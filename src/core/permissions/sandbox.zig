@@ -1656,7 +1656,20 @@ fn foregroundSessionExecutable(scratch: Allocator) ![]const u8 {
             return error.TestProductExecutableMissing;
         return std.mem.sliceTo(path_z, 0);
     }
+    if (comptime builtin.abi == .android) {
+        // termux-exec starts dynamic binaries through Android's linker, making
+        // /proc/self/exe resolve to linker64. It preserves the real executable
+        // here specifically for programs that need to re-exec themselves.
+        if (termuxExecutablePath(io_mod.getenv("TERMUX_EXEC__PROC_SELF_EXE"))) |path|
+            return scratch.dupe(u8, path);
+    }
     return std.process.executablePathAlloc(io_mod.getIo(), scratch);
+}
+
+fn termuxExecutablePath(candidate: ?[]const u8) ?[]const u8 {
+    const path = candidate orelse return null;
+    if (!std.fs.path.isAbsolute(path)) return null;
+    return path;
 }
 
 fn waitForForegroundSessionReady(
@@ -3411,6 +3424,15 @@ test "target replacement marker prefix remains ordinary stderr" {
     try std.testing.expectEqual(@as(usize, 0), foreground.stdout_bytes);
     try std.testing.expectEqual(stderr_text.len, foreground.stderr_bytes);
     try std.testing.expect(std.mem.find(u8, result.output, stderr_text) != null);
+}
+
+test "Termux executable override requires an absolute path" {
+    try std.testing.expectEqualStrings(
+        "/data/data/com.termux/files/home/.local/bin/fx",
+        termuxExecutablePath("/data/data/com.termux/files/home/.local/bin/fx").?,
+    );
+    try std.testing.expect(termuxExecutablePath("fx") == null);
+    try std.testing.expect(termuxExecutablePath(null) == null);
 }
 
 test "invalid readiness directly kills and reaps helper pid" {
