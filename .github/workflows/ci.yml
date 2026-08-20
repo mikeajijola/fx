@@ -340,7 +340,11 @@ jobs:
 
       - name: Build Android target
         if: matrix.android
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} --libc "$RUNNER_TEMP/android-libc.conf" --sysroot "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+        run: |
+          zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} --libc "$RUNNER_TEMP/android-libc.conf" --sysroot "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          tls_alignment="$(readelf -W -l zig-out/bin/fx | awk '$1 == "TLS" { print $NF }')"
+          test -n "$tls_alignment"
+          test "$((tls_alignment))" -ge 64
 
       - name: Report binary size
         run: |

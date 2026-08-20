@@ -51,6 +51,9 @@ jobs:
         run: |
           file zig-out/bin/fx | grep -q 'ARM aarch64'
           readelf -h zig-out/bin/fx | grep -q 'Type:.*DYN'
+          tls_alignment="$(readelf -W -l zig-out/bin/fx | awk '$1 == "TLS" { print $NF }')"
+          test -n "$tls_alignment"
+          test "$((tls_alignment))" -ge 64
 
       - name: Upload Android binary
         uses: actions/upload-artifact@v4

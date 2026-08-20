@@ -2750,11 +2750,16 @@ const CSignalHandler = *const fn (c_int) callconv(.c) void;
 
 extern "c" fn signal(signal_number: c_int, handler: CSignalHandler) CSignalHandler;
 
+// ARM64 Bionic requires PT_TLS alignment of at least 64 bytes. Zig's Android
+// cross-link can otherwise emit the natural 8-byte alignment of its TLS data.
+threadlocal var android_tls_alignment_anchor: u8 align(64) = 0;
+
 fn androidIoSignalHandler(_: c_int) callconv(.c) void {}
 
 fn initThreadedIo(alloc: std.mem.Allocator, options: std.Io.Threaded.InitOptions) std.Io.Threaded {
     const threaded = std.Io.Threaded.init(alloc, options);
     if (builtin.abi == .android) {
+        std.mem.doNotOptimizeAway(&android_tls_alignment_anchor);
         // Zig 0.16's sigaction layout does not match Bionic's. Reinstall the
         // handler through libc so SIGIO interrupts workers instead of exiting.
         _ = signal(@intFromEnum(std.posix.SIG.IO), androidIoSignalHandler);
