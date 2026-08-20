@@ -2757,6 +2757,11 @@ threadlocal var android_tls_alignment_anchor: u8 align(64) = 0;
 fn androidIoSignalHandler(_: c_int) callconv(.c) void {}
 
 fn initThreadedIo(alloc: std.mem.Allocator, options: std.Io.Threaded.InitOptions) std.Io.Threaded {
+    if (builtin.abi == .android) {
+        // Cover signals delivered during Threaded.init itself. Zig installs its
+        // own handler during initialization, so reinstall ours afterwards too.
+        _ = signal(@intFromEnum(std.posix.SIG.IO), androidIoSignalHandler);
+    }
     const threaded = std.Io.Threaded.init(alloc, options);
     if (builtin.abi == .android) {
         std.mem.doNotOptimizeAway(&android_tls_alignment_anchor);
