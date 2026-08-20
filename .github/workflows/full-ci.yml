@@ -15,6 +15,48 @@ permissions:
   contents: read
 
 jobs:
+  android-cross:
+    name: Android aarch64 cross-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+          cache-key: full-ci-android-aarch64
+
+      - name: Configure Android libc
+        run: |
+          python3 .github/scripts/patch-zig-android-stdlib.py "$(zig env | jq -r .lib_dir)"
+          sysroot="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          api=24
+          cat > "$RUNNER_TEMP/android-libc.conf" <<EOF
+          include_dir=$sysroot/usr/include/aarch64-linux-android
+          sys_include_dir=$sysroot/usr/include
+          crt_dir=$sysroot/usr/lib/aarch64-linux-android/$api
+          msvc_lib_dir=
+          kernel32_lib_dir=
+          gcc_dir=
+          EOF
+
+      - name: Build Android binary
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-android --libc "$RUNNER_TEMP/android-libc.conf" --sysroot "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+
+      - name: Verify Android executable
+        run: |
+          file zig-out/bin/fx | grep -q 'ARM aarch64'
+          readelf -h zig-out/bin/fx | grep -q 'Type:.*DYN'
+
+      - name: Upload Android binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: fx-android-aarch64
+          path: zig-out/bin/fx
+          if-no-files-found: error
+
   native:
     name: Native checks (${{ matrix.optimize }}, ${{ matrix.platform.name }})
     runs-on: ${{ matrix.platform.runner }}
