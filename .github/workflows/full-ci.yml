@@ -30,7 +30,9 @@ jobs:
 
       - name: Configure Android libc
         run: |
-          python3 .github/scripts/patch-zig-android-stdlib.py "$(zig env | jq -r .lib_dir)"
+          zig_lib_dir="$(zig env | sed -n 's/^[[:space:]]*\.lib_dir = "\([^"]*\)",/\1/p')"
+          test -n "$zig_lib_dir"
+          python3 .github/scripts/patch-zig-android-stdlib.py "$zig_lib_dir"
           sysroot="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
           api=24
           cat > "$RUNNER_TEMP/android-libc.conf" <<EOF
