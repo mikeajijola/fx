@@ -1647,6 +1647,7 @@ fn waitForForegroundSessionReady(
     const ready_read = child.stderr orelse return error.SpawnFailed;
     const setup_started_ms = io_mod.milliTimestamp();
     const control = BackendControl.init(cfg);
+    var ignored_android_bytes: usize = 0;
 
     while (true) {
         try control.check();
@@ -1674,6 +1675,13 @@ fn waitForForegroundSessionReady(
             const marker_len = try std.posix.read(ready_read.handle, &marker);
             if (marker_len == 0) return error.ForegroundSessionSetupFailed;
             if (marker[0] != foreground_session_ready_byte) {
+                if (comptime builtin.abi == .android) {
+                    // Bionic may write a short asynchronous signal diagnostic
+                    // before the helper reaches its readiness marker. Keep the
+                    // timeout authoritative and cap discarded diagnostics.
+                    ignored_android_bytes += 1;
+                    if (ignored_android_bytes <= 4096) continue;
+                }
                 return error.InvalidForegroundSessionReady;
             }
             return;
