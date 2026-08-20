@@ -29,6 +29,9 @@ jobs:
             target: x86_64-linux
           - name: linux-aarch64
             target: aarch64-linux
+          - name: android-aarch64
+            target: aarch64-linux-android
+            android: true
           - name: macos-x86_64
             target: x86_64-macos
           - name: macos-aarch64
@@ -43,8 +46,28 @@ jobs:
         with:
           version: "0.16.0"
 
+      - name: Configure Android libc
+        if: matrix.android
+        run: |
+          python3 .github/scripts/patch-zig-android-stdlib.py "$(zig env | jq -r .lib_dir)"
+          sysroot="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          api=24
+          cat > "$RUNNER_TEMP/android-libc.conf" <<EOF
+          include_dir=$sysroot/usr/include/aarch64-linux-android
+          sys_include_dir=$sysroot/usr/include
+          crt_dir=$sysroot/usr/lib/aarch64-linux-android/$api
+          msvc_lib_dir=
+          kernel32_lib_dir=
+          gcc_dir=
+          EOF
+
       - name: Build dev binary
+        if: ${{ !matrix.android }}
         run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dupdate-channel=dev
+
+      - name: Build Android dev binary
+        if: matrix.android
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dupdate-channel=dev --libc "$RUNNER_TEMP/android-libc.conf" --sysroot "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
 
       - name: Package
         run: |

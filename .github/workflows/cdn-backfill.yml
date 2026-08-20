@@ -21,7 +21,7 @@ permissions:
 
 env:
   CDN_BASE: cli
-  PLATFORMS: linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64
+  PLATFORMS: linux-x86_64 linux-aarch64 android-aarch64 macos-x86_64 macos-aarch64
 
 jobs:
   backfill:
