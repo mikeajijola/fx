@@ -2746,6 +2746,22 @@ pub fn main(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char)
     return 0;
 }
 
+const CSignalHandler = *const fn (c_int) callconv(.c) void;
+
+extern "c" fn signal(signal_number: c_int, handler: CSignalHandler) CSignalHandler;
+
+fn androidIoSignalHandler(_: c_int) callconv(.c) void {}
+
+fn initThreadedIo(alloc: std.mem.Allocator, options: std.Io.Threaded.InitOptions) std.Io.Threaded {
+    const threaded = std.Io.Threaded.init(alloc, options);
+    if (builtin.abi == .android) {
+        // Zig 0.16's sigaction layout does not match Bionic's. Reinstall the
+        // handler through libc so SIGIO interrupts workers instead of exiting.
+        _ = signal(@intFromEnum(std.posix.SIG.IO), androidIoSignalHandler);
+    }
+    return threaded;
+}
+
 fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !void {
     const raw_args = rawArgs(c_argc, c_argv);
     const raw_env: RawEnviron = @ptrCast(c_envp);
@@ -2754,7 +2770,7 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
         if (terminal_tmux_session.isCaptureModeRaw(raw_args)) {
             io_mod.setRawEnviron(raw_env);
             const process_args = argsFromRaw(raw_args);
-            var threaded = std.Io.Threaded.init(processAllocator(), .{
+            var threaded = initThreadedIo(processAllocator(), .{
                 .argv0 = .init(process_args),
                 .environ = .{ .block = environBlockFromRaw(raw_env) },
             });
@@ -2766,7 +2782,7 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
         if (terminal_tmux_session.isLauncherModeRaw(raw_args)) {
             io_mod.setRawEnviron(raw_env);
             const process_args = argsFromRaw(raw_args);
-            var threaded = std.Io.Threaded.init(processAllocator(), .{
+            var threaded = initThreadedIo(processAllocator(), .{
                 .argv0 = .init(process_args),
                 .environ = .{ .block = environBlockFromRaw(raw_env) },
             });
@@ -2782,7 +2798,7 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
         if (terminal_native_session.isControlModeRaw(raw_args)) {
             io_mod.setRawEnviron(raw_env);
             const process_args = argsFromRaw(raw_args);
-            var threaded = std.Io.Threaded.init(processAllocator(), .{
+            var threaded = initThreadedIo(processAllocator(), .{
                 .argv0 = .init(process_args),
                 .environ = .{ .block = environBlockFromRaw(raw_env) },
             });
@@ -2794,7 +2810,7 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
         if (terminal_native_session.isLauncherModeRaw(raw_args)) {
             io_mod.setRawEnviron(raw_env);
             const process_args = argsFromRaw(raw_args);
-            var threaded = std.Io.Threaded.init(processAllocator(), .{
+            var threaded = initThreadedIo(processAllocator(), .{
                 .argv0 = .init(process_args),
                 .environ = .{ .block = environBlockFromRaw(raw_env) },
             });
@@ -2806,7 +2822,7 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
         if (terminal_host.isInternalModeRaw(raw_args)) {
             io_mod.setRawEnviron(raw_env);
             const process_args = argsFromRaw(raw_args);
-            var threaded = std.Io.Threaded.init(processAllocator(), .{
+            var threaded = initThreadedIo(processAllocator(), .{
                 .argv0 = .init(process_args),
                 .environ = .{ .block = environBlockFromRaw(raw_env) },
             });
@@ -2836,7 +2852,7 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
     if (sandbox.isForegroundSessionInvocation(cli_args)) {
         io_mod.setRawEnviron(raw_env);
         const process_args = argsFromRaw(raw_args);
-        var threaded = std.Io.Threaded.init(processAllocator(), .{
+        var threaded = initThreadedIo(processAllocator(), .{
             .argv0 = .init(process_args),
             .environ = .{ .block = environBlockFromRaw(raw_env) },
         });
@@ -2887,7 +2903,7 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
     if (needsEarlyThreadedIo(cli_args)) {
         const env_block = environBlockFromRaw(raw_env);
         const process_args = argsFromRaw(raw_args);
-        early_threaded = std.Io.Threaded.init(alloc, .{
+        early_threaded = initThreadedIo(alloc, .{
             .argv0 = .init(process_args),
             .environ = .{ .block = env_block },
         });
@@ -2899,7 +2915,7 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
         .interactive => |launch| {
             const env_block = environBlockFromRaw(raw_env);
             const process_args = argsFromRaw(raw_args);
-            var threaded = std.Io.Threaded.init(alloc, .{
+            var threaded = initThreadedIo(alloc, .{
                 .argv0 = .init(process_args),
                 .environ = .{ .block = env_block },
             });

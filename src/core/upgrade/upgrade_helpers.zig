@@ -47,25 +47,33 @@ fn isLoopbackE2eUpgradeBase(url: []const u8) bool {
 }
 
 pub const platform = platformFromTarget() orelse
-    @compileError("unsupported platform for auto-upgrade (requires macOS or Linux, x86_64 or aarch64)");
+    @compileError("unsupported platform for auto-upgrade (requires macOS, Linux, or Android on a supported architecture)");
 
 fn platformFromTarget() ?[]const u8 {
-    const os: ?[]const u8 = switch (builtin.os.tag) {
-        .macos => "macos",
-        .linux => "linux",
-        else => null,
-    };
-    const arch: ?[]const u8 = switch (builtin.cpu.arch) {
-        .x86_64 => "x86_64",
-        .aarch64 => "aarch64",
-        else => null,
-    };
-    if (os) |o| {
-        if (arch) |a| {
-            return o ++ "-" ++ a;
-        }
+    return platformForTarget(builtin.os.tag, builtin.abi, builtin.cpu.arch);
+}
+
+fn platformForTarget(os: std.Target.Os.Tag, abi: std.Target.Abi, arch: std.Target.Cpu.Arch) ?[]const u8 {
+    if (abi == .android) {
+        return switch (arch) {
+            .aarch64 => "android-aarch64",
+            else => null,
+        };
     }
-    return null;
+
+    return switch (os) {
+        .macos => switch (arch) {
+            .x86_64 => "macos-x86_64",
+            .aarch64 => "macos-aarch64",
+            else => null,
+        },
+        .linux => switch (arch) {
+            .x86_64 => "linux-x86_64",
+            .aarch64 => "linux-aarch64",
+            else => null,
+        },
+        else => null,
+    };
 }
 
 pub fn fetchTarget(alloc: Allocator, channel: Channel, base_url: []const u8) !Target {
@@ -319,6 +327,13 @@ fn readAbsoluteFile(alloc: Allocator, path: []const u8) ![]u8 {
 test "platform string is valid" {
     try std.testing.expect(platform.len > 0);
     try std.testing.expect(std.mem.find(u8, platform, "-") != null);
+}
+
+test "platform selection distinguishes Android from Linux" {
+    try std.testing.expectEqualStrings("android-aarch64", platformForTarget(.linux, .android, .aarch64).?);
+    try std.testing.expectEqualStrings("linux-aarch64", platformForTarget(.linux, .gnu, .aarch64).?);
+    try std.testing.expectEqualStrings("macos-x86_64", platformForTarget(.macos, .none, .x86_64).?);
+    try std.testing.expect(platformForTarget(.linux, .android, .x86_64) == null);
 }
 
 test "E2E upgrade base accepts only explicit IPv4 loopback origins" {

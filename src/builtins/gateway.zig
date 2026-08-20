@@ -15,6 +15,7 @@ const gateway_client = @import("../gateway/client.zig");
 const gateway_failure_diagnostics = @import("../core/gateway/gateway_failure_diagnostics.zig");
 const gateway_json = @import("../core/gateway/gateway_json.zig");
 const io_mod = @import("../core/shared/io.zig");
+const http_client = @import("../core/shared/http_client.zig");
 const gateway_generation_usage = @import("../gateway/generation_usage.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
@@ -595,10 +596,7 @@ const OAuthHttpOperation = struct {
     request: oauth_transport.Request,
 
     pub fn run(self: *@This()) !oauth_transport.Response {
-        var client: std.http.Client = .{
-            .allocator = self.alloc,
-            .io = io_mod.getIo(),
-        };
+        var client = try http_client.init(self.alloc);
         defer client.deinit();
 
         const response_buffer = try self.alloc.alloc(u8, oauth_response_max_bytes + 1);

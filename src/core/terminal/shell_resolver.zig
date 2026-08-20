@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const contracts = @import("contracts.zig");
 const command_environment = @import("../execution/command_environment.zig");
+const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -103,6 +104,11 @@ pub fn resolve(
 }
 
 pub fn configuredLoginShellInto(buffer: []u8) ?[]const u8 {
+    // Android does not have conventional passwd login-shell records. Termux
+    // exports the shell it installed through SHELL, so prefer that value there.
+    if (comptime builtin.abi == .android) {
+        if (copySupportedShellInto(buffer, io_mod.getenv("SHELL"))) |shell| return shell;
+    }
     if (comptime !builtin.link_libc or builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         return null;
     }
@@ -119,7 +125,14 @@ pub fn configuredLoginShellInto(buffer: []u8) ?[]const u8 {
     const record = found orelse return null;
     const shell_ptr = record.shell orelse return null;
     const shell = std.mem.span(shell_ptr);
-    if (shell.len == 0 or shell.len > buffer.len) return null;
+    return copySupportedShellInto(buffer, shell);
+}
+
+fn copySupportedShellInto(buffer: []u8, candidate: ?[]const u8) ?[]const u8 {
+    const shell = candidate orelse return null;
+    if (shell.len == 0 or shell.len > buffer.len or !std.fs.path.isAbsolute(shell)) return null;
+    const basename = std.fs.path.basename(shell);
+    if (!std.mem.eql(u8, basename, "bash") and !std.mem.eql(u8, basename, "zsh")) return null;
     @memcpy(buffer[0..shell.len], shell);
     return buffer[0..shell.len];
 }
@@ -374,6 +387,16 @@ test "login shell resolution falls back without accepting explicit unsupported s
         error.UnsupportedShell,
         resolve(null, .{ .executable = .{ .path = "/opt/homebrew/bin/fish" } }),
     );
+}
+
+test "configured shell candidate accepts Termux paths" {
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "/data/data/com.termux/files/usr/bin/bash",
+        copySupportedShellInto(&buffer, "/data/data/com.termux/files/usr/bin/bash").?,
+    );
+    try std.testing.expect(copySupportedShellInto(&buffer, "/system/bin/sh") == null);
+    try std.testing.expect(copySupportedShellInto(&buffer, "bash") == null);
 }
 
 test "captured profiles use exact non-PTY argv" {

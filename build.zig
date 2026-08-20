@@ -51,6 +51,7 @@ pub fn build(b: *std.Build) void {
 
     const exe = b.addExecutable(.{
         .name = "fx",
+        .linkage = if (target.result.abi == .android) .dynamic else null,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -64,6 +65,13 @@ pub fn build(b: *std.Build) void {
             .strip = optimize != .Debug,
         }),
     });
+    // Android's dynamic linker rejects fixed-address ET_EXEC binaries.
+    exe.pie = target.result.abi == .android;
+    if (target.result.abi == .android) {
+        _ = b.sysroot orelse @panic("Android builds require --sysroot pointing to an Android NDK sysroot");
+        // Absolute library paths are resolved beneath --sysroot by Zig.
+        exe.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib/aarch64-linux-android/24" });
+    }
     exe.root_module.addImport("build_options", build_options.createModule());
 
     b.installArtifact(exe);
