@@ -223,6 +223,11 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     if (!isForegroundSessionInvocation(args) or args.len < 3) {
         return error.InvalidForegroundSessionInvocation;
     }
+    if (comptime builtin.abi == .android) {
+        var signal_mask = std.posix.sigemptyset();
+        std.posix.sigaddset(&signal_mask, std.posix.SIG.IO);
+        std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &signal_mask, null);
+    }
     if (std.c.setsid() == -1) return error.ForegroundSessionSetupFailed;
 
     const zio = io_mod.getIo();
@@ -1564,13 +1569,27 @@ fn executeProcessWithDetachedSession(
     try helper_argv.appendSlice(scratch, argv);
 
     const started_ms = io_mod.milliTimestamp();
-    var child = try std.process.spawn(io_mod.getIo(), .{
-        .argv = helper_argv.items,
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .pipe,
-        .cwd = .{ .path = cwd },
-    });
+    var child = blk: {
+        var previous_signal_mask: std.posix.sigset_t = undefined;
+        var restore_signal_mask = false;
+        if (comptime builtin.abi == .android) {
+            var signal_mask = std.posix.sigemptyset();
+            std.posix.sigaddset(&signal_mask, std.posix.SIG.IO);
+            std.posix.sigprocmask(std.posix.SIG.BLOCK, &signal_mask, &previous_signal_mask);
+            restore_signal_mask = true;
+        }
+        defer if (restore_signal_mask) {
+            std.posix.sigprocmask(std.posix.SIG.SETMASK, &previous_signal_mask, null);
+        };
+
+        break :blk try std.process.spawn(io_mod.getIo(), .{
+            .argv = helper_argv.items,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .pipe,
+            .cwd = .{ .path = cwd },
+        });
+    };
 
     var output = OutputCollector.init(scratch, cfg);
     defer output.deinit();
@@ -1647,7 +1666,6 @@ fn waitForForegroundSessionReady(
     const ready_read = child.stderr orelse return error.SpawnFailed;
     const setup_started_ms = io_mod.milliTimestamp();
     const control = BackendControl.init(cfg);
-    var ignored_android_bytes: usize = 0;
 
     while (true) {
         try control.check();
@@ -1675,13 +1693,6 @@ fn waitForForegroundSessionReady(
             const marker_len = try std.posix.read(ready_read.handle, &marker);
             if (marker_len == 0) return error.ForegroundSessionSetupFailed;
             if (marker[0] != foreground_session_ready_byte) {
-                if (comptime builtin.abi == .android) {
-                    // Bionic may write a short asynchronous signal diagnostic
-                    // before the helper reaches its readiness marker. Keep the
-                    // timeout authoritative and cap discarded diagnostics.
-                    ignored_android_bytes += 1;
-                    if (ignored_android_bytes <= 4096) continue;
-                }
                 return error.InvalidForegroundSessionReady;
             }
             return;
