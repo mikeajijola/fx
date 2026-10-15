@@ -1911,6 +1911,9 @@ fn assessContract(raw_ctx: *anyopaque, arena: Allocator, candidate: []const u8, 
     const session = if (ctx.state.active_session) |*active| active else return error.InvalidWorkContract;
     const request = try std.json.Stringify.valueAlloc(arena, .{ .contract = definition.value, .assistantText = candidate, .step = step }, .{});
     const call_id = try arena.print("contract:{d}:{d}", .{ turn_id, step });
+    // A steer waits for host verification just as it waits for a host tool.
+    // User cancellation still aborts the outstanding host request.
+    server.noteSteeringToolsPhase(ctx.state);
     const provider: tool_dispatch.HostToolProvider = if (comptime host_target.is_wasm) js_host_tools.provider() else .{ .context = ctx.state, .call_fn = callHostTool };
     const result = try provider.call(arena, work_contract.bridge_name, call_id, request, work_contract.max_bytes, &session.cancel_flag);
     const raw = switch (result) {
@@ -1918,7 +1921,7 @@ fn assessContract(raw_ctx: *anyopaque, arena: Allocator, candidate: []const u8, 
         else => return error.ContractAssessmentFailed,
     };
     const decision = try work_contract.assess(arena, definition.value, raw);
-    if (decision.disposition == .blocked) ctx.stop_reason = .contract_blocked;
+    ctx.stop_reason = if (decision.disposition == .blocked) .contract_blocked else .end_turn;
     return decision;
 }
 

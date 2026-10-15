@@ -154,6 +154,32 @@ try {
   assert.equal(cancelled.counts().requests, 1);
 } finally { await agent.close(); }
 
+// Verification must not close steering before the turn actually finishes.
+for (const initialStatus of ['pending', 'met', 'blocked']) {
+  let started, release;
+  const assessing = new Promise(resolve => { started = resolve; });
+  const released = new Promise(resolve => { release = resolve; });
+  let checks = 0;
+  const steered = fixture(async () => {
+    if (++checks === 1) { started(); await released; return report(initialStatus); }
+    return report('met');
+  });
+  agent = await createFxEngine(steered.options);
+  try {
+    const turn = agent.prompt('Start');
+    const events = [];
+    const drained = (async () => { for await (const event of turn) events.push(event); return turn.result; })();
+    await assessing;
+    let accepted;
+    try { accepted = await turn.steer('Keep the report concise'); }
+    finally { release(); }
+    assert.equal((await drained).stopReason, 'end_turn');
+    assert.ok(events.some(event => event.type === 'user_message' && event.id === accepted.id));
+    assert.equal(checks, 2);
+    assert.deepEqual(steered.counts(), { requests: 3, effects: 1 });
+  } finally { release(); await agent.close(); }
+}
+
 const ordinary = fixture();
 agent = await createFxEngine(ordinary.options);
 try { assert.equal((await consume(agent)).stopReason, 'end_turn'); }

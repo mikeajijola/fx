@@ -9481,7 +9481,7 @@ fn processQueuedPromptLoop(
                     history_text,
                     history_replay,
                     config.origin,
-                    if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model,
+                    if (deps.assess_contract != null and disposition == .completed) .model else if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model,
                 ))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
@@ -9501,6 +9501,14 @@ fn processQueuedPromptLoop(
                     if (decision.disposition == .continue_work) {
                         try within_turn_suffix.append(arena, .{ .role = .assistant, .content = history_text, .provider_replay = history_replay });
                         try within_turn_suffix.append(arena, .{ .role = .user, .content = decision.feedback });
+                        try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                        continue;
+                    }
+                    // Only an accepted assessment may close steering. A steer
+                    // received while the host assessed joins before completion.
+                    if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+                        try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, history_text, history_replay, config.origin, if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model))
+                    {
                         try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
                         continue;
                     }
@@ -12306,7 +12314,7 @@ fn processQueuedPromptLoop(
                     raw_final,
                     final_provider_replay,
                     config.origin,
-                    if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model,
+                    if (deps.assess_contract != null) .model else if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model,
                 ))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
@@ -12324,6 +12332,12 @@ fn processQueuedPromptLoop(
                 if (decision.disposition == .continue_work) {
                     try within_turn_suffix.append(arena, .{ .role = .assistant, .content = raw_final, .provider_replay = final_provider_replay });
                     try within_turn_suffix.append(arena, .{ .role = .user, .content = decision.feedback });
+                    try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                    continue;
+                }
+                if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+                    try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, raw_final, final_provider_replay, config.origin, if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model))
+                {
                     try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
                     continue;
                 }

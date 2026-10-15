@@ -114,6 +114,7 @@ The host provides `assess(request, context)`. Resolve evidence against your own
 records; assistant text is a completion candidate, not proof of success. The
 callback receives the fixed contract, `assistantText`, the model `step`, and
 `{signal, sessionId, executionId}`. Keep assessment read-only and safe to repeat.
+Steering stays available while assessment waits and while pending work continues.
 
 For example, given an application-owned `reportStore` that verifies retained bytes
 and returns a receipt for the current session:
