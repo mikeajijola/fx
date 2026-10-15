@@ -22,15 +22,20 @@ function fixture(assess, overrides = {}, modelEvents) {
     ...platform, apiKey: 'fixture', model: 'sdk/contract-test',
     ...(assess ? { contract: { ...definition, assess } } : {}),
     fetch(_url, init = {}) {
-      if (init.method === 'GET') return Response.json({ data: [{ id: 'sdk/contract-test', type: 'language', tags: ['tool-use'] }] });
-      requests++;
-      const body = JSON.parse(init.body);
-      if (assess) assert.match(JSON.stringify(body), /Save and verify the report/);
-      assert.doesNotMatch(JSON.stringify(body.tools || []), /__libfx_contract_assess/);
-      const events = modelEvents ? modelEvents(requests, body) : requests === 2 && assess
-        ? [{ type: 'tool-call', toolCallId: 'save-once', toolName: 'save', input: {} }, { type: 'finish', finishReason: { unified: 'tool-calls', raw: 'tool-calls' } }]
-        : [{ type: 'text-delta', delta: 'Done.' }, { type: 'finish', finishReason: { unified: 'stop', raw: 'stop' } }];
-      return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join('') + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+      try {
+        if (init.method === 'GET') return Response.json({ data: [{ id: 'sdk/contract-test', type: 'language', tags: ['tool-use'] }] });
+        requests++;
+        const body = JSON.parse(typeof init.body === 'string' ? init.body : new TextDecoder().decode(init.body));
+        if (assess) assert.match(JSON.stringify(body), /Save and verify the report/);
+        assert.doesNotMatch(JSON.stringify(body.tools || []), /__libfx_contract_assess/);
+        const events = modelEvents ? modelEvents(requests, body) : requests === 2 && assess
+          ? [{ type: 'tool-call', toolCallId: 'save-once', toolName: 'save', input: {} }, { type: 'finish', finishReason: { unified: 'tool-calls', raw: 'tool-calls' } }]
+          : [{ type: 'text-delta', delta: 'Done.' }, { type: 'finish', finishReason: { unified: 'stop', raw: 'stop' } }];
+        return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join('') + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+      } catch (error) {
+        console.error('Contract fixture request failed:', error);
+        throw error;
+      }
     },
     tools: [{ name: 'save', description: 'Save the report', inputSchema: { type: 'object' }, execute() { effects++; return 'receipt:report'; } }],
     ...overrides,
