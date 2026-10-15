@@ -74,7 +74,7 @@ A turn's result says how it ended:
 const { stopReason, usage, error } = await turn.result;
 ```
 
-`stopReason` is `end_turn`, `max_output_tokens`, `max_model_turns`, `refused` or `cancelled`. It's `error` when the turn failed, with the reason in `error`, and `unknown` when the process running it stopped before recording how it ended.
+`stopReason` is `end_turn`, `contract_blocked`, `max_output_tokens`, `max_model_turns`, `refused` or `cancelled`. It's `error` when the turn failed, with the reason in `error`, and `unknown` when the process running it stopped before recording how it ended.
 
 ### Streaming to a browser
 
@@ -101,6 +101,77 @@ export async function GET(request) {
 ```
 
 Each line is one JSON object with a `type`: the model's events, such as `text_delta` and `tool_start`, and the turn's own, `turn_start` (which carries the `sessionId`), `turn_end`, `turn_resume` and `turn_yield`. Lines from `session.stream()` carry a `cursor`. Store the last one you read and pass it back to resume after it. The `FxStreamLine` type lists every field.
+
+## Contract-dependent execution
+
+Supply `contract` to `createFxAgent()` or `createFxEngine()` when work must satisfy
+explicit obligations. The Zig loop checks the contract whenever the model tries
+to end a normal reply. Pending obligations continue the same turn; all obligations
+marked `met` permit `end_turn`; blocked obligations with no pending work return
+`contract_blocked`. Without a contract, turns keep their existing behavior.
+
+The host provides `assess(request, context)`. Resolve evidence against your own
+records; assistant text is a completion candidate, not proof of success. The
+callback receives the fixed contract, `assistantText`, the model `step`, and
+`{signal, sessionId, executionId}`. Keep assessment read-only and safe to repeat.
+
+For example, given an application-owned `reportStore` that verifies retained bytes
+and returns a receipt for the current session:
+
+```js
+const agent = createFxAgent({
+  model: "anthropic/claude-haiku-5.5",
+  tools: reportTools, // Your application's report creation and inspection tools.
+  contract: {
+    id: "save-report",
+    version: 1,
+    objective: "Save and verify the report",
+    obligations: [{ id: "saved", description: "The report is retained and verified" }],
+    async assess({ contract }, { signal, sessionId }) {
+      const receipt = await reportStore.verify(sessionId, { signal });
+      return {
+        contractId: contract.id,
+        version: contract.version,
+        obligations: [{
+          id: "saved",
+          status: receipt ? "met" : "pending",
+          evidence: receipt ? [receipt.id] : [],
+          note: receipt ? "Verified retained report bytes" : "Save and verify the report",
+        }],
+      };
+    },
+  },
+});
+```
+
+Every assessment must name the exact contract ID and version and report each
+obligation exactly once. Each report needs a note; `met` additionally needs at
+least one evidence reference. Zig validates this structure. The host remains
+responsible for whether the references establish fulfilment. Use `blocked` with
+a note describing the missing input when progress needs intervention. If another
+obligation is pending, that independent work continues first.
+
+Contracts have 1–100 obligations, unique obligation IDs, and a positive 32-bit
+version. IDs are at most 128 UTF-8 bytes; objectives are at most 8 KiB; descriptions
+and assessment notes are at most 4 KiB. Definitions and assessments are each
+limited to 64 KiB. An obligation can cite at most 100 references of 512 bytes each.
+Malformed assessments and callback failures fail the turn. They never establish
+completion. Cancellation aborts the callback's signal and stops waiting even if
+the callback does not settle. Provider errors and output limits remain separate
+terminal outcomes. There is no implicit total-work retry or cost budget; use the
+host's cancellation and usage controls.
+
+The contract definition is fixed for the engine lifetime and applies to its
+prompts. Create another engine for another contract. `createFxAgent()` passes the
+same definition to the engines it creates, so use a distinct agent configuration
+for a different objective. Supply the same definition and a current assessor
+when restoring a checkpoint. Checkpoints record a digest of the definition and
+reject a missing or changed contract; they do not contain the assessor or its
+evidence store. Keep those records in host-owned durable storage.
+
+Contract assessments use the existing cancellable host bridge, without adding a
+model-callable tool. `__libfx_contract_assess` is reserved. A core that does not
+advertise contract support is rejected before the first prompt.
 
 ## Durability
 

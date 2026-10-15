@@ -79,7 +79,7 @@ export async function engine(): Promise<FxEngine> {
   for await (const _ of turn) {}
   const result = await turn.result;
   assertType<Equal<typeof result, FxEngineTurnResult>>();
-  assertType<Equal<typeof result.stopReason, "end_turn" | "max_output_tokens" | "max_model_turns" | "refused" | "cancelled">>();
+  assertType<Equal<typeof result.stopReason, "end_turn" | "max_output_tokens" | "max_model_turns" | "refused" | "cancelled" | "contract_blocked">>();
 
   agent.prompt([
     { type: "text", text: "What does this screenshot show?" },
@@ -330,3 +330,17 @@ export async function grokEngine(): Promise<FxEngine> {
   await createFxEngine({ provider: "grok", model, credentials: ({ provider }) => tokenStore.load(provider) });
   return engine;
 }
+
+// Contracts carry host assessments; model output cannot accept its own work.
+void createFxEngine({
+  apiKey: "fixture",
+  contract: {
+    id: "report", version: 1, objective: "Save the report",
+    obligations: [{ id: "saved", description: "Report is retained" }],
+    async assess({ contract, assistantText, step }, { signal, sessionId }) {
+      void assistantText; void step; void signal; void sessionId;
+      return { contractId: contract.id, version: contract.version,
+        obligations: [{ id: "saved", status: "met", evidence: ["receipt:1"], note: "Verified saved bytes" }] };
+    },
+  },
+});

@@ -9491,6 +9491,22 @@ fn processQueuedPromptLoop(
             if (disposition == .completed and agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                 try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, history_text, history_replay)) continue;
 
+            // Contract completion is checked on every normal model stop, not
+            // once per turn like an advisory stop hook. Failures and cancellation
+            // propagate; neither can be mistaken for accepted work.
+            if (disposition == .completed) {
+                if (deps.assess_contract) |assess_contract| {
+                    const decision = try assess_contract(deps.ctx, arena, history_text, turn_id, current_step_index);
+                    if (config.cancel_flag.load(.seq_cst)) return error.Cancelled;
+                    if (decision.disposition == .continue_work) {
+                        try within_turn_suffix.append(arena, .{ .role = .assistant, .content = history_text, .provider_replay = history_replay });
+                        try within_turn_suffix.append(arena, .{ .role = .user, .content = decision.feedback });
+                        try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                        continue;
+                    }
+                }
+            }
+
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 if (!has_content) {
                     try deps.push_text(deps.ctx, .{ .operational = rendered });
@@ -12299,6 +12315,19 @@ fn processQueuedPromptLoop(
 
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                 try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, raw_final, final_provider_replay)) continue;
+
+            // A provider may return a final answer together with hosted tool
+            // results. It must pass the same gate as a text-only completion.
+            if (deps.assess_contract) |assess_contract| {
+                const decision = try assess_contract(deps.ctx, arena, raw_final, turn_id, current_step_index);
+                if (config.cancel_flag.load(.seq_cst)) return error.Cancelled;
+                if (decision.disposition == .continue_work) {
+                    try within_turn_suffix.append(arena, .{ .role = .assistant, .content = raw_final, .provider_replay = final_provider_replay });
+                    try within_turn_suffix.append(arena, .{ .role = .user, .content = decision.feedback });
+                    try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                    continue;
+                }
+            }
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });

@@ -201,6 +201,7 @@ pub const DiffMarkerStyles = struct {
 
 pub const AgentRuntimeDeps = struct {
     ctx: *anyopaque,
+    assess_contract: ?*const fn (ctx: *anyopaque, arena: Allocator, candidate: []const u8, turn_id: u64, step: usize) anyerror!@import("work_contract.zig").Decision = null,
     observer: ?*observation.Observer = null,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
     flush_assistant_stream_per_content_chunk: bool = false,
