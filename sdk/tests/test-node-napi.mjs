@@ -34,6 +34,7 @@ const scripts = [
   "test-libfx-loader.mjs",
   "test-agent-bootstrap.mjs",
   "test-agent-step-limit.mjs",
+  "test-agent-contract.mjs",
   "test-agent-effort.mjs",
   "test-agent-fast.mjs",
   "test-agent-images.mjs",

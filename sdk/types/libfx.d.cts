@@ -262,7 +262,7 @@ export interface FxUsage {
 }
 
 /** Why an engine turn ended. */
-export type FxStopReason = "end_turn" | "max_output_tokens" | "max_model_turns" | "refused" | "cancelled";
+export type FxStopReason = "end_turn" | "contract_blocked" | "max_output_tokens" | "max_model_turns" | "refused" | "cancelled";
 
 // ---------------------------------------------------------------------------
 // Diagnostics
@@ -276,6 +276,7 @@ interface FxEventBase {
 export interface FxCheckpointMeta {
   libfxVersion: string;
   toolSchemaHash: string;
+  contractHash?: string;
   model: string;
 }
 
@@ -428,8 +429,27 @@ export type FxHookEvent = FxHookEnvelope & (
   | { type: "journal.error"; data: { error: string; fenced: boolean } }
 );
 
+/** Fixed, host-owned acceptance criteria for the Zig loop. */
+export interface FxWorkContractDefinition {
+  id: string;
+  version: number;
+  objective: string;
+  obligations: readonly { id: string; description: string }[];
+}
+export interface FxContractAssessment {
+  contractId: string;
+  version: number;
+  obligations: readonly { id: string; status: "pending" | "met" | "blocked"; evidence?: readonly string[]; note: string }[];
+}
+export interface FxWorkContract extends FxWorkContractDefinition {
+  /** Read-only, repeatable verification against host-owned evidence. */
+  assess(request: { contract: FxWorkContractDefinition; assistantText: string; step: number }, context: FxToolContext): FxContractAssessment | Promise<FxContractAssessment>;
+}
+
 /** Options `createFxAgent()` and `createFxEngine()` share. */
 export interface FxSharedOptions<Event> {
+  /** Zig continues normal model stops until the host establishes fulfilment or a blocker. */
+  contract?: FxWorkContract;
   /** Host-owned instrumentation of native and Wasm execution. Disabled by default. */
   hooks?: FxHooks;
   /** The complete host-owned system context, up to 64 KiB of UTF-8. An array is joined with blank lines. */

@@ -2112,6 +2112,7 @@ function normalizeHostTools(value) {
     if (typeof name !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(name)) {
       throw new TypeError(`tool ${index} has an invalid name`);
     }
+    if (name === "__libfx_contract_assess") throw new TypeError("Reserved contract bridge name");
     if (names.has(name)) throw new TypeError(`duplicate tool name: ${name}`);
     names.add(name);
     if (providerExecuted !== undefined && typeof providerExecuted !== "boolean") {
@@ -2249,13 +2250,30 @@ export async function createFxEngine(options = {}) {
   options = normalizeAgentOptions(options);
   const hostTools = normalizeHostTools(options.tools);
   const instructions = normalizeInstructions(options.instructions);
+  let contract;
+  if (options.contract !== undefined) {
+    if (!options.contract || typeof options.contract !== "object" || typeof options.contract.assess !== "function") throw new TypeError("contract requires assess()");
+    const { assess, ...definition } = options.contract;
+    contract = JSON.parse(JSON.stringify(definition));
+    if (encoder.encode(JSON.stringify(contract)).length > 64 * 1024) throw new RangeError("Contract exceeds 64 KiB");
+    hostTools.executors.set("__libfx_contract_assess", (input, context) => assess(input, context));
+  }
   // Recorded in every checkpoint this agent saves, so a later one can tell
   // it continues with another libfx, other tools, or another model.
   const checkpointMeta = {
     libfxVersion: String(fxSdkApiVersion),
     toolSchemaHash: toolSchemaHash(hostTools.descriptors),
     model: options.model ?? "",
+    contractHash: "",
   };
+  if (contract) {
+    const canonical = JSON.stringify({
+      id: contract.id, version: contract.version, objective: contract.objective,
+      obligations: contract.obligations?.map(({ id, description }) => ({ id, description })),
+    });
+    const digest = await crypto.subtle.digest("SHA-256", encoder.encode(canonical));
+    checkpointMeta.contractHash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
   const initialCheckpoint = checkpointBytes(options.checkpoint);
   // Checked before the core starts, and with the core's message, so both
   // backends report it the same way.
@@ -2507,6 +2525,7 @@ export async function createFxEngine(options = {}) {
   // model still restores; the host hears what changed.
   const compareCheckpointMeta = (saved) => {
     if (!saved || typeof saved !== "object") return;
+    if (saved.contractHash && saved.contractHash !== checkpointMeta.contractHash) throw new Error("Checkpoint requires the same work contract");
     const changed = Object.keys(checkpointMeta).filter((key) => typeof saved[key] === "string" && saved[key] !== "" && saved[key] !== checkpointMeta[key]);
     if (changed.length) emit("checkpoint.mismatch", { sessionId, changed, saved, current: checkpointMeta });
   };
@@ -2836,8 +2855,8 @@ export async function createFxEngine(options = {}) {
     await request("initialize", {
       protocolVersion: 1,
       clientCapabilities: {
-        ...(hostTools.descriptors.length || instructions
-          ? { libfx: { tools: hostTools.descriptors, instructions } }
+        ...(hostTools.descriptors.length || instructions || contract
+          ? { libfx: { tools: hostTools.descriptors, instructions, ...(contract ? { contract } : {}) } }
           : {}),
       },
     });
@@ -2849,6 +2868,7 @@ export async function createFxEngine(options = {}) {
       ...(options.hooks ? { hooks: { captureContent: options.hooks.captureContent === true } } : {}),
     });
     sessionId = sessionResult.sessionId;
+    if (contract && sessionResult?._meta?.fx?.contractVersion !== 1) throw new Error("Work contracts require a matching libfx core");
     if (options.hooks && sessionResult?._meta?.fx?.hooksVersion !== 1) throw new Error("Semantic hooks require a matching libfx core with hooks version 1");
     if (initialCheckpoint) {
       const [checkpointAttachment] = attachBytes([initialCheckpoint]);

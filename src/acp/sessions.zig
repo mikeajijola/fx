@@ -699,7 +699,11 @@ fn writeNewSessionResponse(
     try out.writer.writeAll(",\"availableModes\":");
     try writeModesArray(&out.writer, state.cfg.mode_registry);
     try out.writer.writeByte('}');
-    if (state.active_session.?.observer_hooks != null) try out.writer.writeAll(",\"_meta\":{\"fx\":{\"hooksVersion\":1}}");
+    if (state.work_contract_json != null) {
+        try out.writer.writeAll(",\"_meta\":{\"fx\":{\"contractVersion\":1");
+        if (state.active_session.?.observer_hooks != null) try out.writer.writeAll(",\"hooksVersion\":1");
+        try out.writer.writeAll("}}");
+    } else if (state.active_session.?.observer_hooks != null) try out.writer.writeAll(",\"_meta\":{\"fx\":{\"hooksVersion\":1}}");
     try out.writer.writeByte('}');
 
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());

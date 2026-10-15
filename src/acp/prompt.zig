@@ -1,3 +1,4 @@
+const work_contract = @import("../core/agent/runtime/work_contract.zig");
 const std = @import("std");
 const observation = @import("../core/agent/runtime/observation.zig");
 const testing_allocator = @import("../core/shared/testing_allocator.zig");
@@ -1903,11 +1904,33 @@ fn localFileTargetPath(alloc: Allocator, uri_text: []const u8) Allocator.Error!?
     };
 }
 
+fn assessContract(raw_ctx: *anyopaque, arena: Allocator, candidate: []const u8, turn_id: u64, step: usize) !work_contract.Decision {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const definition = try work_contract.parse(arena, ctx.state.work_contract_json orelse return error.InvalidWorkContract);
+    defer definition.deinit();
+    const session = if (ctx.state.active_session) |*active| active else return error.InvalidWorkContract;
+    const request = try std.json.Stringify.valueAlloc(arena, .{ .contract = definition.value, .assistantText = candidate, .step = step }, .{});
+    const call_id = try arena.print("contract:{d}:{d}", .{ turn_id, step });
+    // A steer waits for host verification just as it waits for a host tool.
+    // User cancellation still aborts the outstanding host request.
+    server.noteSteeringToolsPhase(ctx.state);
+    const provider: tool_dispatch.HostToolProvider = if (comptime host_target.is_wasm) js_host_tools.provider() else .{ .context = ctx.state, .call_fn = callHostTool };
+    const result = try provider.call(arena, work_contract.bridge_name, call_id, request, work_contract.max_bytes, &session.cancel_flag);
+    const raw = switch (result) {
+        .success => |text| text,
+        else => return error.ContractAssessmentFailed,
+    };
+    const decision = try work_contract.assess(arena, definition.value, raw);
+    ctx.stop_reason = if (decision.disposition == .blocked) .contract_blocked else .end_turn;
+    return decision;
+}
+
 fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
     const session = if (ctx.state.active_session) |*active| active else unreachable;
     return .{
         .ctx = @ptrCast(ctx),
         .observer = ctx.observer,
+        .assess_contract = if (ctx.state.work_contract_json != null) assessContract else null,
         .agent_stream_provider = server.streamProviderFor(ctx.state, ctx.state.active_session.?.provider),
         .confirm_session_writer = confirmSessionWriter,
         .report_usage = reportUsage,
