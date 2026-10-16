@@ -722,6 +722,21 @@ describe("Gemini setup", () => {
     } finally { f.close(); }
   });
 
+  test("keeps the profile valid when its connection limit is reached", async () => {
+    const f = fixture();
+    try {
+      const settings: any = f.settings;
+      for (let index = 2; index < 32; index++) settings.providers[`connection_${index}`] = settings.providers.local;
+      f.save();
+      const before = readFileSync(f.settingsPath, "utf8");
+      const result = await runFx(["setup", "gemini"], { cwd: f.workspace, env: { ...f.env, GEMINI_API_KEY: "fixture-key" } });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("LimitExceeded");
+      expect(readFileSync(f.settingsPath, "utf8")).toBe(before);
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  });
+
   test("refuses an existing Gemini name bound to another endpoint", async () => {
     const f = fixture();
     try {

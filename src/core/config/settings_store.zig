@@ -1074,6 +1074,8 @@ fn applyUserPatchToRoot(
             if (!std.mem.eql(u8, &old_binding, &new_binding)) return error.ConnectionAlreadyExists;
         } else {
             try providers.object.put(arena, try arena.dupe(u8, connection.id), parsed.value);
+            var merged_registry = try configured_provider.Registry.parse(arena, providers.*);
+            defer merged_registry.deinit(arena);
             application.changed = true;
         }
     }
