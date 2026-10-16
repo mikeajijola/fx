@@ -320,6 +320,7 @@ fn validate_history(alloc: Allocator, messages: []const types.ChatMessage) Error
 
 const reasoning_fields = [_][]const u8{ "reasoning", "reasoning_content" };
 const association_field = "_tool_call_ids";
+const signatures_field = "_tool_call_signatures";
 
 // The private association list never reaches the wire. Signed/encrypted metadata
 // is indivisible: filtering an associated call must drop the entire sequence.
@@ -347,6 +348,12 @@ fn parse_replay(alloc: Allocator, raw: []const u8) Error!std.json.Parsed(std.jso
                 for (value.array.items) |item| if (item != .object) return error.InvalidProviderState;
             }
             metadata_seen = true;
+        } else if (std.mem.eql(u8, key, signatures_field)) {
+            if (value != .array or value.array.items.len > max_selected_tools) return error.InvalidProviderState;
+            for (value.array.items) |signature| {
+                if (signature != .null and (signature != .string or signature.string.len == 0)) return error.InvalidProviderState;
+            }
+            metadata_seen = true;
         } else if (std.mem.eql(u8, key, association_field)) {
             if (value != .array or value.array.items.len > max_selected_tools) return error.InvalidProviderState;
             for (value.array.items, 0..) |id, index| {
@@ -356,6 +363,9 @@ fn parse_replay(alloc: Allocator, raw: []const u8) Error!std.json.Parsed(std.jso
         } else return error.InvalidProviderState;
     }
     if (!metadata_seen or !fields.contains(association_field)) return error.InvalidProviderState;
+    if (fields.get(signatures_field)) |signatures| {
+        if (signatures.array.items.len != fields.get(association_field).?.array.items.len) return error.InvalidProviderState;
+    }
     return parsed;
 }
 
@@ -375,14 +385,10 @@ pub fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []
     return if (replay_calls_match(parsed.value.object, calls)) value else null;
 }
 
-fn write_replay(writer: *std.Io.Writer, alloc: Allocator, message: types.ChatMessage) (Error || std.Io.Writer.Error)!void {
-    const replay = message.provider_replay orelse return;
-    var parsed = try parse_replay(alloc, replay.parts_json);
-    defer parsed.deinit();
-    if (!replay_calls_match(parsed.value.object, message.tool_calls)) return error.InvalidProviderState;
-    var fields = parsed.value.object.iterator();
+fn write_replay(writer: *std.Io.Writer, replay_fields: std.json.ObjectMap) std.Io.Writer.Error!void {
+    var fields = replay_fields.iterator();
     while (fields.next()) |entry| {
-        if (std.mem.eql(u8, entry.key_ptr.*, association_field)) continue;
+        if (std.mem.eql(u8, entry.key_ptr.*, association_field) or std.mem.eql(u8, entry.key_ptr.*, signatures_field)) continue;
         try writer.writeByte(',');
         try std.json.Stringify.value(entry.key_ptr.*, .{}, writer);
         try writer.writeByte(':');
@@ -544,7 +550,12 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
             } else {
                 try std.json.Stringify.value(message.content, .{}, writer);
             }
-            try write_replay(writer, alloc, message);
+            var replay = if (message.provider_replay) |state| try parse_replay(alloc, state.parts_json) else null;
+            defer if (replay) |*value| value.deinit();
+            if (replay) |value| {
+                if (!replay_calls_match(value.value.object, message.tool_calls)) return error.InvalidProviderState;
+                try write_replay(writer, value.value.object);
+            }
             if (message.role == .tool) {
                 try writer.writeAll(",\"tool_call_id\":");
                 try std.json.Stringify.value(projection.resolve(message.tool_call_id.?), .{}, writer);
@@ -559,7 +570,18 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
                     try std.json.Stringify.value(call.name, .{}, writer);
                     try writer.writeAll(",\"arguments\":");
                     try std.json.Stringify.value(call.arguments_json, .{}, writer);
-                    try writer.writeAll("}}");
+                    try writer.writeByte('}');
+                    if (replay) |value| {
+                        if (value.value.object.get(signatures_field)) |signatures| {
+                            const signature = signatures.array.items[index];
+                            if (signature != .null) {
+                                try writer.writeAll(",\"extra_content\":{\"google\":{\"thought_signature\":");
+                                try std.json.Stringify.value(signature, .{}, writer);
+                                try writer.writeAll("}}");
+                            }
+                        }
+                    }
+                    try writer.writeByte('}');
                 }
                 try writer.writeByte(']');
             }
@@ -630,11 +652,13 @@ const Deltas = struct {
 
 const Tool = struct {
     id: ?[]u8 = null,
+    signature: ?[]u8 = null,
     name: std.ArrayList(u8) = .empty,
     arguments: std.ArrayList(u8) = .empty,
 
     fn deinit(self: *Tool, alloc: Allocator) void {
         if (self.id) |id| alloc.free(id);
+        if (self.signature) |signature| alloc.free(signature);
         self.name.deinit(alloc);
         self.arguments.deinit(alloc);
     }
@@ -817,7 +841,9 @@ pub const Reducer = struct {
 
     /// Caller owns the bounded replay envelope; accumulators remain reducer-owned.
     fn reasoning_state(self: *const Reducer) (Error || std.Io.Writer.Error)!?[]u8 {
-        if (self.reasoning[0].presence == .absent and self.reasoning[1].presence == .absent and self.reasoning_details.presence == .absent) return null;
+        var has_signatures = false;
+        for (self.tools.items) |tool| has_signatures = has_signatures or tool.signature != null;
+        if (!has_signatures and self.reasoning[0].presence == .absent and self.reasoning[1].presence == .absent and self.reasoning_details.presence == .absent) return null;
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
         try out.writer.writeByte('{');
@@ -839,6 +865,14 @@ pub const Reducer = struct {
                 try out.writer.writeByte(']');
             }
             try out.writer.writeByte(',');
+        }
+        if (has_signatures) {
+            try out.writer.writeAll("\"" ++ signatures_field ++ "\":[");
+            for (self.tools.items, 0..) |tool, index| {
+                if (index != 0) try out.writer.writeByte(',');
+                try std.json.Stringify.value(tool.signature, .{}, &out.writer);
+            }
+            try out.writer.writeAll("],");
         }
         try out.writer.writeAll("\"" ++ association_field ++ "\":[");
         for (self.tools.items, 0..) |tool, index| {
@@ -877,6 +911,18 @@ pub const Reducer = struct {
             if (tool.id) |id| for (self.tools.items, 0..) |other, other_index| {
                 if (other_index != index and other.id != null and std.mem.eql(u8, id, other.id.?)) return error.ConflictingIdentity;
             };
+            if (non_null(delta, "extra_content")) |extra| {
+                if (non_null(try object(extra), "google")) |google| {
+                    if (non_null(try object(google), "thought_signature")) |signature| {
+                        const text = try string(signature);
+                        if (text.len != 0) {
+                            const first_signature = tool.signature == null;
+                            if (first_signature) try self.count_reasoning(text.len + 2);
+                            try self.accept_identity(&tool.signature, signature, @min(self.limits.reasoning_bytes, types.ProviderReplay.max_bytes));
+                        }
+                    }
+                }
+            }
             if (non_null(delta, "function")) |function_value| {
                 const function = try object(function_value);
                 if (non_null(function, "name")) |name_value| {
@@ -2571,4 +2617,67 @@ test "chat completions prose resembling a call stays prose and cancellation afte
     try test_accept(&cancelled, test_stop);
     try test_accept(&cancelled, "[DONE]");
     try std.testing.expectError(error.Cancelled, cancelled.finish(true));
+}
+
+test "chat completions Gemini signatures remain attached to their tool calls" {
+    const alloc = std.testing.allocator;
+    const provider = test_provider();
+    var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, test_call);
+    try test_accept(&reducer,
+        \\{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call-2","type":"function","function":{"name":"read_file","arguments":"{}"}}]}}]}
+    );
+    const signature_delta =
+        \\{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"extra_content":{"google":{"thought_signature":"opaque-google-signature"}}}]}}]}
+    ;
+    try test_accept(&reducer, signature_delta);
+    try test_accept(&reducer, signature_delta);
+    var result = try test_finish(&reducer, test_tools_finish);
+    defer result.deinit(alloc);
+    const completion = result.completed.completion;
+    const replay: types.ProviderReplay = .{ .source = .{ .provider = provider, .model = test_request().model }, .parts_json = completion.provider_state_json.? };
+    var request = test_request();
+    request.messages = &.{
+        .{ .role = .assistant, .tool_calls = completion.tool_calls, .provider_replay = replay },
+        .{ .role = .tool, .tool_call_id = completion.tool_calls[0].id, .content = "result" },
+        .{ .role = .tool, .tool_call_id = completion.tool_calls[1].id, .content = "second result" },
+    };
+    const body = try build_request(alloc, request, .{ .provider = &provider });
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const assistant = parsed.value.object.get("messages").?.array.items[2].object;
+    const call = assistant.get("tool_calls").?.array.items[0].object;
+    try std.testing.expectEqualStrings("opaque-google-signature", call.get("extra_content").?.object.get("google").?.object.get("thought_signature").?.string);
+    try std.testing.expect(assistant.get("tool_calls").?.array.items[1].object.get("extra_content") == null);
+    try std.testing.expect(assistant.get(signatures_field) == null);
+    try std.testing.expect(try project_replay(alloc, replay, &.{}, false, true) == null);
+    var other = provider;
+    other.configured.binding.?[0] ^= 1;
+    const stripped = try build_request(alloc, request, .{ .provider = &other });
+    defer alloc.free(stripped);
+    try std.testing.expect(std.mem.find(u8, stripped, "thought_signature") == null);
+}
+
+test "chat completions Gemini signature validation fails closed and stays bounded" {
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, test_call);
+    try test_accept(&reducer,
+        \\{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"extra_content":{"google":{"thought_signature":"first"}}}]}}]}
+    );
+    try std.testing.expectError(error.ConflictingIdentity, test_accept(&reducer,
+        \\{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"extra_content":{"google":{"thought_signature":"changed"}}}]}}]}
+    ));
+    var bounded = try Reducer.init(alloc, test_tool_request(), .{ .reasoning_bytes = 2 });
+    defer bounded.deinit();
+    try std.testing.expectError(error.ReplayTooLarge, test_accept(&bounded,
+        \\{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"extra_content":{"google":{"thought_signature":"too-large"}}}]}}]}
+    ));
+    for ([_][]const u8{
+        "{\"_tool_call_signatures\":[1],\"_tool_call_ids\":[\"call\"]}",
+        "{\"_tool_call_signatures\":[\"signature\"],\"_tool_call_ids\":[]}",
+    }) |raw| try std.testing.expectError(error.InvalidProviderState, parse_replay(alloc, raw));
 }

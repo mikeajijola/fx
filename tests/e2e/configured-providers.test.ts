@@ -663,7 +663,35 @@ os.close(master)
 print(json.dumps({"code": code, "output": output.decode(errors="replace")}))
 `;
 
+async function googleToolCompletion(model: string) {
+  const response = toolCompletion(model, "read_file", { path: "note.txt" }, "google-call-1");
+  const wire = (await response.text()).replace('"type":"function"', '"extra_content":{"google":{"thought_signature":"opaque-google-signature"}},"type":"function"');
+  return new Response(wire, { headers: response.headers });
+}
+
 describe("Gemini setup", () => {
+  test("Gemini tool signatures survive saved sessions and stay on their original connection", async () => {
+    let calls = 0;
+    const f = fixture(body => ++calls === 1 ? googleToolCompletion(body.model) : completion(body.model, "signed tool reply"));
+    try {
+      writeFileSync(join(f.workspace, "note.txt"), "fixture note");
+      const env = { ...f.env, FX_PROVIDER: "remote" };
+      const first = await runFx(["ask", "--json", "Read note.txt"], { cwd: f.workspace, env });
+      if (first.code !== 0) throw new Error(first.stdout + first.stderr);
+      const saved = JSON.parse(first.stdout);
+      expect(saved.output).toBe("signed tool reply");
+      const signedCall = (request: any) => request.body.messages.find((m: any) => m.role === "assistant" && m.tool_calls?.length)?.tool_calls[0];
+      expect(signedCall(f.requests[1]).extra_content.google.thought_signature).toBe("opaque-google-signature");
+      expect(first.stdout).not.toContain("opaque-google-signature");
+      const resumed = await runFx(["ask", "--json", "--resume", saved.session_id, "Continue"], { cwd: f.workspace, env });
+      if (resumed.code !== 0) throw new Error(resumed.stdout + resumed.stderr);
+      expect(signedCall(f.requests[2]).extra_content.google.thought_signature).toBe("opaque-google-signature");
+      const switched = await runFx(["ask", "--json", "--resume", saved.session_id, "Continue"], { cwd: f.workspace, env: { ...env, FX_PROVIDER: "local" } });
+      if (switched.code !== 0) throw new Error(switched.stdout + switched.stderr);
+      expect(signedCall(f.requests[3]).extra_content).toBeUndefined();
+    } finally { f.close(); }
+  }, 45000);
+
   test.skipIf(!Bun.which("python3"))("hides an immediate paste, saves a private key, and preserves it on cancellation", () => {
     const f = fixture();
     try {
@@ -765,7 +793,7 @@ describe("Gemini setup", () => {
 
   test("saved provider keys authenticate streaming and tools independently of Gateway keys", async () => {
     let calls = 0;
-    const f = fixture(body => ++calls === 1 ? toolCompletion(body.model, "read_file", { path: "note.txt" }) : completion(body.model, "Gemini tool flow passed"));
+    const f = fixture(body => ++calls === 1 ? googleToolCompletion(body.model) : completion(body.model, "Gemini tool flow passed"));
     try {
       const keys = join(f.home, ".fx", "provider-keys");
       mkdirSync(keys, { mode: 0o700 });
@@ -781,6 +809,8 @@ describe("Gemini setup", () => {
       expect(f.requests).toHaveLength(2);
       expect(f.requests.every(r => r.authorization === "Bearer fixture-saved-gemini-key")).toBe(true);
       expect(f.requests[1].body.messages.at(-1).content).toContain("fixture note");
+      const toolTurn = f.requests[1].body.messages.find((m: any) => m.tool_calls?.length);
+      expect(toolTurn.tool_calls[0].extra_content.google.thought_signature).toBe("opaque-google-signature");
       expect(result.stdout + result.stderr).not.toContain("fixture-saved-gemini-key");
       const overridden = await runFx(["ask", "--json", "--no-save", "Hello"], { cwd: f.workspace, env: { ...env, GEMINI_API_KEY: "fixture-env-key" }, timeoutMs: 20000 });
       expect(overridden.code).toBe(0);
