@@ -5,6 +5,7 @@ const app_lifecycle = @import("../app/app_lifecycle.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
+const gemini_setup = @import("../auth/gemini_setup.zig");
 const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
@@ -367,7 +368,7 @@ const LoadCatalogStartupStateWithAuthModeFn = *const fn (Allocator, host.SecretS
 const LoadStartupStatusWithAuthModeFn = *const fn (Allocator, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupStatus;
 const GetenvFn = *const fn (?*anyopaque, []const u8) ?[]const u8;
 const EnvironMapFn = *const fn (?*anyopaque) ?*const std.process.Environ.Map;
-const ReadMaskedKeyFn = *const fn (?*anyopaque, Allocator, WriteFn, ?*anyopaque) anyerror![]u8;
+const ReadMaskedKeyFn = *const fn (?*anyopaque, Allocator, WriteFn, ?*anyopaque, []const u8) anyerror![]u8;
 const SetupTerminalAvailableFn = *const fn (?*anyopaque) bool;
 const RunDeps = struct {
     stdout_ctx: ?*anyopaque = null,
@@ -1352,7 +1353,8 @@ fn runNonInteractiveWithDeps(
                 .handled_failure;
         },
         .setup => |rest| {
-            if (rest.len != 0) {
+            const gemini = rest.len == 1 and std.mem.eql(u8, rest[0], "gemini");
+            if (rest.len != 0 and !gemini) {
                 try writeTopLevelUsage(cfg.command_catalog, deps, .setup);
                 return .handled_failure;
             }
@@ -1360,6 +1362,7 @@ fn runNonInteractiveWithDeps(
                 try writeHostManagedAuthResult(deps);
                 return .handled_success;
             }
+            if (gemini) return if (try runGeminiSetup(alloc, cfg.secret_store, deps)) .handled_success else .handled_failure;
             return if (try runPasteSetup(alloc, cfg.secret_store, deps)) .handled_success else .handled_failure;
         },
         .status => |rest| {
@@ -2091,6 +2094,54 @@ fn writeStderr(deps: RunDeps, text: []const u8) !void {
     try deps.write_stderr(deps.stderr_ctx, text);
 }
 
+fn runGeminiSetup(alloc: Allocator, secret_store: host.SecretStore, deps: RunDeps) !bool {
+    gemini_setup.checkConnection(alloc) catch |err| {
+        const message = try alloc.print("fx setup gemini: could not configure connection ({s})\n", .{@errorName(err)});
+        defer alloc.free(message);
+        try writeStderr(deps, message);
+        return false;
+    };
+    const env_key = io_mod.getenv(gemini_setup.key_slot);
+    if (env_key == null or std.mem.trim(u8, env_key.?, " \t\r\n").len == 0) {
+        if (secret_store.isDisabled()) {
+            try writeStderr(deps, "fx setup gemini: stored API keys are disabled by FX_DISABLE_KEYCHAIN; set GEMINI_API_KEY instead\n");
+            return false;
+        }
+        if (!deps.setup_terminal_available(deps.setup_ctx)) {
+            try writeStderr(deps, "fx setup gemini: use an interactive terminal to paste a key, or set GEMINI_API_KEY\n");
+            return false;
+        }
+        const key = deps.read_masked_key(deps.setup_ctx, alloc, deps.write_stderr, deps.stderr_ctx, "Get a Gemini API key at https://aistudio.google.com/apikey\nPaste Gemini API key (input hidden): ") catch {
+            try writeStderr(deps, "\nfx setup gemini: API key was not saved\n");
+            return false;
+        };
+        defer secret.zeroAndFree(alloc, key);
+        try writeStderr(deps, "\n");
+        if (key.len == 0 or std.mem.trim(u8, key, " \t\r\n").len != key.len) {
+            try writeStderr(deps, "fx setup gemini: API key must be nonempty and contain no whitespace\n");
+            return false;
+        }
+        for (key) |byte| if (byte <= 0x20 or byte >= 0x7f) {
+            try writeStderr(deps, "fx setup gemini: API key must contain printable characters without whitespace\n");
+            return false;
+        };
+        secret_store.storeNamed(alloc, gemini_setup.key_slot, key) catch {
+            try writeStderr(deps, "fx setup gemini: API key was not saved\n");
+            return false;
+        };
+    }
+    gemini_setup.saveConnection(alloc) catch |err| {
+        const message = try alloc.print("fx setup gemini: could not save connection ({s}); rerun setup to retry\n", .{@errorName(err)});
+        defer alloc.free(message);
+        try writeStderr(deps, message);
+        return false;
+    };
+    try writeStdout(deps, "Gemini connection selected (" ++ gemini_setup.default_model ++ ").\n" ++
+        "Requests go directly to Google. GEMINI_API_KEY overrides the key saved in ~/.fx/provider-keys/GEMINI_API_KEY (private profile file).\n" ++
+        "Run fx to start, or fx --model <model-id> to choose another Gemini model.\n");
+    return true;
+}
+
 fn runPasteSetup(
     alloc: Allocator,
     secret_store: host.SecretStore,
@@ -2105,7 +2156,6 @@ fn runPasteSetup(
         return false;
     }
 
-    try writeStderr(deps, "Paste AI Gateway API key (input hidden): ");
     const stored_interactively = secret_store.storeInteractive() catch {
         try writeStderr(deps, "\nfx setup: API key was not saved\n");
         return false;
@@ -2116,6 +2166,7 @@ fn runPasteSetup(
             alloc,
             deps.write_stderr,
             deps.stderr_ctx,
+            "Paste AI Gateway API key (input hidden): ",
         ) catch {
             try writeStderr(deps, "\nfx setup: API key was not saved\n");
             return false;
@@ -2147,9 +2198,13 @@ fn readMaskedKeyDefault(
     alloc: Allocator,
     write_mask: WriteFn,
     write_ctx: ?*anyopaque,
+    prompt: []const u8,
 ) ![]u8 {
     var raw = try MaskedKeyRawMode.enable();
     defer raw.disable();
+    // Publish the paste target only after echo is off and the input flush is
+    // finished, so a paste triggered by the prompt cannot be echoed or lost.
+    try write_mask(write_ctx, prompt);
 
     var input: std.ArrayList(u8) = .empty;
     errdefer {
@@ -6289,9 +6344,11 @@ fn captureSetupTerminalAvailable(_: ?*anyopaque) bool {
 fn captureReadMaskedKey(
     ctx: ?*anyopaque,
     alloc: Allocator,
-    _: WriteFn,
-    _: ?*anyopaque,
+    write_mask: WriteFn,
+    write_ctx: ?*anyopaque,
+    prompt: []const u8,
 ) ![]u8 {
+    try write_mask(write_ctx, prompt);
     const capture: *CaptureOutput = @ptrCast(@alignCast(ctx.?));
     capture.setup_read_calls += 1;
     return alloc.dupe(u8, "paste-only-test-key");

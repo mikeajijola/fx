@@ -1620,7 +1620,8 @@ test "rendered top-level help is a complete CLI navigation page" {
     try std.testing.expect(std.mem.find(u8, text, "Sign in to a model provider") != null);
     try std.testing.expect(std.mem.find(u8, text, "Sign out of a model provider") != null);
     try std.testing.expect(std.mem.find(u8, text, "Choose the active model provider") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Configure a Vercel AI Gateway API key") != null);
+    try std.testing.expect(std.mem.find(u8, text, "setup [gemini]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Configure an AI Gateway or Gemini API key") != null);
     try std.testing.expect(std.mem.find(u8, text, "Choose a Vercel AI Gateway team") != null);
     try std.testing.expect(std.mem.find(u8, text, "Show Vercel AI Gateway credits") != null);
     try std.testing.expect(std.mem.find(u8, text, "Sign in to Vercel or a selected provider") == null);

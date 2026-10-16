@@ -116,8 +116,13 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .setup,
         .token = "setup",
-        .usage = "setup",
-        .summary = "Configure an AI Gateway API key",
+        .usage = "setup [gemini]",
+        .summary = "Configure an AI Gateway or Gemini API key",
+        .details = &.{
+            "Use fx setup gemini to connect directly to Google with your own API key.",
+            "Set GEMINI_API_KEY or paste a key at the hidden prompt. Pasted Gemini keys",
+            "are saved in a private profile file. Environment keys take precedence.",
+        },
     },
     .{
         .kind = .status,
@@ -322,7 +327,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .models, .usage = "models" },
     } },
     .{ .entries = &.{
-        .{ .kind = .setup, .usage = "setup", .summary = "Configure a Vercel AI Gateway API key" },
+        .{ .kind = .setup, .usage = "setup [gemini]", .summary = "Configure an AI Gateway or Gemini API key" },
         .{ .kind = .teams, .usage = "teams", .summary = "Choose a Vercel AI Gateway team" },
         .{ .kind = .credits, .usage = "credits|balance", .summary = "Show Vercel AI Gateway credits" },
     } },

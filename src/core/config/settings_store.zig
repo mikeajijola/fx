@@ -9,6 +9,7 @@ const compactor = @import("../compactor/compactor.zig");
 const context_limits = @import("context_limits.zig");
 const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
+const configured_provider = @import("configured_provider.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -92,7 +93,13 @@ pub const ProjectMcpMutation = struct {
     action: project_config.ProjectMcpAction,
 };
 
+pub const ConnectionPatch = struct {
+    id: []const u8,
+    definition_json: []const u8,
+};
+
 pub const UserSettingsPatch = struct {
+    connection: ?ConnectionPatch = null,
     model_preference: ?ModelPreferencePatch = null,
     provider: ?model_provider.ProviderId = null,
     permission_mode: ?types.PermissionMode = null,
@@ -116,7 +123,8 @@ pub const UserSettingsPatch = struct {
     notification_max: ?bool = null,
 
     fn isEmpty(self: UserSettingsPatch) bool {
-        return self.model_preference == null and
+        return self.connection == null and
+            self.model_preference == null and
             self.provider == null and
             self.permission_mode == null and
             self.credential_source == null and
@@ -1046,6 +1054,31 @@ fn applyUserPatchToRoot(
     patch: UserSettingsPatch,
 ) !PatchApplication {
     var application = PatchApplication{};
+    if (patch.connection) |connection| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, arena, connection.definition_json, .{ .duplicate_field_behavior = .@"error" });
+        var candidate: std.json.Value = .{ .object = .empty };
+        try candidate.object.put(arena, connection.id, parsed.value);
+        var registry = try configured_provider.Registry.parse(arena, candidate);
+        defer registry.deinit(arena);
+        if (!root.object.contains("providers")) try root.object.put(arena, "providers", .{ .object = .empty });
+        const providers = root.object.getPtr("providers").?;
+        if (providers.* != .object) return error.InvalidSettingsFormat;
+        // A setup preset must never silently redirect an existing connection.
+        if (providers.object.get(connection.id)) |existing| {
+            var existing_object: std.json.Value = .{ .object = .empty };
+            try existing_object.object.put(arena, connection.id, existing);
+            var existing_registry = try configured_provider.Registry.parse(arena, existing_object);
+            defer existing_registry.deinit(arena);
+            const old_binding = existing_registry.get(connection.id).?.binding_identity();
+            const new_binding = registry.get(connection.id).?.binding_identity();
+            if (!std.mem.eql(u8, &old_binding, &new_binding)) return error.ConnectionAlreadyExists;
+        } else {
+            try providers.object.put(arena, try arena.dupe(u8, connection.id), parsed.value);
+            var merged_registry = try configured_provider.Registry.parse(arena, providers.*);
+            defer merged_registry.deinit(arena);
+            application.changed = true;
+        }
+    }
     if (patch.model_preference) |preference| {
         application.changed = try putModelPreference(arena, &root.object, preference) or application.changed;
     }
@@ -4163,4 +4196,17 @@ test "workspace directory add compacts saved aliases before applying effective c
     defer alloc.free(retained_identity);
     try std.testing.expectEqualStrings(shared, retained_identity);
     try std.testing.expectEqualStrings(added, directories[1].string);
+}
+
+test "connection setup preserves settings and refuses to redirect an existing credential" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var root = (try std.json.parseFromSlice(std.json.Value, arena, "{\"fast_mode\":true,\"providers\":{\"other\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://other.example/v1\",\"auth\":{\"type\":\"none\"}}}}", .{})).value;
+    const patch = UserSettingsPatch{ .connection = .{ .id = "gemini", .definition_json = @import("../auth/gemini_setup.zig").definition_json } };
+    try std.testing.expect((try applyUserPatchToRoot(arena, &root, patch)).changed);
+    try std.testing.expect(root.object.get("fast_mode").?.bool);
+    try std.testing.expect(root.object.get("providers").?.object.contains("other"));
+    try std.testing.expect(!(try applyUserPatchToRoot(arena, &root, patch)).changed);
+    try std.testing.expectError(error.ConnectionAlreadyExists, applyUserPatchToRoot(arena, &root, .{ .connection = .{ .id = "gemini", .definition_json = "{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://other.example/v1\",\"auth\":{\"type\":\"bearer\",\"env\":\"GEMINI_API_KEY\"}}" } }));
 }

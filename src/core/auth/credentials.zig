@@ -387,7 +387,7 @@ pub fn resolveForProvider(
         const definition = registry.get(bound.label()).?;
         return switch (definition.auth) {
             .none => .{ .credential = .{ .token = try alloc.dupe(u8, ""), .source = .configured } },
-            .bearer => |env| .{ .credential = try loadEnvCredential(alloc, env, .configured) },
+            .bearer => |env| .{ .credential = try loadConfiguredCredential(alloc, secret_store, env) },
         };
     }
     if (provider != .gateway) {
@@ -634,6 +634,14 @@ pub fn requireSignInStorage(source: Source) error{CredentialStorageUnavailable}!
         .grok_subscription => try grok_session.requireSignInStorage(),
         else => {},
     }
+}
+
+/// An exported key takes precedence over the key saved by setup. The named
+/// host slot cannot fall back to the unrelated Gateway key.
+fn loadConfiguredCredential(alloc: std.mem.Allocator, secret_store: host.SecretStore, env: []const u8) !?Credential {
+    if (try loadEnvCredential(alloc, env, .configured)) |credential| return credential;
+    const token = try secret_store.loadNamed(alloc, env) orelse return null;
+    return .{ .token = token, .source = .configured };
 }
 
 fn loadEnvCredential(
@@ -1657,4 +1665,33 @@ test "a disabled store still reports why the fx login was silent" {
     try std.testing.expect(resolution.credential == null);
     try std.testing.expectEqual(FxLoginReadStatus.unavailable, resolution.fx_login_status);
     try std.testing.expectEqual(StoredKeyReadStatus.not_attempted, resolution.stored_key_status);
+}
+
+test "configured saved keys respect environment precedence and never load the Gateway key" {
+    const alloc = std.testing.allocator;
+    var env = try CredentialTestEnv.install(alloc, &.{.{ "GEMINI_API_KEY", "environment-gemini-key" }});
+    defer env.deinit();
+    var fixture = SecretStoreFixture{ .value = "unrelated-gateway-key" };
+    var store = fixture.provider();
+    const Named = struct {
+        fn load(_: ?*anyopaque, allocator: std.mem.Allocator, name: []const u8) host.SecretStoreLoadError!?[]u8 {
+            if (!std.mem.eql(u8, name, "GEMINI_API_KEY")) return error.StoredKeyUnreadable;
+            return try allocator.dupe(u8, "saved-gemini-key");
+        }
+    };
+    store.load_named_fn = Named.load;
+    var from_env = (try loadConfiguredCredential(alloc, store, "GEMINI_API_KEY")).?;
+    defer from_env.deinit(alloc);
+    try std.testing.expectEqualStrings("environment-gemini-key", from_env.token);
+    try std.testing.expectEqual(Source.configured, from_env.source);
+    _ = env.map.swapRemove("GEMINI_API_KEY");
+    var saved = (try loadConfiguredCredential(alloc, store, "GEMINI_API_KEY")).?;
+    defer saved.deinit(alloc);
+    try std.testing.expectEqualStrings("saved-gemini-key", saved.token);
+    fixture.disabled = true;
+    try std.testing.expect(try loadConfiguredCredential(alloc, store, "GEMINI_API_KEY") == null);
+    fixture.disabled = false;
+    store.load_named_fn = null;
+    try std.testing.expect(try loadConfiguredCredential(alloc, store, "GEMINI_API_KEY") == null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.load_calls);
 }
