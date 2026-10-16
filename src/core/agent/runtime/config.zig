@@ -49,6 +49,8 @@ pub const Config = struct {
     step_limit_notice: []const u8 = default_step_limit_notice,
     cancel_flag: *std.atomic.Value(bool),
     review_enabled: bool = false,
+    contract_review_enabled: bool = false,
+    contract_review_model: []const u8 = "",
     fast_mode: bool = false,
     ultrafast_mode: bool = false,
     effort: ReasoningEffort = .auto,

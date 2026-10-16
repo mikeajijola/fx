@@ -94,6 +94,7 @@ pub fn writeModelRecoveryInfoUpdate(
 
 pub const StopReason = enum {
     end_turn,
+    contract_blocked,
     max_output_tokens,
     max_model_turns,
     refused,
@@ -105,6 +106,7 @@ pub const StopReason = enum {
     pub fn jsonString(self: StopReason) []const u8 {
         return switch (self) {
             .end_turn => "end_turn",
+            .contract_blocked => "contract_blocked",
             .max_output_tokens => "max_output_tokens",
             .max_model_turns => "max_model_turns",
             .refused => "refused",

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
@@ -822,4 +822,152 @@ describe("Gemini setup", () => {
       expect(f.requests).toHaveLength(count);
     } finally { f.close(); }
   }, 45000);
+});
+
+
+describe("CLI work contracts", () => {
+  function isReview(body: any) {
+    return body.tools?.some((tool: any) => tool.function?.name === "omos_contract_assessment");
+  }
+  function assessment(body: any, status: string, evidence?: string[]) {
+    const packet = JSON.parse(body.messages.at(-1).content);
+    return toolCompletion(body.model, "omos_contract_assessment", {
+      contractId: packet.contract.id, version: packet.contract.version,
+      obligations: [{ id: "request_complete", status,
+        note: status === "pending" ? "Read and verify note.txt before finishing." : "Assessed the recorded work.",
+        evidence: evidence ?? (status === "met" ? [packet.evidence.find((record: any) => record.tool)?.id ?? packet.evidence.at(-1).id] : []),
+      }],
+    }, "review-call");
+  }
+
+  test("continues a premature done reply and verifies recorded execution on the same provider", async () => {
+    let actorCalls = 0, reviews = 0;
+    const f = fixture(body => {
+      if (isReview(body)) {
+        reviews++;
+        expect(body.tools).toHaveLength(1);
+        const packet = JSON.parse(body.messages.at(-1).content);
+        expect(packet.originalRequest).toBe("Read note.txt and report its contents");
+        expect(JSON.stringify(packet)).not.toContain("own-provider-token");
+        if (reviews === 2) {
+          const read = packet.evidence.find((record: any) => record.tool === "read_file");
+          expect(read.status).toBe("success");
+          expect(read.content).toContain("host verified contents");
+        }
+        return assessment(body, reviews === 1 ? "pending" : "met");
+      }
+      actorCalls++;
+      if (actorCalls === 1) return completion(body.model, "Done.");
+      if (actorCalls === 2) {
+        expect(JSON.stringify(body.messages)).toContain("Read and verify note.txt before finishing");
+        return toolCompletion(body.model, "read_file", { path: "note.txt" });
+      }
+      return completion(body.model, "host verified contents");
+    });
+    try {
+      writeFileSync(join(f.workspace, "note.txt"), "host verified contents");
+      const result = await runFx(["ask", "--json", "Read note.txt and report its contents"], {
+        cwd: f.workspace, env: { ...f.env, FX_PROVIDER: "remote", FX_CONTRACT_REVIEW: "1" }, timeoutMs: 25000,
+      });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(JSON.parse(result.stdout).output).toContain("host verified contents");
+      expect(actorCalls).toBe(3);
+      expect(reviews).toBe(2);
+      expect(f.requests).toHaveLength(5);
+      expect(f.requests.every(request => request.authorization === "Bearer own-provider-token")).toBe(true);
+    } finally { f.close(); }
+  }, 30000);
+
+  test.each(["invented", "malformed", "blocked", "unavailable"])("does not claim completion when review is %s", async mode => {
+    const f = fixture(body => {
+      if (!isReview(body)) return completion(body.model, "Done.");
+      if (mode === "unavailable") return new Response("unavailable", { status: 503 });
+      if (mode === "malformed") return completion(body.model, "Trust me, it passed.");
+      return assessment(body, mode === "blocked" ? "blocked" : "met", mode === "invented" ? ["made-up-receipt"] : []);
+    });
+    try {
+      const result = await runFx(["ask", "--json", "Verify the task"], {
+        cwd: f.workspace, env: { ...f.env, FX_CONTRACT_REVIEW: "1" }, timeoutMs: 20000,
+      });
+      expect(result.code).not.toBe(0);
+      expect(result.stdout + result.stderr).toMatch(/Contract|contract|Invalid|failed/);
+    } finally { f.close(); }
+  }, 25000);
+
+  test("pending work at the step limit remains incomplete", async () => {
+    const f = fixture(body => isReview(body) ? assessment(body, "pending") : completion(body.model, "Done."));
+    try {
+      const result = await runFx(["ask", "--json", "Read the note"], {
+        cwd: f.workspace, env: { ...f.env, FX_CONTRACT_REVIEW: "1", FX_MAX_AGENT_STEPS: "1" }, timeoutMs: 20000,
+      });
+      expect(result.code).not.toBe(0);
+      expect(result.stdout + result.stderr).toContain("step limit");
+    } finally { f.close(); }
+  }, 25000);
+
+  test("uses the configured review model on the same connection", async () => {
+    const f = fixture(body => {
+      if (isReview(body)) {
+        expect(body.model).toBe("review-model");
+        return assessment(body, "met");
+      }
+      expect(body.model).toBe("local-model");
+      return completion(body.model, "Hello");
+    });
+    try {
+      (f.settings.providers.local as any).reviewer_model = "review-model";
+      f.save();
+      const result = await runFx(["ask", "--json", "Say hello"], {
+        cwd: f.workspace, env: { ...f.env, FX_CONTRACT_REVIEW: "1" }, timeoutMs: 20000,
+      });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(f.requests).toHaveLength(2);
+    } finally { f.close(); }
+  }, 25000);
+
+  test("cancellation stops an in-flight completion review", async () => {
+    let started!: () => void;
+    const reviewStarted = new Promise<void>(resolve => { started = resolve; });
+    const f = fixture(body => {
+      if (!isReview(body)) return completion(body.model, "Candidate answer");
+      started();
+      return new Promise<Response>(() => {});
+    });
+    let child: ReturnType<typeof Bun.spawn> | undefined;
+    try {
+      const env: Record<string, string> = {};
+      for (const [key, value] of Object.entries({ ...process.env, ...f.env, FX_CONTRACT_REVIEW: "1" })) {
+        if (value !== undefined) env[key] = value;
+      }
+      child = Bun.spawn([FX_BIN, "ask", "--json", "Do the task"], { cwd: f.workspace, env, stdout: "pipe", stderr: "pipe" });
+      const output = new Response(child.stdout as ReadableStream).text();
+      const errors = new Response(child.stderr as ReadableStream).text();
+      await reviewStarted;
+      child.kill("SIGINT");
+      expect(await child.exited).not.toBe(0);
+      expect(await output).not.toContain('"exit_code":0');
+      await errors;
+    } finally { child?.kill(); f.close(); }
+  }, 15000);
+
+  test.each(["omos", "omo"])("%s enables contract review without an environment switch", async name => {
+    let reviews = 0;
+    const f = fixture(body => {
+      if (isReview(body)) { reviews++; return assessment(body, "met"); }
+      return completion(body.model, "Hello from the CLI");
+    });
+    try {
+      const alias = join(f.home, name);
+      symlinkSync(FX_BIN, alias);
+      const env: Record<string, string> = {};
+      for (const [key, value] of Object.entries({ ...process.env, ...f.env, FX_CONTRACT_REVIEW: undefined })) {
+        if (value !== undefined) env[key] = value;
+      }
+      const child = Bun.spawn([alias, "ask", "--json", "Say hello"], { cwd: f.workspace, env, stdout: "pipe", stderr: "pipe" });
+      const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      if (code !== 0) throw new Error(stdout + stderr);
+      expect(JSON.parse(stdout).output).toBe("Hello from the CLI");
+      expect(reviews).toBe(1);
+    } finally { f.close(); }
+  }, 25000);
 });

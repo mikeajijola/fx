@@ -1,3 +1,4 @@
+const work_contract = @import("../core/agent/runtime/work_contract.zig");
 const std = @import("std");
 const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const managed_execution = @import("../core/execution/managed_execution.zig");
@@ -368,6 +369,7 @@ pub const ServerState = struct {
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     host_tools: host_tool_runtime.Runtime = .{},
     host_instructions: []u8 = &.{},
+    work_contract_json: ?[]u8 = null,
     outbound_mutex: std.Io.Mutex = .init,
     outbound_cond: std.Io.Condition = .init,
     next_outbound_request_id: u64 = 1,
@@ -408,6 +410,7 @@ pub const ServerState = struct {
         self.lifecycle_runtime.deinit();
         self.host_tools.deinit();
         if (self.host_instructions.len > 0) self.alloc.free(self.host_instructions);
+        if (self.work_contract_json) |raw| self.alloc.free(raw);
         self.capability_resolver.deinit(self.alloc);
         var pending = self.pending_outbound.valueIterator();
         while (pending.next()) |entry| {
@@ -2440,10 +2443,12 @@ const InitializeRequest = struct {
     client_elicitation: elicitation.Capabilities = .{},
     host_tools: host_tool_runtime.Runtime = .{},
     host_instructions: []u8 = &.{},
+    work_contract_json: ?[]u8 = null,
 
     fn deinit(self: *InitializeRequest, alloc: Allocator) void {
         self.host_tools.deinit();
         if (self.host_instructions.len > 0) alloc.free(self.host_instructions);
+        if (self.work_contract_json) |raw| alloc.free(raw);
         self.* = .{};
     }
 };
@@ -2499,12 +2504,26 @@ fn parseInitializeRequest(
                 libfx.object.get("tools"),
                 libfx_provider_tool_registry,
             );
-            errdefer request.host_tools.deinit();
+            errdefer request.deinit(alloc);
+            for (request.host_tools.tools) |tool| {
+                if (std.mem.eql(u8, tool.name, work_contract.bridge_name)) return error.InvalidInitializeParams;
+            }
+            if (libfx.object.get("contract")) |contract| {
+                const raw_contract = try std.json.Stringify.valueAlloc(alloc, contract, .{});
+                request.work_contract_json = raw_contract;
+                const checked = try work_contract.parse(alloc, raw_contract);
+                checked.deinit();
+            }
             if (libfx.object.get("instructions")) |instructions| {
                 if (instructions != .string or instructions.string.len > 64 * 1024) {
                     return error.InvalidInitializeParams;
                 }
                 request.host_instructions = try alloc.dupe(u8, instructions.string);
+            }
+            if (request.work_contract_json) |contract| {
+                const combined = try alloc.print("{s}\nWork contract (host-owned requirements): {s}\nFulfil every obligation. A reply does not complete the work; the host assesses its evidence. Do not weaken the contract or replay completed external actions.", .{ request.host_instructions, contract });
+                if (request.host_instructions.len > 0) alloc.free(request.host_instructions);
+                request.host_instructions = combined;
             }
         }
     }
@@ -2819,6 +2838,9 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     if (state.host_instructions.len > 0) alloc.free(state.host_instructions);
     state.host_instructions = request.host_instructions;
     request.host_instructions = &.{};
+    if (state.work_contract_json) |raw| alloc.free(raw);
+    state.work_contract_json = request.work_contract_json;
+    request.work_contract_json = null;
     debug_trace.logf("acp", "libfx host capabilities tools={d} instructions_bytes={d}", .{
         state.host_tools.tools.len,
         state.host_instructions.len,

@@ -1,3 +1,4 @@
+const completion_review = @import("../agent/runtime/completion_review.zig");
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const std_builtin = @import("builtin");
@@ -2070,6 +2071,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .max_tool_result_bytes = startup.max_tool_result_bytes,
         .auto_compact_percent = startup.auto_compact_percent,
         .cancel_flag = ctx.cancelFlag(),
+        .contract_review_enabled = completion_review.enabled(),
+        .contract_review_model = completion_review.selectModel(ctx.reviewer_model, ctx.provider, cfg.provider_set.definitions, ctx.model),
         .fast_mode = ctx.fast_mode,
         .ultrafast_mode = ctx.ultrafast_mode,
         .effort = ctx.effort,

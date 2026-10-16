@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
+const completion_review = @import("core/agent/runtime/completion_review.zig");
 
 pub const version = "0.0.14";
 
@@ -3566,6 +3567,7 @@ fn writeTopLevelHelpFast(raw_env: RawEnviron) !void {
 
 fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_args: []const [:0]const u8) !void {
     io_mod.setRawEnviron(raw_env);
+    completion_review.configureInvocation(if (raw_args.len > 0) std.mem.span(raw_args[0]) else "fx");
 
     const alloc = processAllocator();
     const auth_mode = credentials.parseAuthMode(rawEnvValue(raw_env, "FX_AUTH_MODE")) catch {

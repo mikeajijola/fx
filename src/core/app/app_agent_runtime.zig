@@ -1,3 +1,4 @@
+const completion_review = @import("../agent/runtime/completion_review.zig");
 const std = @import("std");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
@@ -1279,6 +1280,11 @@ pub fn Runtime(comptime App: type) type {
                 .auto_compact_percent = job.agent_settings.auto_compact_percent,
                 .cancel_flag = &app.worker.worker_cancel_requested,
                 .review_enabled = false,
+                .contract_review_enabled = completion_review.enabled(),
+                .contract_review_model = if (comptime @hasField(App, "review_model") and @hasDecl(App, "providerSet"))
+                    completion_review.selectModel(app.review_model, job.provider, app.providerSet().definitions, job.model)
+                else
+                    job.model,
                 .fast_mode = job.agent_settings.fast_mode,
                 .ultrafast_mode = job.agent_settings.ultrafast_mode,
                 .effort = job.agent_settings.effort,

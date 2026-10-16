@@ -1,3 +1,5 @@
+const work_contract = @import("work_contract.zig");
+const completion_review = @import("completion_review.zig");
 const std = @import("std");
 const testing_allocator = @import("../../shared/testing_allocator.zig");
 const skill_runtime = @import("../../skills/skill_runtime.zig");
@@ -193,6 +195,7 @@ fn append_steering_guidance(
                 try runtime_execution_memory.parentSteeringMessage(arena, text)
             else
                 try runtime_execution_memory.steeringMessage(arena, text),
+            .context_origin = if (origin == .root) .user_turn else .ordinary,
         });
     }
 }
@@ -6811,6 +6814,66 @@ test "compaction activity transaction settles only after publication and preserv
     }
 }
 
+const ContractCandidate = struct {
+    config: Config,
+    job: worker_runtime.QueuedPrompt,
+    candidate: []const u8,
+    messages: []const ChatMessage,
+    api_key: []const u8,
+    model: []const u8,
+    root_user_context: []const u8,
+    turn_id: u64,
+    step: usize,
+};
+
+fn assessCompletionContract(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    summary: *runtime_telemetry.TurnSummaryAccumulator,
+    input: ContractCandidate,
+) !work_contract.Decision {
+    if (deps.assess_contract) |assess_contract| {
+        return assess_contract(deps.ctx, arena, input.candidate, input.turn_id, input.step);
+    }
+    try deps.push_system_notice(deps.ctx, "Checking work contract...");
+    var delivery: agent_stream_provider.DeliveryCertainty = .init();
+    var evidence: agent_stream_provider.AttemptEvidence = .{};
+    var event_context: u8 = 0;
+    const result = completion_review.assess(arena, deps.agent_stream_provider, .{
+        .prompt = input.job.prompt,
+        .root_user_context = input.root_user_context,
+        .candidate = input.candidate,
+        .messages = input.messages,
+        .request = .{
+            .observer = deps.observer,
+            .credential = activeCredentialLease(input.api_key, input.job),
+            .model = if (input.config.contract_review_model.len > 0) input.config.contract_review_model else input.model,
+            .retry_count = 1,
+            .messages = &.{},
+            .tool_choice = .required,
+            .provider_options = .{},
+            .trace_ctx = .{ .turn_id = input.turn_id },
+            .content_capture_limit = work_contract.max_bytes,
+            .deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(60_000) }),
+            .delivery = &delivery,
+            .attempt_evidence = &evidence,
+            .events = .{ .context = &event_context, .emit_fn = discardContractEvent },
+            .cooperative_pulse = deps.cooperative_transport_pulse,
+            .cancel_flag = input.config.cancel_flag,
+        },
+    }) catch |err| {
+        if (err != error.Cancelled) try deps.push_system_notice(deps.ctx, "Completion could not be verified; the task remains incomplete.");
+        return err;
+    };
+    if (deps.report_usage) |report| report(deps.ctx, result.usage);
+    summary.prepareTokenRequest();
+    _ = summary.reconcileTokenRequest(result.usage, false);
+    debug_trace.eventf("agent", "contract_assessment", .{ .turn_id = input.turn_id }, "disposition={s} step={d}", .{ @tagName(result.decision.disposition), input.step });
+    return result.decision;
+}
+
+fn discardContractEvent(_: *anyopaque, _: agent_stream_provider.Event) void {}
+
 fn processQueuedPromptLoop(
     deps: *const AgentRuntimeDeps,
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
@@ -6902,6 +6965,7 @@ fn processQueuedPromptLoop(
                 job.history,
             ),
     };
+    const contract_enabled = deps.assess_contract != null or (config.contract_review_enabled and config.origin == .root);
     var active_api_key: []const u8 = job.api_key;
     var owned_refreshed_api_key: ?[]u8 = null;
     defer if (owned_refreshed_api_key) |key| secret.zeroAndFree(std.heap.c_allocator, key);
@@ -9481,7 +9545,7 @@ fn processQueuedPromptLoop(
                     history_text,
                     history_replay,
                     config.origin,
-                    if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model,
+                    if (contract_enabled and disposition == .completed) .model else if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model,
                 ))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
@@ -9490,6 +9554,44 @@ fn processQueuedPromptLoop(
 
             if (disposition == .completed and agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                 try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, history_text, history_replay)) continue;
+
+            // Contract completion is checked on every normal model stop, not
+            // once per turn like an advisory stop hook. Failures and cancellation
+            // propagate; neither can be mistaken for accepted work.
+            if (disposition == .completed) {
+                if (contract_enabled) {
+                    const decision = try assessCompletionContract(deps, arena, &summary_accumulator, .{
+                        .config = config,
+                        .job = job,
+                        .candidate = history_text,
+                        .messages = within_turn_suffix.items,
+                        .api_key = active_api_key,
+                        .model = successful_gateway_model,
+                        .root_user_context = root_user_intent_context,
+                        .turn_id = turn_id,
+                        .step = current_step_index,
+                    });
+                    if (deps.assess_contract == null and decision.disposition == .blocked) {
+                        try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, decision.feedback, "contract_blocked");
+                        return;
+                    }
+                    if (config.cancel_flag.load(.seq_cst)) return error.Cancelled;
+                    if (decision.disposition == .continue_work) {
+                        try within_turn_suffix.append(arena, .{ .role = .assistant, .content = history_text, .provider_replay = history_replay });
+                        try within_turn_suffix.append(arena, .{ .role = .user, .content = decision.feedback });
+                        try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                        continue;
+                    }
+                    // Only an accepted assessment may close steering. A steer
+                    // received while the host assessed joins before completion.
+                    if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+                        try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, history_text, history_replay, config.origin, if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model))
+                    {
+                        try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                        continue;
+                    }
+                }
+            }
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 if (!has_content) {
@@ -12290,7 +12392,7 @@ fn processQueuedPromptLoop(
                     raw_final,
                     final_provider_replay,
                     config.origin,
-                    if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model,
+                    if (contract_enabled) .model else if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model,
                 ))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
@@ -12299,6 +12401,39 @@ fn processQueuedPromptLoop(
 
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                 try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, raw_final, final_provider_replay)) continue;
+
+            // A provider may return a final answer together with hosted tool
+            // results. It must pass the same gate as a text-only completion.
+            if (contract_enabled) {
+                const decision = try assessCompletionContract(deps, arena, &summary_accumulator, .{
+                    .config = config,
+                    .job = job,
+                    .candidate = raw_final,
+                    .messages = within_turn_suffix.items,
+                    .api_key = active_api_key,
+                    .model = successful_gateway_model,
+                    .root_user_context = root_user_intent_context,
+                    .turn_id = turn_id,
+                    .step = current_step_index,
+                });
+                if (deps.assess_contract == null and decision.disposition == .blocked) {
+                    try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, decision.feedback, "contract_blocked");
+                    return;
+                }
+                if (config.cancel_flag.load(.seq_cst)) return error.Cancelled;
+                if (decision.disposition == .continue_work) {
+                    try within_turn_suffix.append(arena, .{ .role = .assistant, .content = raw_final, .provider_replay = final_provider_replay });
+                    try within_turn_suffix.append(arena, .{ .role = .user, .content = decision.feedback });
+                    try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                    continue;
+                }
+                if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+                    try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, raw_final, final_provider_replay, config.origin, if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model))
+                {
+                    try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                    continue;
+                }
+            }
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
