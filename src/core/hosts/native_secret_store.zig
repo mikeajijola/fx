@@ -24,6 +24,8 @@ pub const provider: host.SecretStore = .{
     .presence_fn = presenceCallback,
     .load_fn = loadCallback,
     .store_fn = storeCallback,
+    .load_named_fn = loadNamedCallback,
+    .store_named_fn = storeNamedCallback,
     .store_interactive_fn = storeInteractiveCallback,
 };
 
@@ -137,7 +139,11 @@ fn loadFromProfile(alloc: Allocator) LoadError!?[]u8 {
 }
 
 fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) LoadError!?[]u8 {
-    var file = fx_dir.openFile(io_mod.getIo(), profile_paths.api_key_file_name, .{
+    return loadFileFromDir(alloc, fx_dir, profile_paths.api_key_file_name);
+}
+
+fn loadFileFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, name: []const u8) LoadError!?[]u8 {
+    var file = fx_dir.openFile(io_mod.getIo(), name, .{
         .mode = .read_only,
         .allow_directory = false,
         .follow_symlinks = false,
@@ -283,4 +289,53 @@ test "stored key file tolerates a trailing newline and rejects an empty value" {
     try std.testing.expect((try loadFromDir(std.testing.allocator, &fx_dir.dir)) == null);
 
     try std.testing.expectError(error.StoredKeyWriteFailed, store(std.testing.allocator, ""));
+}
+
+// Named provider keys use private profile files on every native platform.
+// Keeping the environment slot in the filename avoids mixing Gateway credentials
+// with a direct provider's credential.
+fn validSlot(name: []const u8) bool {
+    if (name.len == 0 or name.len > 128) return false;
+    if (!std.ascii.isAlphabetic(name[0]) and name[0] != '_') return false;
+    for (name) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_') return false;
+    return true;
+}
+
+fn loadNamedCallback(_: ?*anyopaque, alloc: Allocator, name: []const u8) LoadError!?[]u8 {
+    if (!validSlot(name)) return error.StoredKeyUnreadable;
+    const home = io_mod.homeDir() orelse return error.StoredKeyUnreadable;
+    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{}) catch return error.StoredKeyUnreadable;
+    defer home_dir.close(io_mod.getIo());
+    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return error.StoredKeyUnreadable,
+    };
+    defer fx_dir.close(io_mod.getIo());
+    var keys_dir = fx_dir.openDir(io_mod.getIo(), "provider-keys", .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return error.StoredKeyUnreadable,
+    };
+    defer keys_dir.close(io_mod.getIo());
+    return loadFileFromDir(alloc, &keys_dir, name);
+}
+
+fn storeNamedCallback(_: ?*anyopaque, alloc: Allocator, name: []const u8, value: []const u8) StoreError!void {
+    if (!validSlot(name) or value.len == 0 or value.len > max_key_file_bytes) return error.StoredKeyWriteFailed;
+    const home = io_mod.homeDir() orelse return error.StoredKeyWriteFailed;
+    var home_dir = io_mod.VerifiedDir{ .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch return error.StoredKeyWriteFailed };
+    defer home_dir.close();
+    var fx_dir = io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name) catch return error.StoredKeyWriteFailed;
+    defer fx_dir.close();
+    var keys_dir = io_mod.openOrCreateVerifiedPrivateDir(&fx_dir, "provider-keys") catch return error.StoredKeyWriteFailed;
+    defer keys_dir.close();
+    io_mod.durableReplaceVerified(alloc, &keys_dir, name, value) catch |err| return writeFailed("named_key", err);
+}
+
+test "named key slots cannot escape the private provider key directory" {
+    for ([_][]const u8{ "", "../api-key", "/tmp/key", "nested/key", "key.txt", "1KEY" }) |name| {
+        try std.testing.expect(!validSlot(name));
+        try std.testing.expectError(error.StoredKeyWriteFailed, storeNamedCallback(null, std.testing.allocator, name, "fixture-key"));
+        try std.testing.expectError(error.StoredKeyUnreadable, loadNamedCallback(null, std.testing.allocator, name));
+    }
+    try std.testing.expect(validSlot("GEMINI_API_KEY"));
 }

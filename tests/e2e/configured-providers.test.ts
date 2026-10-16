@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { completion, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
 
@@ -631,4 +632,149 @@ describe("configured providers", () => {
       expect(f.requests).toHaveLength(0);
     } finally { f.close(); }
   }, 25000);
+});
+
+const setupPtyScript = String.raw`
+import json, os, pty, select, subprocess, sys, time
+master, slave = pty.openpty()
+proc = subprocess.Popen([sys.argv[1], "setup", "gemini"], stdin=slave, stdout=slave, stderr=slave)
+os.close(slave)
+output = b""
+sent = False
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline:
+    if select.select([master], [], [], 0.1)[0]:
+        try:
+            chunk = os.read(master, 8192)
+            if not chunk: break
+            output += chunk
+        except OSError:
+            break
+    if b"input hidden" in output and not sent:
+        os.write(master, b"\x03" if sys.argv[2] == "cancel" else b"fixture-pasted-gemini-key\n")
+        sent = True
+try:
+    code = proc.wait(timeout=2)
+except subprocess.TimeoutExpired:
+    proc.kill()
+    proc.wait()
+    raise RuntimeError("setup did not finish")
+os.close(master)
+print(json.dumps({"code": code, "output": output.decode(errors="replace")}))
+`;
+
+describe("Gemini setup", () => {
+  test.skipIf(!Bun.which("python3"))("hides an immediate paste, saves a private key, and preserves it on cancellation", () => {
+    const f = fixture();
+    try {
+      const env = { ...process.env, ...f.env, GEMINI_API_KEY: undefined, FX_DISABLE_KEYCHAIN: undefined };
+      const interact = (action: string) => {
+        const result = spawnSync("python3", ["-c", setupPtyScript, FX_BIN, action], { env, cwd: f.workspace, encoding: "utf8", timeout: 15000 });
+        if (result.status !== 0) throw new Error(result.stderr + result.stdout);
+        return JSON.parse(result.stdout);
+      };
+      const pasted = interact("paste");
+      expect(pasted.code).toBe(0);
+      expect(pasted.output).not.toContain("fixture-pasted-gemini-key");
+      const keyPath = join(f.home, ".fx", "provider-keys", "GEMINI_API_KEY");
+      expect(readFileSync(keyPath, "utf8")).toBe("fixture-pasted-gemini-key");
+      expect(statSync(keyPath).mode & 0o777).toBe(0o600);
+      const before = readFileSync(f.settingsPath, "utf8");
+      expect(JSON.parse(before).provider).toBe("gemini");
+      expect(before).not.toContain("fixture-pasted-gemini-key");
+      expect(interact("cancel").code).toBe(1);
+      expect(readFileSync(keyPath, "utf8")).toBe("fixture-pasted-gemini-key");
+      expect(readFileSync(f.settingsPath, "utf8")).toBe(before);
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  }, 30000);
+
+  test("registers Google's endpoint, selects Gemini, and preserves existing profile settings", async () => {
+    const f = fixture();
+    const env = { ...f.env, GEMINI_API_KEY: "fixture-gemini-env-key", FX_DISABLE_KEYCHAIN: "1" };
+    try {
+      const result = await runFx(["setup", "gemini"], { cwd: f.workspace, env });
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toContain("Gemini connection selected");
+      expect(result.stdout).not.toContain(env.GEMINI_API_KEY);
+      const saved = JSON.parse(readFileSync(f.settingsPath, "utf8"));
+      expect(saved.provider).toBe("gemini");
+      expect(saved.models.gemini).toBe("gemini-3.8-flash");
+      expect(saved.providers.gemini.base_url).toBe("https://generativelanguage.googleapis.com/v1beta/openai");
+      expect(saved.providers.gemini.auth).toEqual({ type: "bearer", env: "GEMINI_API_KEY" });
+      expect(saved.providers.local).toEqual(f.settings.providers.local);
+      expect(saved.permission_mode).toBe("ask");
+      expect(JSON.stringify(saved)).not.toContain(env.GEMINI_API_KEY);
+      expect(existsSync(join(f.home, ".fx", "provider-keys", "GEMINI_API_KEY"))).toBe(false);
+      const again = await runFx(["setup", "gemini"], { cwd: f.workspace, env });
+      expect(again.code).toBe(0);
+      expect(f.requests).toHaveLength(0);
+      // Exercise the preset's model metadata and auth against the local fixture.
+      saved.providers.gemini.base_url = f.settings.providers.remote.base_url;
+      writeFileSync(f.settingsPath, JSON.stringify(saved));
+      const reply = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env });
+      if (reply.code !== 0) throw new Error(reply.stdout + reply.stderr);
+      expect(JSON.parse(reply.stdout).output).toBe("local reply");
+      expect(f.requests).toHaveLength(1);
+      expect(f.requests[0].authorization).toBe(`Bearer ${env.GEMINI_API_KEY}`);
+      expect(f.requests[0].body.model).toBe(saved.models.gemini);
+    } finally { f.close(); }
+  });
+
+  test("refuses an existing Gemini name bound to another endpoint", async () => {
+    const f = fixture();
+    try {
+      const saved: any = f.settings;
+      saved.providers.gemini = { ...saved.providers.remote, auth: { type: "bearer", env: "GEMINI_API_KEY" } };
+      f.save();
+      const before = readFileSync(f.settingsPath, "utf8");
+      const result = await runFx(["setup", "gemini"], { cwd: f.workspace, env: { ...f.env, GEMINI_API_KEY: "fixture-key" } });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("ConnectionAlreadyExists");
+      expect(readFileSync(f.settingsPath, "utf8")).toBe(before);
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  });
+
+  test.each([undefined, "", " \t "])("requires a terminal when the environment key is absent or blank (%s)", async key => {
+    const f = fixture();
+    try {
+      const before = readFileSync(f.settingsPath, "utf8");
+      const result = await runFx(["setup", "gemini"], { cwd: f.workspace, env: { ...f.env, GEMINI_API_KEY: key, FX_DISABLE_KEYCHAIN: undefined } });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("interactive terminal");
+      expect(readFileSync(f.settingsPath, "utf8")).toBe(before);
+    } finally { f.close(); }
+  });
+
+  test("saved provider keys authenticate streaming and tools independently of Gateway keys", async () => {
+    let calls = 0;
+    const f = fixture(body => ++calls === 1 ? toolCompletion(body.model, "read_file", { path: "note.txt" }) : completion(body.model, "Gemini tool flow passed"));
+    try {
+      const keys = join(f.home, ".fx", "provider-keys");
+      mkdirSync(keys, { mode: 0o700 });
+      const keyPath = join(keys, "GEMINI_API_KEY");
+      writeFileSync(keyPath, "fixture-saved-gemini-key", { mode: 0o600 });
+      writeFileSync(join(f.workspace, "note.txt"), "fixture note");
+      f.settings.providers.remote.auth.env = "GEMINI_API_KEY";
+      f.save();
+      const env = { ...f.env, FX_PROVIDER: "remote", GEMINI_API_KEY: undefined, FX_DISABLE_KEYCHAIN: undefined };
+      const result = await runFx(["ask", "--json", "--no-save", "Read note.txt"], { cwd: f.workspace, env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(JSON.parse(result.stdout).output).toBe("Gemini tool flow passed");
+      expect(f.requests).toHaveLength(2);
+      expect(f.requests.every(r => r.authorization === "Bearer fixture-saved-gemini-key")).toBe(true);
+      expect(f.requests[1].body.messages.at(-1).content).toContain("fixture note");
+      expect(result.stdout + result.stderr).not.toContain("fixture-saved-gemini-key");
+      const overridden = await runFx(["ask", "--json", "--no-save", "Hello"], { cwd: f.workspace, env: { ...env, GEMINI_API_KEY: "fixture-env-key" }, timeoutMs: 20000 });
+      expect(overridden.code).toBe(0);
+      expect(f.requests.at(-1)!.authorization).toBe("Bearer fixture-env-key");
+      chmodSync(keyPath, 0o644);
+      const count = f.requests.length;
+      const insecure = await runFx(["ask", "--json", "--no-save", "Hello"], { cwd: f.workspace, env });
+      expect(insecure.code).toBe(1);
+      expect(f.requests).toHaveLength(count);
+    } finally { f.close(); }
+  }, 45000);
 });

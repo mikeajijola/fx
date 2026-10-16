@@ -111,6 +111,23 @@ pub const SecretStore = struct {
         ?*anyopaque,
     ) SecretStoreWriteError!bool,
 
+    /// Named slots are separate from the Gateway key. Names are environment
+    /// variable identifiers; hosts may omit support for persisted named keys.
+    load_named_fn: ?*const fn (?*anyopaque, std.mem.Allocator, []const u8) SecretStoreLoadError!?[]u8 = null,
+    store_named_fn: ?*const fn (?*anyopaque, std.mem.Allocator, []const u8, []const u8) SecretStoreWriteError!void = null,
+
+    pub fn loadNamed(self: SecretStore, alloc: std.mem.Allocator, name: []const u8) SecretStoreLoadError!?[]u8 {
+        if (self.isDisabled()) return null;
+        const callback = self.load_named_fn orelse return null;
+        return callback(self.context, alloc, name);
+    }
+
+    pub fn storeNamed(self: SecretStore, alloc: std.mem.Allocator, name: []const u8, value: []const u8) SecretStoreWriteError!void {
+        if (self.isDisabled()) return error.StoredKeyWriteFailed;
+        const callback = self.store_named_fn orelse return error.StoredKeyWriteFailed;
+        return callback(self.context, alloc, name, value);
+    }
+
     pub fn isDisabled(self: SecretStore) bool {
         return self.is_disabled_fn(self.context);
     }

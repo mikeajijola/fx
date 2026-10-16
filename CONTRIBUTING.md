@@ -18,7 +18,7 @@ You need:
 - [Bun](https://bun.sh) and [tmux](https://github.com/tmux/tmux) for the end-to-end tests.
 - [hyperfine](https://github.com/sharkdp/hyperfine), if you want to run the startup benchmark locally.
 
-The unit tests and most end-to-end tests don't call a model. To try a change that does, sign in as the [README](README.md#quick-start) describes or set `AI_GATEWAY_API_KEY`.
+The unit tests and most end-to-end tests don't call a model. To try a change that does, sign in as the [README](README.md#quick-start) describes, set `AI_GATEWAY_API_KEY`, or configure a direct Gemini connection with the steps below.
 
 Clone the repository, or your fork if you're an outside contributor, and build fx:
 
@@ -29,9 +29,20 @@ zig build
 ./zig-out/bin/fx
 ```
 
+To use your own Gemini API key with this checkout, run:
+
+```bash
+./zig-out/bin/fx setup gemini
+./zig-out/bin/fx
+```
+
+Get a key from [Google AI Studio](https://aistudio.google.com/apikey) and paste it at the hidden prompt. Setup selects `gemini-3.8-flash` and saves the connection in `~/.fx/settings.json`. Requests use [Google's OpenAI compatibility endpoint](https://ai.google.dev/gemini-api/docs/openai) directly. Use `./zig-out/bin/fx --model <model-id>` to select another Gemini model for a run.
+
+You can also export `GEMINI_API_KEY` before running setup. An environment key takes precedence and setup doesn't copy it to disk. Pasted Gemini keys use `~/.fx/provider-keys/GEMINI_API_KEY`, a private file with mode `0600` on Linux and macOS. `FX_DISABLE_KEYCHAIN=1` disables these saved keys too; environment keys still work. To remove a saved Gemini key, delete that file.
+
 Test your changes with `./zig-out/bin/fx` from your checkout. A bare `fx` runs whichever copy comes first on your `PATH`, which is usually an installed release that doesn't include your change.
 
-fx keeps its settings and sessions in `~/.fx`, and on macOS it stores API keys and OAuth credentials in your Keychain. To try a change against an empty profile without touching your own, give fx a temporary home directory and turn off Keychain storage:
+fx keeps its settings and sessions in `~/.fx`. On macOS it stores Gateway API keys and OAuth credentials in your Keychain; pasted Gemini keys use the private profile file described above. To try a change against an empty profile without touching your own, give fx a temporary home directory and turn off Keychain storage:
 
 ```bash
 HOME="$(mktemp -d)" FX_DISABLE_KEYCHAIN=1 ./zig-out/bin/fx
