@@ -905,6 +905,25 @@ describe("CLI work contracts", () => {
     } finally { f.close(); }
   }, 25000);
 
+  test("accepts Gemini's complete unindexed review call ending in stop", async () => {
+    const f = fixture(async body => {
+      if (!isReview(body)) return completion(body.model, "Hello");
+      const response = assessment(body, "met");
+      const wire = (await response.text())
+        .replaceAll('"index":0,"id":', '"id":')
+        .replace('"finish_reason":"tool_calls"', '"finish_reason":"stop"');
+      return new Response(wire, { headers: response.headers });
+    });
+    try {
+      const result = await runFx(["ask", "--json", "Say hello"], {
+        cwd: f.workspace, env: { ...f.env, FX_CONTRACT_REVIEW: "1" }, timeoutMs: 20000,
+      });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(JSON.parse(result.stdout).output).toBe("Hello");
+      expect(f.requests).toHaveLength(2);
+    } finally { f.close(); }
+  }, 25000);
+
   test("uses the configured review model on the same connection", async () => {
     const f = fixture(body => {
       if (isReview(body)) {

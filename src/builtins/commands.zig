@@ -424,7 +424,7 @@ pub const top_level_examples = [_]TopLevelExample{
 pub const top_level_notes = [_][]const u8{
     "Run `fx <command> --help` for command-specific usage and options.",
     "Run `/help` inside an interactive session for slash commands.",
-    "This build enforces work contracts when launched as omos or omo (also FX_CONTRACT_REVIEW=1).",
+    "omos and omo enforce work contracts (FX_CONTRACT_REVIEW=1).",
 };
 
 pub const top_level_resources = [_]TopLevelResource{
