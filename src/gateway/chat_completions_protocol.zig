@@ -674,6 +674,7 @@ pub const Reducer = struct {
     choice: types.ToolChoice,
     names: std.ArrayList([]u8) = .empty,
     tools: std.ArrayList(Tool) = .empty,
+    unindexed_tools: bool = false,
     content: std.ArrayList(u8) = .empty,
     generation_id: ?[]u8 = null,
     response_model: ?[]u8 = null,
@@ -899,11 +900,17 @@ pub const Reducer = struct {
         if (value.array.items.len != 0 and self.choice == .none) return error.UnexpectedToolCall;
         for (value.array.items, 0..) |item, delta_index| {
             const delta = try object(item);
-            const index = try index_value(delta.get("index") orelse return error.InvalidChunk);
+            // Gemini sends complete calls without indexes. They can be appended
+            // in wire order, but must never be confused with indexed fragments.
+            const index_field = delta.get("index");
+            const unindexed = index_field == null;
+            if (self.tools.items.len != 0 and self.unindexed_tools != unindexed) return error.InvalidChunk;
+            const index = if (index_field) |field| try index_value(field) else self.tools.items.len;
             if (index >= self.limits.tool_calls) return error.TooManyTools;
-            for (value.array.items[0..delta_index]) |prior| {
+            if (!unindexed) for (value.array.items[0..delta_index]) |prior| {
                 if (try index_value((try object(prior)).get("index") orelse return error.InvalidChunk) == index) return error.ConflictingIdentity;
-            }
+            };
+            self.unindexed_tools = unindexed;
             while (self.tools.items.len <= index) try self.tools.append(self.alloc, .{});
             const tool = &self.tools.items[index];
             if (non_null(delta, "type")) |kind| if (!std.mem.eql(u8, try string(kind), "function")) return error.InvalidChunk;
@@ -934,6 +941,11 @@ pub const Reducer = struct {
                 }
                 if (non_null(function, "arguments")) |arguments| try append_bounded(self.alloc, &tool.arguments, try string(arguments), self.limits.arguments_bytes, error.ArgumentsTooLarge);
             }
+            if (unindexed) {
+                if (tool.id == null) return error.InvalidToolCallId;
+                if (!self.known_name(tool.name.items)) return error.InvalidToolName;
+                try validate_arguments(self.alloc, tool.arguments.items);
+            }
         }
     }
 
@@ -963,10 +975,11 @@ pub const Reducer = struct {
         // Carried progress values are lower bounds, not current or final assertions.
         if (total) |tokens| {
             const sum = std.math.add(u64, usage.input_tokens orelse 0, usage.output_tokens orelse 0) catch return error.InvalidChunk;
-            const exact = (incoming.input_tokens != null and incoming.output_tokens != null) or (final_fields.input and final_fields.output);
+            // Providers may include additional token categories in the total
+            // without exposing them in prompt_tokens or completion_tokens.
             if (incoming_total != null or final_fields.total) {
-                if (tokens < sum or (exact and tokens != sum)) return error.InvalidChunk;
-            } else if (exact and sum < tokens) return error.InvalidChunk;
+                if (tokens < sum) return error.InvalidChunk;
+            }
         }
         for (
             [_]?u64{ self.usage.input_tokens, self.usage.output_tokens, self.usage_total },
@@ -990,7 +1003,9 @@ pub const Reducer = struct {
         if (cancelled) return error.Cancelled;
         if (self.phase == .closed) return error.StreamClosed;
         if (self.phase != .done) return error.IncompleteStream;
-        const reason = self.finish_reason.?;
+        // Gemini terminates its complete, unindexed tool turns with "stop".
+        // Keep the wire reason until here so repeated usage trailers still match.
+        const reason = if (self.unindexed_tools and self.finish_reason.? == .stop) types.ProviderFinishReason.tool_calls else self.finish_reason.?;
         switch (reason) {
             .length => return error.OutputTruncated,
             .content_filter => return error.ContentFiltered,
@@ -1637,6 +1652,26 @@ test "chat completions final usage allows optional total metadata in either orde
     }
 }
 
+test "chat completions aggregate usage may exceed reported input and output" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |final| {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        if (final) try test_accept(&reducer, test_stop);
+        try test_usage_snapshot(&reducer, "{\"total_tokens\":3307}");
+        try test_usage_snapshot(&reducer, "{\"prompt_tokens\":3255,\"completion_tokens\":30}");
+        try test_usage_snapshot(&reducer, "{\"prompt_tokens\":3255,\"completion_tokens\":30,\"total_tokens\":3307}");
+        if (!final) try test_accept(&reducer, test_stop);
+        try test_usage_snapshot(&reducer, "{\"prompt_tokens\":3255}");
+        try test_usage_snapshot(&reducer, "{\"completion_tokens\":30,\"total_tokens\":3307}");
+        try test_accept(&reducer, "[DONE]");
+        var result = try reducer.finish(false);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(@as(?u64, 3255), result.completed.completion.usage.input_tokens);
+        try std.testing.expectEqual(@as(?u64, 30), result.completed.completion.usage.output_tokens);
+    }
+}
+
 test "chat completions partial usage snapshots enrich without erasing known counters" {
     const alloc = std.testing.allocator;
     for ([_]bool{ false, true }) |final| {
@@ -1754,10 +1789,6 @@ test "chat completions partial usage rejects conflicts against merged observatio
     const alloc = std.testing.allocator;
     for ([_]struct { first: []const u8, next: []const u8, final: bool = false, failure: Error }{
         .{ .first = "{\"prompt_tokens\":10}", .next = "{\"completion_tokens\":3,\"total_tokens\":12}", .failure = error.InvalidChunk },
-        .{ .first = "{\"total_tokens\":13}", .next = "{\"prompt_tokens\":10,\"completion_tokens\":2}", .failure = error.InvalidChunk },
-        .{ .first = "{\"prompt_tokens\":10}", .next = "{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":14}", .failure = error.InvalidChunk },
-        .{ .first = "{\"prompt_tokens\":10}", .next = "{\"completion_tokens\":3,\"total_tokens\":14}", .final = true, .failure = error.InvalidChunk },
-        .{ .first = "{\"prompt_tokens\":10,\"total_tokens\":13}", .next = "{\"completion_tokens\":2}", .final = true, .failure = error.InvalidChunk },
         .{ .first = "{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13}", .next = "{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14}", .final = true, .failure = error.ConflictingIdentity },
         .{ .first = "{\"prompt_tokens\":9223372036854775807}", .next = "{\"completion_tokens\":9223372036854775807,\"total_tokens\":9223372036854775807}", .failure = error.InvalidChunk },
         .{ .first = "{\"prompt_tokens\":10,\"total_tokens\":13}", .next = "{\"completion_tokens\":4}", .final = true, .failure = error.InvalidChunk },
@@ -2180,7 +2211,7 @@ test "chat completions repeated terminal choices reject invalid or conflicting u
     const cases = [_]struct { usage: []const u8, seed_usage: bool = false, expected: Error = error.InvalidChunk }{
         .{ .usage = "{\"prompt_tokens\":-1}" },
         .{ .usage = "{\"prompt_tokens\":1.5}" },
-        .{ .usage = "{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":3}" },
+        .{ .usage = "{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":1}" },
         .{ .usage = "{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}", .seed_usage = true, .expected = error.ConflictingIdentity },
     };
     for (cases) |case| {
@@ -2323,7 +2354,7 @@ test "chat completions usage trailers preserve observations" {
     for ([_][]const u8{
         "{\"choices\":[],\"usage\":{\"prompt_tokens\":-1}}",
         "{\"choices\":[],\"usage\":{\"completion_tokens\":1.5}}",
-        "{\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":8}}",
+        "{\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":4}}",
     }) |invalid| {
         var bad = try Reducer.init(alloc, test_request(), .{});
         defer bad.deinit();
@@ -2658,6 +2689,85 @@ test "chat completions Gemini signatures remain attached to their tool calls" {
     const stripped = try build_request(alloc, request, .{ .provider = &other });
     defer alloc.free(stripped);
     try std.testing.expect(std.mem.find(u8, stripped, "thought_signature") == null);
+}
+
+const test_unindexed_call =
+    \\{"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"x\"}"},"extra_content":{"google":{"thought_signature":"opaque-google-signature"}}}
+;
+
+test "chat completions Gemini unindexed complete tools accept stop and preserve replay" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |batched| {
+        var request = test_tool_request();
+        request.tool_choice = .required;
+        var reducer = try Reducer.init(alloc, request, .{});
+        defer reducer.deinit();
+        const second =
+            \\{"id":"call-2","type":"function","function":{"name":"read_file","arguments":"{}"}}
+        ;
+        const chunk = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"tool_calls\":[{s}{s}{s}]}}}}],\"usage\":{{\"prompt_tokens\":28,\"completion_tokens\":10,\"total_tokens\":38}}}}", .{ test_unindexed_call, if (batched) "," else "", if (batched) second else "" });
+        defer alloc.free(chunk);
+        try test_accept(&reducer, chunk);
+        if (!batched) try test_accept(&reducer,
+            \\{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call-2","type":"function","function":{"name":"read_file","arguments":"{}"}}]}}]}
+        );
+        const terminal =
+            \\{"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":"stop"}],"usage":{"prompt_tokens":78,"completion_tokens":16,"total_tokens":94}}
+        ;
+        try test_accept(&reducer, terminal);
+        try test_accept(&reducer, terminal);
+        try test_accept(&reducer, "[DONE]");
+        var result = try reducer.finish(false);
+        defer result.deinit(alloc);
+        const completion = result.completed.completion;
+        try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason);
+        try std.testing.expectEqual(@as(usize, 2), completion.tool_calls.len);
+        try std.testing.expectEqualStrings("call-1", completion.tool_calls[0].id);
+        try std.testing.expectEqualStrings("read_file", completion.tool_calls[0].name);
+        try std.testing.expectEqualStrings("{\"path\":\"x\"}", completion.tool_calls[0].arguments_json);
+        try std.testing.expectEqualStrings("call-2", completion.tool_calls[1].id);
+        try std.testing.expectEqual(@as(?u64, 78), completion.usage.input_tokens);
+        try std.testing.expectEqual(@as(?u64, 16), completion.usage.output_tokens);
+        var replay = try std.json.parseFromSlice(std.json.Value, alloc, completion.provider_state_json.?, .{});
+        defer replay.deinit();
+        const signatures = replay.value.object.get(signatures_field).?.array.items;
+        try std.testing.expectEqualStrings("opaque-google-signature", signatures[0].string);
+        try std.testing.expect(signatures[1] == .null);
+    }
+}
+
+test "chat completions unindexed tools reject fragments duplicates mixed indexing and limits" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { call: []const u8, first: ?[]const u8 = null, failure: Error, limits: Limits = .{}, choice: types.ToolChoice = .auto }{
+        .{ .call = "{\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}", .failure = error.InvalidToolCallId },
+        .{ .call = "{\"id\":\"x\",\"function\":{\"arguments\":\"{}\"}}", .failure = error.InvalidToolName },
+        .{ .call = "{\"id\":\"x\",\"function\":{\"name\":\"read_file\"}}", .failure = error.InvalidToolArguments },
+        .{ .call = "{\"id\":\"x\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\"}}", .failure = error.InvalidToolArguments },
+        .{ .call = "{\"id\":\"x\",\"function\":{\"name\":\"read_\",\"arguments\":\"{}\"}}", .failure = error.InvalidToolName },
+        .{ .call = test_unindexed_call, .first = test_unindexed_call, .failure = error.ConflictingIdentity },
+        .{ .call = "{\"index\":0,\"function\":{\"arguments\":\"{}\"}}", .first = test_unindexed_call, .failure = error.InvalidChunk },
+        .{ .call = test_unindexed_call, .first = "{\"index\":0}", .failure = error.InvalidChunk },
+        .{ .call = test_unindexed_call ++ ",{\"index\":1}", .failure = error.InvalidChunk },
+        .{ .call = test_unindexed_call, .limits = .{ .tool_calls = 0 }, .failure = error.TooManyTools },
+        .{ .call = test_unindexed_call, .first = "{\"id\":\"x\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}", .limits = .{ .tool_calls = 1 }, .failure = error.TooManyTools },
+        .{ .call = test_unindexed_call, .limits = .{ .arguments_bytes = 1 }, .failure = error.ArgumentsTooLarge },
+        .{ .call = test_unindexed_call, .choice = .none, .failure = error.UnexpectedToolCall },
+    };
+    for (cases) |case| {
+        var request = test_tool_request();
+        request.tool_choice = case.choice;
+        var reducer = try Reducer.init(alloc, request, case.limits);
+        defer reducer.deinit();
+        if (case.first) |first| {
+            const chunk = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{s}]}}}}]}}", .{first});
+            defer alloc.free(chunk);
+            try test_accept(&reducer, chunk);
+        }
+        const chunk = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{s}]}}}}]}}", .{case.call});
+        defer alloc.free(chunk);
+        try std.testing.expectError(case.failure, reducer.accept(chunk, false));
+        try std.testing.expectError(error.StreamClosed, reducer.accept(test_stop, false));
+    }
 }
 
 test "chat completions Gemini signature validation fails closed and stays bounded" {

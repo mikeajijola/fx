@@ -40,7 +40,29 @@ Get a key from [Google AI Studio](https://aistudio.google.com/apikey) and paste 
 
 You can also export `GEMINI_API_KEY` before running setup. An environment key takes precedence and setup doesn't copy it to disk. Pasted Gemini keys use `~/.fx/provider-keys/GEMINI_API_KEY`, a private file with mode `0600` on Linux and macOS. `FX_DISABLE_KEYCHAIN=1` disables these saved keys too; environment keys still work. To remove a saved Gemini key, delete that file.
 
-Test your changes with `./zig-out/bin/fx` from your checkout. A bare `fx` runs whichever copy comes first on your `PATH`, which is usually an installed release that doesn't include your change.
+### Contract-enforcing CLI
+
+After building this fork, install its terminal commands:
+
+```bash
+sh scripts/install-omos.sh
+omos
+# The same CLI is also available as omo.
+```
+
+The installer creates `omos` and `omo` links in `~/.local/bin`, or `XDG_BIN_HOME` when set. Both commands use this checkout's binary and enable work contracts for root user requests. They share the existing `~/.fx` profile, including your Gemini connection. The installer refuses to replace unrelated commands.
+
+Each request becomes a fixed contract requiring every requested outcome and acceptance criterion. When the acting model tries to finish, a separate model request reviews the original request, candidate answer, and recorded tool results. Pending work continues in the same turn. A blocker, invalid assessment, invented evidence reference, failed review request, or exhausted step limit cannot establish successful completion. Cancellation still stops the turn.
+
+The review adds a model request at each completion attempt and uses the same provider credentials. It uses `FX_REVIEW_MODEL` or the `review_model` setting when present, then the configured connection’s `reviewer_model`, then the acting model. It has no executable tools and grants no permissions. Its judgments about whether an outcome meets the request come from the reviewing model; the host validates the contract identity, required reports, and evidence references. For deterministic acceptance checks, an embedded host can supply its own assessor as described in [SDK work contracts](sdk/README.md#contract-dependent-execution).
+
+Exercise contract review directly from a development checkout with:
+
+```bash
+FX_CONTRACT_REVIEW=1 ./zig-out/bin/fx ask "Read and summarize CONTRIBUTING.md"
+```
+
+Test your changes with `./zig-out/bin/fx` from your checkout. A bare `fx` runs whichever copy comes first on your `PATH`, which is usually an installed release that doesn't include your change. Direct `fx` invocations keep their existing completion behavior unless `FX_CONTRACT_REVIEW=1` is set; `omos` and `omo` always enable the review.
 
 fx keeps its settings and sessions in `~/.fx`. On macOS it stores Gateway API keys and OAuth credentials in your Keychain; pasted Gemini keys use the private profile file described above. To try a change against an empty profile without touching your own, give fx a temporary home directory and turn off Keychain storage:
 

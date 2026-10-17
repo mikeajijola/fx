@@ -309,8 +309,70 @@ fn build_review(raw: *anyopaque, alloc: Allocator, model: []const u8, _: []const
     const state: *Review = @ptrCast(@alignCast(raw));
     const expanded = try review_messages.expandPendingToolReviewMessages(alloc, messages, target_id, deadline, cancel);
     defer alloc.free(expanded);
+    const pending = messages[messages.len - 1];
+    const target = for (pending.tool_calls) |call| {
+        if (std.mem.eql(u8, call.id, target_id)) break call;
+    } else return error.InvalidGatewayHistory;
+    // A review is a separate model task, not a continuation of the agent's
+    // signed tool turn. Carry the exact action as data instead of inventing
+    // native tool history that Gemini requires a thought signature to replay.
+    const action = try std.json.Stringify.valueAlloc(alloc, .{
+        .pending_tool_call = .{ .id = target.id, .name = target.name, .arguments_json = target.arguments_json },
+        .execution_status = "not_executed",
+    }, .{});
+    defer alloc.free(action);
+    const projected = try alloc.dupe(types.ChatMessage, messages);
+    defer alloc.free(projected);
+    projected[projected.len - 1] = .{ .role = .user, .content = action };
     const output_limit = if (state.definition.model(model)) |metadata| @min(metadata.max_output_tokens orelse 2048, 2048) else 2048;
-    return build(@ptrCast(@constCast(state.definition)), alloc, .{ .model = model, .instructions = instructions, .messages = expanded, .tools = .{ .additional_functions = &.{classifier.function_schema} }, .tool_choice = .required, .provider_options = .{}, .max_output_tokens = output_limit });
+    return build(@ptrCast(@constCast(state.definition)), alloc, .{ .model = model, .instructions = instructions, .messages = projected, .tools = .{ .additional_functions = &.{classifier.function_schema} }, .tool_choice = .required, .provider_options = .{}, .max_output_tokens = output_limit });
+}
+
+test "chat completions review carries exact pending action as data without synthetic tool history" {
+    const alloc = std.testing.allocator;
+    var registry = try definitions.Registry.parse_json(alloc,
+        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"},"tool_choice_mode":"send","model_metadata":{"review-model":{"max_output_tokens":512}}}}
+    );
+    defer registry.deinit(alloc);
+    var state = Review{ .definition = registry.get("local").?, .input = .{} };
+    const arguments = "{\"code\":\"return 1;\\n\"}";
+    const calls = [_]types.ToolCall{
+        .{ .id = "other", .name = "other_tool", .arguments_json = "{}" },
+        .{ .id = "target", .name = "browser_read", .arguments_json = arguments },
+    };
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Review this exact action." }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "review_context_kind: contextual\ntrusted_root_context:\nRead the page." },
+        .{ .role = .assistant, .content = "untrusted assistant prose", .tool_calls = &calls },
+    };
+    var cancel = std.atomic.Value(bool).init(false);
+    const deadline = phase_deadline(30_000, null);
+    const body = try build_review(&state, alloc, "review-model", "", &instructions, &messages, "target", deadline, &cancel);
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const wire_messages = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), wire_messages.len);
+    try std.testing.expectEqualStrings(instructions[0].content.?, wire_messages[0].object.get("content").?.string);
+    try std.testing.expectEqualStrings(messages[0].content.?, wire_messages[1].object.get("content").?.string);
+    try std.testing.expectEqualStrings("user", wire_messages[2].object.get("role").?.string);
+    for (wire_messages) |message| try std.testing.expect(message.object.get("tool_calls") == null);
+    var evidence = try std.json.parseFromSlice(std.json.Value, alloc, wire_messages[2].object.get("content").?.string, .{});
+    defer evidence.deinit();
+    const action = evidence.value.object.get("pending_tool_call").?.object;
+    try std.testing.expectEqualStrings("target", action.get("id").?.string);
+    try std.testing.expectEqualStrings("browser_read", action.get("name").?.string);
+    try std.testing.expectEqualStrings(arguments, action.get("arguments_json").?.string);
+    try std.testing.expectEqualStrings("not_executed", evidence.value.object.get("execution_status").?.string);
+    try std.testing.expectEqualStrings("required", parsed.value.object.get("tool_choice").?.string);
+    try std.testing.expectEqual(@as(i64, 512), parsed.value.object.get("max_tokens").?.integer);
+    try std.testing.expect(std.mem.find(u8, body, "untrusted assistant prose") == null);
+    try std.testing.expect(std.mem.find(u8, body, "other_tool") == null);
+    try std.testing.expectEqualStrings("untrusted assistant prose", messages[1].content.?);
+    try std.testing.expectEqual(@as(usize, 2), messages[1].tool_calls.len);
+    try std.testing.expectError(error.InvalidGatewayHistory, build_review(&state, alloc, "review-model", "", &instructions, &messages, "missing", deadline, &cancel));
+    cancel.store(true, .seq_cst);
+    try std.testing.expectError(error.Cancelled, build_review(&state, alloc, "review-model", "", &instructions, &messages, "target", deadline, &cancel));
 }
 fn ignore_event(_: *anyopaque, _: streams.Event) void {}
 fn free_result(raw: *anyopaque, alloc: Allocator) void {
