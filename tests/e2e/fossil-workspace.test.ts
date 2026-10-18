@@ -133,6 +133,31 @@ describe("portable Fossil agent workspace", () => {
     expect(reopened.tasks[0].state).toBe("accepted");
   }, 60000);
 
+  test("checkpoints same-length edits even when filesystem mtimes do not change", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const executable = Bun.which("fossil")!;
+    const bin = join(f.home, "bin");
+    mkdirSync(bin);
+    symlinkSync(process.execPath, join(bin, "bun"));
+    // Force equal mtimes independently of host speed or timestamp precision.
+    writeFileSync(join(bin, "fossil"), `#!/usr/bin/env bun
+import { existsSync, utimesSync, writeSync } from "node:fs";
+const args = process.argv.slice(2);
+if ((args.includes("changes") || args.includes("commit")) && existsSync("memory/preference.md")) {
+  utimesSync("memory/preference.md", 946684800, 946684800);
+}
+const result = Bun.spawnSync([${JSON.stringify(executable)}, ...args], { env: process.env, stdin: "inherit" });
+writeSync(1, result.stdout);
+writeSync(2, result.stderr);
+process.exit(result.exitCode);
+`, { mode: 0o700 });
+    model(f, (_body, count) => count <= 2 ? writeMemory(count === 1 ? "first" : "other") : { content: "The final preference is other." });
+    const result = await f.run(["ask", "Save first, then replace it with other", "--json"], { PATH: `${bin}:${process.env.PATH}` }, 60000);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("other");
+  }, 60000);
+
   test("a commit before acknowledgement recovers without repeating model actions", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
@@ -241,7 +266,8 @@ describe("portable Fossil agent workspace", () => {
         return writeMemory("Recovered preference.");
       });
       const failed = await f.run(["ask", "Remember the preference", "--json"], { FX_E2E_FOSSIL_FAULT: fault });
-      expect(failed.code).toBe(1);
+      expect(failed.code, failed.stderr + failed.stdout).toBe(1);
+      expect(JSON.parse(failed.stdout).error).toBe("WorkspaceInjectedFailure");
       const before = effects;
       const session = JSON.parse(failed.stdout).session_id;
       const snapshot = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout);
@@ -250,7 +276,7 @@ describe("portable Fossil agent workspace", () => {
       mkdirSync(pending, { recursive: true });
       writeFileSync(join(pending, `${"a".repeat(64)}.pending-${"b".repeat(32)}`), "partial interrupted record");
       const recovered = await f.run(["ask", "--resume-id", session, "continue", "--json"]);
-      expect(recovered.code, recovered.stderr).toBe(0);
+      expect(recovered.code, recovered.stderr + recovered.stdout).toBe(0);
       if (fault === "evidence-checkpoint-committed") expect(effects).toBe(before);
       expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Recovered preference.");
       expect(JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).pending_journals).toBe(0);

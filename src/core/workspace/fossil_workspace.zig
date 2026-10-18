@@ -370,7 +370,7 @@ pub const Manager = struct {
         const target = try self.revision(revision_id);
         if (repository_matches and checkout_revision != null and std.mem.eql(u8, checkout_revision.?, target)) return tree;
         const clean = if (repository_matches)
-            (try self.run(tree, &.{ "changes", "--differ" })).len == 0 and (try self.run(tree, &.{ "extras", "--dotfiles" })).len == 0
+            (try self.run(tree, &.{ "changes", "--hash", "--differ" })).len == 0 and (try self.run(tree, &.{ "extras", "--dotfiles" })).len == 0
         else
             false;
         if (clean) {
@@ -405,6 +405,8 @@ pub const Manager = struct {
     }
 
     fn commit(self: Manager, tree: []const u8, message: []const u8) ![]const u8 {
+        // Atomic replacements can preserve size and second-resolution mtime.
+        // Always hash managed files so the recorded revision matches disk.
         const extras = try self.run(tree, &.{ "extras", "--dotfiles" });
         var extra_lines = std.mem.splitScalar(u8, extras, '\n');
         while (extra_lines.next()) |path| {
@@ -422,7 +424,7 @@ pub const Manager = struct {
             if (!allowedPath(path) and !std.mem.eql(u8, path, "registry.json")) return unexpectedEntry("checkout inventory", path);
         }
         _ = try self.run(tree, &.{ "addremove", "--dotfiles" });
-        _ = try self.run(tree, &.{ "commit", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", message });
+        _ = try self.run(tree, &.{ "commit", "--hash", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", message });
         const output = try self.run(tree, &.{"info"});
         var lines = std.mem.splitScalar(u8, output, '\n');
         while (lines.next()) |line| {
@@ -667,7 +669,7 @@ pub const Manager = struct {
             const relative = try self.alloc.print("history/{s}/{s}.json", .{ task.id, name });
             try atomicWrite(self.alloc, try join(self.alloc, tree, relative), bytes);
         }
-        const changes = try self.run(tree, &.{ "changes", "--differ" });
+        const changes = try self.run(tree, &.{ "changes", "--hash", "--differ" });
         const extras = try self.run(tree, &.{"extras"});
         if (std.mem.trim(u8, changes, " \r\n").len > 0 or std.mem.trim(u8, extras, " \r\n").len > 0) _ = try self.commit(tree, "Checkpoint task evidence");
         try fault("checkpoint-committed");
@@ -832,7 +834,7 @@ pub const Manager = struct {
         var directory = try contentParent(self.alloc, tree, path);
         defer directory.close(io_mod.getIo());
         try atomicWriteAt(self.alloc, directory, std.Io.Dir.path.basename(path), bytes);
-        const changes = try self.run(tree, &.{ "changes", "--differ" });
+        const changes = try self.run(tree, &.{ "changes", "--hash", "--differ" });
         const extras = try self.run(tree, &.{"extras"});
         if (changes.len > 0 or extras.len > 0) _ = try self.commit(tree, "Update task workspace content");
     }
@@ -1029,7 +1031,7 @@ pub const Manager = struct {
             _ = try self.run(tree, &.{ "update", "--nosync", publication.target });
             try self.ensureMergeable(publication.task, publication.source, try self.revision(publication.target));
             try self.validateDependencies(publication.task);
-            const changes = try self.run(tree, &.{ "changes", "--differ" });
+            const changes = try self.run(tree, &.{ "changes", "--hash", "--differ" });
             if (std.mem.trim(u8, changes, " \r\n").len != 0) return error.WorkspaceRecoveryRequired;
             try self.merge(tree, publication.source, publication.task);
             try atomicWrite(self.alloc, try join(self.alloc, tree, receipt), try json(self.alloc, publication));
@@ -1157,7 +1159,7 @@ pub const Manager = struct {
             try atomicWrite(self.alloc, path, archive);
             count += 1;
         }
-        const changes = try self.run(tree, &.{ "changes", "--differ" });
+        const changes = try self.run(tree, &.{ "changes", "--hash", "--differ" });
         const extras = try self.run(tree, &.{ "extras", "--dotfiles" });
         if (changes.len > 0 or extras.len > 0) _ = try self.commit(tree, "Archive existing session history");
         try remove(marker);
