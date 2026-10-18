@@ -1103,9 +1103,33 @@ fn append_bounded(alloc: Allocator, destination: *std.ArrayList(u8), text: []con
 /// event_bytes also bounds all wire between dispatched data events (including
 /// ignored fields/comments); total_wire_bytes bounds the entire consumed stream.
 pub fn consume_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_provider.RequestData, limits: Limits, events: ?stream_provider.EventSink, cancel_flag: *const std.atomic.Value(bool)) Error!stream_provider.Result {
+    return consume_stream_diagnostic(alloc, source, request, limits, events, cancel_flag, null);
+}
+
+pub fn consume_stream_diagnostic(alloc: Allocator, source: *std.Io.Reader, request: stream_provider.RequestData, limits: Limits, events: ?stream_provider.EventSink, cancel_flag: *const std.atomic.Value(bool), diagnostic: ?*?stream_provider.ToolIdentityFailure) Error!stream_provider.Result {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     var reducer = try Reducer.init(alloc, request, limits);
     defer reducer.deinit();
+    errdefer {
+        if (diagnostic) |out| {
+            var failure: stream_provider.ToolIdentityFailure = .{ .advertised_count = reducer.names.items.len };
+            var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+            for (reducer.names.items) |name| {
+                hasher.update(name);
+                hasher.update(&.{0});
+            }
+            var digest: [32]u8 = undefined;
+            hasher.final(&digest);
+            failure.advertised_hash = std.fmt.bytesToHex(&digest, .lower);
+            for (reducer.tools.items) |tool| {
+                if (reducer.known_name(tool.name.items)) continue;
+                failure.name_len = @min(tool.name.items.len, failure.name_bytes.len);
+                for (tool.name.items[0..failure.name_len], failure.name_bytes[0..failure.name_len]) |byte, *dest| dest.* = if (std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-' or byte == '.') byte else '?';
+                break;
+            }
+            out.* = failure;
+        }
+    }
     var framing = sse.Reader{ .max_event_bytes = limits.event_bytes };
     defer framing.deinit(alloc);
     while (true) {
@@ -1145,6 +1169,16 @@ const test_functions = [_]model_tool_schema.FunctionSchema{
         } } }},
     } },
 };
+
+test "chat completions retain bounded rejected tool identity diagnostics" {
+    const bytes = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"rejected\",\"function\":{\"name\":\"not_advertised\",\"arguments\":\"{}\"}}]}}]}\n\n";
+    var source = std.Io.Reader.fixed(bytes);
+    var cancelled = std.atomic.Value(bool).init(false);
+    var diagnostic: ?stream_provider.ToolIdentityFailure = null;
+    try std.testing.expectError(error.InvalidToolName, consume_stream_diagnostic(std.testing.allocator, &source, test_tool_request(), .{}, null, &cancelled, &diagnostic));
+    try std.testing.expectEqualStrings("not_advertised", diagnostic.?.name());
+    try std.testing.expect(diagnostic.?.advertised_count > 0);
+}
 
 fn test_request() stream_provider.RequestData {
     return .{

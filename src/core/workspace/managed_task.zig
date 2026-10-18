@@ -11,6 +11,7 @@ pub const Turn = struct {
     assessment: []const u8 = "",
     review_snapshot: []const u8 = "",
     recovered_candidate: ?[]const u8 = null,
+    review_only_candidate: ?[]const u8 = null,
     recorded_evidence: std.ArrayList([]const u8) = .empty,
 
     pub fn begin(alloc: std.mem.Allocator, session: []const u8, parent_session: ?[]const u8, project: []const u8, prompt: []const u8) !?Turn {
@@ -39,6 +40,7 @@ pub const Turn = struct {
         if (task.state == .conflict) return error.WorkspaceMergeConflict;
         if (task.state == .accepted) task = try manager.start(session, project, prompt, parent);
         turn.task = try manager.setState(task.id, .active);
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, prompt, " \t\r\n"), "continue")) turn.review_only_candidate = try manager.failedReviewCandidate(turn.task);
         if (parent_session == null and !std.mem.eql(u8, prompt, task.definition.objective)) {
             turn.task = try manager.amend(task, prompt);
         }
@@ -83,7 +85,31 @@ pub const Turn = struct {
         }
         self.review_snapshot = try self.manager.reviewSnapshot(self.task, self.reviewed_revision.?);
         try evidence.append(alloc, try review.workspaceEvidence(alloc, self.review_snapshot));
+        const latest = try self.manager.loadTask(self.task.id);
+        for (latest.dependencies) |dependency| {
+            const bytes = try self.manager.contentAt(dependency.path, self.reviewed_revision.?);
+            try evidence.append(alloc, .{ .id = try alloc.print("workspace-file:{s}:{s}", .{ try workspace.hash(alloc, bytes), dependency.path }), .kind = .workspace, .content = bytes });
+        }
         return evidence.toOwnedSlice(alloc);
+    }
+
+    pub fn journal(self: *Turn) review.Journal {
+        return .{ .context = self, .record_fn = recordReview };
+    }
+
+    fn recordReview(raw: *anyopaque, kind: []const u8, bytes: []const u8) !void {
+        const self: *Turn = @ptrCast(@alignCast(raw));
+        try self.manager.record(self.task, kind, .{ .at_ms = @import("../shared/io.zig").milliTimestamp(), .data = bytes });
+    }
+
+    pub fn sealReview(self: *Turn) !void {
+        // Only the host's audit journal may have advanced during assessment.
+        // Fence actual branch edits before adding those audit records.
+        const previous = self.reviewed_revision orelse return error.WorkspaceReviewRequired;
+        if (!std.mem.eql(u8, previous, try self.manager.currentRevision(self.task))) return error.WorkspaceRevisionChanged;
+        _ = try self.manager.reviewSnapshot(self.task, previous);
+        self.reviewed_revision = try self.manager.checkpoint(self.task);
+        self.review_snapshot = try self.manager.reviewSnapshot(self.task, self.reviewed_revision.?);
     }
 
     pub fn publish(self: *Turn, candidate: []const u8) !void {

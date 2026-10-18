@@ -25,7 +25,7 @@ function fixture() {
     AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined, GEMINI_API_KEY: undefined,
     FX_PROVIDER: undefined, FX_MODEL: undefined, FX_REVIEW_MODEL: undefined,
   };
-  const run = async (args: string[], extra: Record<string, string | undefined> = {}, timeoutMs = 30000) => {
+  const run = async (args: string[], extra: Record<string, string | undefined> = {}, timeoutMs = 60000) => {
     const result = await runFx(args, { cwd, env: { ...env, ...extra }, timeoutMs });
     if (result.code !== 0 && existsSync(env.FX_TRACE_LOG)) result.stderr += "\n" + readFileSync(env.FX_TRACE_LOG, "utf8");
     return result;
@@ -38,7 +38,7 @@ function fixture() {
   return { home, cwd, env, run, fossil };
 }
 
-function model(f: ReturnType<typeof fixture>, actor: (body: any, count: number) => object, assess?: (packet: any) => string | Promise<string>) {
+function model(f: ReturnType<typeof fixture>, actor: (body: any, count: number) => object, assess?: (packet: any) => string | { name: string; args: object } | Promise<string | { name: string; args: object }>) {
   let actors = 0, assessments = 0;
   const packets: any[] = [];
   const server = Bun.serve({
@@ -49,12 +49,13 @@ function model(f: ReturnType<typeof fixture>, actor: (body: any, count: number) 
       let delta: any, reason = "stop";
       if (body.tools?.some((tool: any) => tool.function?.name === "omos_contract_assessment")) {
         assessments++;
-        const packet = JSON.parse(body.messages.at(-1).content);
+        const packet = JSON.parse(body.messages.find((message: any) => message.role === "user").content);
+        packet.inspections = body.messages.filter((message: any) => message.role === "tool").map((message: any) => JSON.parse(message.content));
         packets.push(packet);
         const status = await assess?.(packet) ?? "met";
-        const evidence = packet.evidence.filter((item: any) => item.kind === "candidate" || item.status === "success").map((item: any) => item.id);
+        const evidence = packet.evidence.filter((item: any) => item.complete && (item.kind === "candidate" || item.status === "success")).map((item: any) => item.id);
         delta = { tool_calls: [{ index: 0, id: `assessment-${assessments}`, type: "function", function: {
-          name: "omos_contract_assessment", arguments: JSON.stringify({ contractId: packet.contract.id, version: packet.contract.version, obligations: [{ id: "request_complete", status, evidence: status === "met" ? evidence : [], note: status === "blocked" ? "Waiting for requested input" : "Checked host evidence" }] }),
+          name: typeof status === "string" ? "omos_contract_assessment" : status.name, arguments: JSON.stringify(typeof status === "string" ? { contractId: packet.contract.id, version: packet.contract.version, obligations: [{ id: "request_complete", status, evidence: status === "met" ? evidence : [], note: status === "blocked" ? "Waiting for requested input" : "Checked host evidence" }] } : status.args),
         } }] };
         reason = "tool_calls";
       } else {
@@ -81,6 +82,92 @@ function writeMemory(content: string) {
 }
 
 describe("portable Fossil agent workspace", () => {
+  test("reviews retained evidence beyond the former aggregate limit through bounded pages", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let seeded = false;
+    const target = "tool:fixture:0";
+    const m = model(f, () => ({ content: "The retained receipt confirms the requested outcome." }), packet => {
+      if (!seeded) return "blocked";
+      const previous = packet.inspections.at(-1);
+      if (!previous || previous.nextOffset !== null) return {
+        name: "omos_review_evidence", args: { action: "read", id: target, offset: previous?.nextOffset ?? 0 },
+      };
+      return { name: "omos_contract_assessment", args: {
+        contractId: packet.contract.id, version: packet.contract.version,
+        obligations: [{ id: "request_complete", status: "met", evidence: [target], note: "Inspected the complete retained receipt" }],
+      } };
+    });
+    const first = await f.run(["ask", "Confirm the retained fixture receipt", "--json"]);
+    expect(first.code).toBe(1);
+    const session = JSON.parse(first.stdout).session_id;
+    const status = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout);
+    const task = status.tasks[0];
+    const tree = join(f.home, "evidence-fixture");
+    mkdirSync(tree);
+    const fossil = (...args: string[]) => {
+      const result = spawnSync("fossil", args, { cwd: tree, env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, USER: "omos", LC_ALL: "C" }, encoding: "utf8" });
+      expect(result.status, result.stderr).toBe(0);
+    };
+    fossil("open", "--nosync", join(f.cwd, "omos.fossil"), task.branch);
+    const history = join(tree, "history", task.id);
+    mkdirSync(history, { recursive: true });
+    for (let i = 0; i < 36; i++) {
+      const value = JSON.stringify({ kind: "tool_evidence", task: task.id, contract_version: task.definition.version,
+        value: [{ id: `tool:fixture:${i}`, kind: "tool", tool: "fixture_receipt", arguments: "{}", status: "success", content: JSON.stringify({ receipt: "confirmed", padding: "x".repeat(24576) }) }],
+      });
+      writeFileSync(join(history, createHash("sha256").update(value).digest("hex") + ".json"), value);
+    }
+    fossil("addremove");
+    fossil("commit", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", "Retain fixture evidence");
+    seeded = true;
+    const resumed = await f.run(["ask", "--resume-id", session, "continue", "--json"], {}, 120000);
+    expect(resumed.code, resumed.stderr).toBe(0);
+    expect(m.packets.at(-1).inspections.at(-1).fullyInspected).toBe(true);
+    expect(m.packets.every(packet => JSON.stringify(packet).length < 524288)).toBe(true);
+    expect(m.packets.at(-1).evidence.find((item: any) => item.id === target).complete).toBe(false);
+  }, 120000);
+
+  test("corrects one unadvertised tool proposal without executing it", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const m = model(f, (_body, count) => count === 1
+      ? { tool_calls: [{ index: 0, id: "rejected-proposal", type: "function", function: { name: "mcp_unavailable_fixture", arguments: "{}" } }] }
+      : { content: "The corrected answer." });
+    const result = await f.run(["ask", "Give a short answer using the available tools only", "--json"]);
+    expect(result.code, result.stderr).toBe(0);
+    expect(result.stdout).toContain("The corrected answer.");
+    expect(m.counts().actors).toBe(2);
+    const status = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout);
+    const files = f.fossil("ls", "-r", status.tasks[0].branch).trim().split("\n").filter(path => path.startsWith("history/"));
+    const records = files.map(path => JSON.parse(f.fossil("cat", path, "-r", status.tasks[0].branch)));
+    const failure = records.find(record => record.kind === "protocol_failure");
+    expect(failure.value.stage).toBe("response");
+    expect(failure.value.rejected_name).toBe("mcp_unavailable_fixture");
+    expect(records.filter(record => record.kind === "action_intent").flatMap(record => record.value.calls).some(call => call.name === "mcp_unavailable_fixture")).toBe(false);
+  }, 60000);
+
+  test("continues a failed review from its retained candidate without repeating actor work", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let permit = false;
+    const m = model(f, () => ({ content: "A retained answer." }), packet => permit ? "met" : {
+      name: "omos_contract_assessment",
+      args: { contractId: packet.contract.id, version: packet.contract.version, obligations: [{ id: "request_complete", status: "met", evidence: ["invented"], note: "Invalid fixture evidence" }] },
+    });
+    const first = await f.run(["ask", "Give a short informational answer", "--json"]);
+    expect(first.code).toBe(1);
+    const status = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout);
+    const session = status.tasks[0].session;
+    const actual = JSON.parse(first.stdout).session_id;
+    expect(session).toBe(createHash("sha256").update(actual).digest("hex"));
+    permit = true;
+    const resumed = await f.run(["ask", "--resume-id", actual, "continue", "--json"]);
+    expect(resumed.code, resumed.stderr).toBe(0);
+    expect(resumed.stdout).toContain("A retained answer.");
+    expect(m.counts().actors).toBe(1);
+  }, 60000);
+
   test("initializes, binds across directories, verifies and exports without overwriting", async () => {
     const f = fixture();
     const initialized = await f.run(["fossil", "init", "--json"]);
@@ -142,18 +229,20 @@ describe("portable Fossil agent workspace", () => {
     symlinkSync(process.execPath, join(bin, "bun"));
     // Force equal mtimes independently of host speed or timestamp precision.
     writeFileSync(join(bin, "fossil"), `#!/usr/bin/env bun
-import { existsSync, utimesSync, writeSync } from "node:fs";
+import { appendFileSync, existsSync, utimesSync, writeSync } from "node:fs";
 const args = process.argv.slice(2);
 if ((args.includes("changes") || args.includes("commit")) && existsSync("memory/preference.md")) {
   utimesSync("memory/preference.md", 946684800, 946684800);
 }
 const result = Bun.spawnSync([${JSON.stringify(executable)}, ...args], { env: process.env, stdin: "inherit" });
+if (result.exitCode !== 0) appendFileSync(${JSON.stringify(join(f.home, "fossil-wrapper.errors"))}, JSON.stringify({ args, exitCode: result.exitCode, stderr: new TextDecoder().decode(result.stderr) }) + "\\n");
 writeSync(1, result.stdout);
 writeSync(2, result.stderr);
 process.exit(result.exitCode);
 `, { mode: 0o700 });
     model(f, (_body, count) => count <= 2 ? writeMemory(count === 1 ? "first" : "other") : { content: "The final preference is other." });
     const result = await f.run(["ask", "Save first, then replace it with other", "--json"], { PATH: `${bin}:${process.env.PATH}` }, 60000);
+    if (result.code !== 0 && existsSync(join(f.home, "fossil-wrapper.errors"))) result.stderr += readFileSync(join(f.home, "fossil-wrapper.errors"), "utf8");
     expect(result.code, result.stderr + result.stdout).toBe(0);
     expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("other");
   }, 60000);
@@ -349,7 +438,7 @@ process.exit(result.exitCode);
       expect(status.tasks).toHaveLength(2);
       if (conflicting) {
         expect(results.map(result => result.code).sort()).toEqual([0, 1]);
-        expect(status.tasks.map((task: any) => task.state).sort()).toEqual(["accepted", "conflict"]);
+        expect(status.tasks.map((task: any) => task.state).sort(), JSON.stringify(results)).toEqual(["accepted", "conflict"]);
       } else {
         expect(results.map(result => result.code)).toEqual([0, 0]);
         expect(status.tasks.every((task: any) => task.state === "accepted")).toBe(true);

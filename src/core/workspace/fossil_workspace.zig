@@ -268,7 +268,10 @@ pub const Manager = struct {
             .stderr_limit = .limited(64 * 1024),
         });
         switch (result.term) {
-            .exited => |code| if (code != 0) return error.FossilCommandFailed,
+            .exited => |code| if (code != 0) {
+                debug_trace.logf("workspace", "Fossil action={s} exit={d} detail={s}", .{ if (arguments.len > 0) arguments[0] else "unknown", code, result.stderr[0..@min(result.stderr.len, 2048)] });
+                return error.FossilCommandFailed;
+            },
             else => return error.FossilCommandFailed,
         }
         if (arguments.len > 0 and std.mem.eql(u8, arguments[0], "merge") and std.mem.find(u8, result.stderr, "conflict") != null) return error.WorkspaceMergeConflict;
@@ -706,6 +709,42 @@ pub const Manager = struct {
         return self.run(null, &.{ "cat", path, "-r", task.branch, "-R", self.repository });
     }
 
+    pub fn contentAt(self: Manager, path: []const u8, revision_id: []const u8) ![]const u8 {
+        if (!allowedPath(path)) return error.WorkspacePathDenied;
+        return self.run(null, &.{ "cat", path, "-r", revision_id, "-R", self.repository });
+    }
+
+    pub fn currentRevision(self: Manager, task: Task) ![]const u8 {
+        return self.revision(task.branch);
+    }
+
+    pub fn failedReviewCandidate(self: Manager, task: Task) !?[]const u8 {
+        var candidate: ?[]const u8 = null;
+        var candidate_at: i64 = -1;
+        var failure_at: i64 = -1;
+        for (try self.taskHistory(task, try self.currentRevision(task))) |bytes| {
+            const entry = try parse(self.alloc, std.json.Value, bytes);
+            if (entry != .object) continue;
+            const kind = entry.object.get("kind") orelse continue;
+            const version_value = entry.object.get("contract_version") orelse continue;
+            if (kind != .string or version_value != .integer or version_value.integer != task.definition.version) continue;
+            if (!std.mem.eql(u8, kind.string, "review_candidate") and !std.mem.eql(u8, kind.string, "review_failure")) continue;
+            const value = entry.object.get("value") orelse continue;
+            if (value != .object) continue;
+            const at = value.object.get("at_ms") orelse continue;
+            if (at != .integer) continue;
+            if (std.mem.eql(u8, kind.string, "review_failure")) {
+                failure_at = @max(failure_at, at.integer);
+            } else if (at.integer >= candidate_at) {
+                const text = value.object.get("text") orelse continue;
+                if (text != .string) continue;
+                candidate = text.string;
+                candidate_at = at.integer;
+            }
+        }
+        return if (failure_at >= candidate_at) candidate else null;
+    }
+
     pub fn readContent(self: Manager, task: Task, path: []const u8) ![]const u8 {
         const bytes = try self.content(task, path);
         if (!std.mem.startsWith(u8, path, "memory/") and !std.mem.startsWith(u8, path, "skills/")) return bytes;
@@ -803,22 +842,86 @@ pub const Manager = struct {
 
     pub fn evidenceRecords(self: Manager, task: Task, revision_id: []const u8) ![]const []const u8 {
         var records: std.ArrayList([]const u8) = .empty;
-        var total: usize = 0;
-        const prefix = try self.alloc.print("history/{s}/", .{task.id});
-        for (try self.inventory(revision_id)) |path| {
-            if (!std.mem.startsWith(u8, path, prefix)) continue;
-            const bytes = try self.run(null, &.{ "cat", path, "-r", revision_id, "-R", self.repository });
+        for (try self.taskHistory(task, revision_id)) |bytes| {
             const entry = try parse(self.alloc, std.json.Value, bytes);
             if (entry != .object) return error.InvalidWorkspaceJournal;
             const kind = entry.object.get("kind") orelse return error.InvalidWorkspaceJournal;
             if (kind != .string) return error.InvalidWorkspaceJournal;
             if (!std.mem.eql(u8, kind.string, "tool_evidence")) continue;
-            const name = std.Io.Dir.path.basename(path);
-            if (name.len != 69 or !std.mem.eql(u8, name[0..64], try hash(self.alloc, bytes))) return error.InvalidWorkspaceJournal;
-            total += bytes.len;
-            if (total > 512 * 1024) return error.ContractReviewEvidenceTooLarge;
             try records.append(self.alloc, bytes);
         }
+        return records.toOwnedSlice(self.alloc);
+    }
+
+    pub fn taskHistory(self: Manager, task: Task, revision_id: []const u8) ![]const []const u8 {
+        const prefix = try self.alloc.print("history/{s}/", .{task.id});
+        var paths: std.ArrayList([]const u8) = .empty;
+        for (try self.inventory(revision_id)) |path| if (std.mem.startsWith(u8, path, prefix)) try paths.append(self.alloc, path);
+        var records: std.ArrayList([]const u8) = .empty;
+        var start: usize = 0;
+        while (start < paths.items.len) : (start += 16) {
+            const batch = paths.items[start..@min(start + 16, paths.items.len)];
+            if (self.historyBatch(batch, revision_id)) |values| {
+                try records.appendSlice(self.alloc, values);
+            } else |err| {
+                if (err == error.OutOfMemory) return err;
+                // Noncanonical whitespace or a large batch can defeat framing.
+                // Individual reads retain the same exact hash verification.
+                for (batch) |path| {
+                    const bytes = try self.contentAt(path, revision_id);
+                    try self.checkHistoryHash(path, bytes);
+                    try records.append(self.alloc, bytes);
+                }
+            }
+        }
+        return records.toOwnedSlice(self.alloc);
+    }
+
+    fn checkHistoryHash(self: Manager, path: []const u8, bytes: []const u8) !void {
+        const name = std.Io.Dir.path.basename(path);
+        if (name.len != 69 or !std.mem.endsWith(u8, name, ".json") or !std.mem.eql(u8, name[0..64], try hash(self.alloc, bytes))) return error.InvalidWorkspaceJournal;
+    }
+
+    fn historyBatch(self: Manager, paths: []const []const u8, revision_id: []const u8) ![]const []const u8 {
+        var args: std.ArrayList([]const u8) = .empty;
+        try args.append(self.alloc, "cat");
+        try args.appendSlice(self.alloc, paths);
+        try args.appendSlice(self.alloc, &.{ "-r", revision_id, "-R", self.repository });
+        const bytes = try self.run(null, args.items);
+        var records: std.ArrayList([]const u8) = .empty;
+        var start: usize = 0;
+        var depth: usize = 0;
+        var quoted = false;
+        var escaped = false;
+        for (bytes, 0..) |byte, i| {
+            if (quoted) {
+                if (escaped) {
+                    escaped = false;
+                } else if (byte == '\\') {
+                    escaped = true;
+                } else if (byte == '"') {
+                    quoted = false;
+                }
+                continue;
+            }
+            if (byte == '"') {
+                quoted = true;
+                continue;
+            }
+            if (byte == '{' or byte == '[') depth += 1;
+            if (byte == '}' or byte == ']') {
+                if (depth == 0) return error.InvalidWorkspaceJournal;
+                depth -= 1;
+                if (depth == 0) {
+                    const record = bytes[start .. i + 1];
+                    if (records.items.len >= paths.len) return error.InvalidWorkspaceJournal;
+                    try self.checkHistoryHash(paths[records.items.len], record);
+                    try records.append(self.alloc, record);
+                    start = i + 1;
+                }
+            }
+        }
+        if (start != bytes.len or records.items.len != paths.len) return error.InvalidWorkspaceJournal;
         return records.toOwnedSlice(self.alloc);
     }
 
@@ -900,16 +1003,31 @@ pub const Manager = struct {
 
     pub fn reviewSnapshot(self: Manager, task: Task, revision_id: []const u8) ![]const u8 {
         const latest = try self.loadTask(task.id);
-        const Read = struct { path: []const u8, observed_hash: []const u8, reviewed_content: []const u8 };
+        const Read = struct { path: []const u8, observed_hash: []const u8, reviewed_hash: []const u8, bytes: usize, reviewed_content: []const u8, complete: bool };
         var reads: std.ArrayList(Read) = .empty;
-        var total: usize = 0;
         for (latest.dependencies) |dependency| {
             const bytes = try self.run(null, &.{ "cat", dependency.path, "-r", revision_id, "-R", self.repository });
-            total += bytes.len;
-            if (total > 256 * 1024) return error.ContractReviewEvidenceTooLarge;
-            try reads.append(self.alloc, .{ .path = dependency.path, .observed_hash = dependency.observed_hash, .reviewed_content = bytes });
+            const preview = @import("../agent/runtime/review_evidence.zig").View.prefix(bytes, 1024);
+            try reads.append(self.alloc, .{ .path = dependency.path, .observed_hash = dependency.observed_hash, .reviewed_hash = try hash(self.alloc, bytes), .bytes = bytes.len, .reviewed_content = preview, .complete = preview.len == bytes.len });
         }
         return json(self.alloc, .{ .workspace = self.manifest.id, .task = task.id, .branch = task.branch, .reviewed_revision = revision_id, .contract_version = task.definition.version, .reads = reads.items });
+    }
+
+    pub fn verifyManifest(self: Manager, task: Task, path: []const u8) ![]const u8 {
+        const revision_id = try self.currentRevision(task);
+        const bytes = try self.contentAt(path, revision_id);
+        const File = struct { path: []const u8, sha256: []const u8, bytes: usize };
+        const declaration = try parse(self.alloc, struct { files: []const File }, bytes);
+        if (declaration.files.len == 0 or declaration.files.len > 4096) return error.InvalidArtifactManifest;
+        var total: usize = 0;
+        for (declaration.files, 0..) |file, i| {
+            if (!allowedMutablePath(file.path) or !safeId(file.sha256)) return error.InvalidArtifactManifest;
+            for (declaration.files[0..i]) |previous| if (std.mem.eql(u8, previous.path, file.path)) return error.InvalidArtifactManifest;
+            const actual = try self.contentAt(file.path, revision_id);
+            if (actual.len != file.bytes or !std.mem.eql(u8, file.sha256, try hash(self.alloc, actual))) return error.WorkspaceVerificationFailed;
+            total = try std.math.add(usize, total, actual.len);
+        }
+        return json(self.alloc, .{ .kind = "workspace_manifest_verification", .revision = revision_id, .manifest_sha256 = try hash(self.alloc, bytes), .verified = true, .files = declaration.files.len, .bytes = total, .scope = "Verifies workspace bytes against the supplied manifest; source provenance and external effects require separate evidence." });
     }
 
     pub fn diff(self: Manager, task: Task) ![]const u8 {

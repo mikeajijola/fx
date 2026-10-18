@@ -3,7 +3,7 @@ const workspace = @import("../../core/workspace/fossil_workspace.zig");
 const dispatch = @import("../../core/tooling/tool_dispatch.zig");
 
 const Input = struct {
-    action: enum { status, read, write, artifact, diff, history },
+    action: enum { status, read, write, artifact, diff, history, verify_manifest },
     path: ?[]const u8 = null,
     content: ?[]const u8 = null,
 };
@@ -64,6 +64,7 @@ fn execute(alloc: std.mem.Allocator, ctx: dispatch.DispatchContext, input: Input
     }
     const active = task orelse return error.SavedTaskRequired;
     switch (input.action) {
+        .verify_manifest => return manager.verifyManifest(active, input.path orelse return error.MissingPath),
         .diff => return manager.diff(active),
         .write => {
             try manager.writeContent(active, input.path orelse return error.MissingPath, input.content orelse return error.MissingContent);

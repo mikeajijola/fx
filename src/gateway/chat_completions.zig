@@ -219,7 +219,7 @@ pub fn failure_kind(status: std.http.Status) streams.FailureKind {
 pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest) !streams.Result {
     var limits: codec.Limits = .{};
     if (request.content_capture_limit) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
-    return codec.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag);
+    return codec.consume_stream_diagnostic(alloc, reader, request.data(), limits, request.events, request.cancel_flag, &request.attempt_evidence.tool_identity_failure);
 }
 
 /// The returned entry borrows its strings; fetch_catalog replaces them with owned copies.

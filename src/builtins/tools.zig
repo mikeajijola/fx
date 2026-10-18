@@ -843,13 +843,13 @@ pub const read_tool_result = ToolSpec{
 
 pub const fossil_workspace = ToolSpec{
     .name = "fossil_workspace",
-    .description = "Inspect task state, read/write memory or skills, attach a content-addressed artifact, or inspect history/diff. Branch and merge operations are host-only.",
+    .description = "Inspect task state, read/write memory or skills, attach an artifact, verify workspace file bytes with verify_manifest, or inspect history/diff. A manifest path contains files with path, sha256, and bytes. Branch and merge operations are host-only.",
     .model_schema = .{
         .name = "fossil_workspace",
-        .description = "Inspect task state, read/write memory or skills, attach a content-addressed artifact, or inspect history/diff. Branch and merge operations are host-only.",
+        .description = "Inspect task state, read/write memory or skills, attach an artifact, verify workspace file bytes with verify_manifest, or inspect history/diff. A manifest path contains files with path, sha256, and bytes. Branch and merge operations are host-only.",
         .input_schema = .{
             .properties = &.{
-                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "status", "read", "write", "artifact", "diff", "history" } } },
+                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "status", "read", "write", "artifact", "diff", "history", "verify_manifest" } } },
                 .{ .name = "path", .json_type = .string },
                 .{ .name = "content", .json_type = .string },
             },

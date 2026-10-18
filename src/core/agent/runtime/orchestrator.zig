@@ -6852,8 +6852,11 @@ fn assessCompletionContract(
     var delivery: agent_stream_provider.DeliveryCertainty = .init();
     var evidence: agent_stream_provider.AttemptEvidence = .{};
     var event_context: u8 = 0;
+    if (input.managed) |turn| try turn.manager.record(turn.task, "review_candidate", .{ .at_ms = io_mod.milliTimestamp(), .text = input.candidate });
     const prior_evidence = if (input.managed) |turn| try turn.beforeReview(arena, input.messages) else &.{};
     const result = completion_review.assess(arena, deps.agent_stream_provider, .{
+        .journal = if (input.managed) |turn| turn.journal() else null,
+        .provider = input.job.provider,
         .definition = if (input.managed) |turn| turn.task.definition else null,
         .original_request = if (input.managed) |turn| try turn.manager.originalRequest(turn.task) else null,
         .prior_evidence = prior_evidence,
@@ -6880,7 +6883,8 @@ fn assessCompletionContract(
             .cancel_flag = input.config.cancel_flag,
         },
     }) catch |err| {
-        if (err != error.Cancelled) try deps.push_system_notice(deps.ctx, "Completion could not be verified; the task remains incomplete.");
+        if (input.managed) |turn| try turn.manager.record(turn.task, "review_failure", .{ .at_ms = io_mod.milliTimestamp(), .reason = @errorName(err), .candidate_retained = true });
+        if (err != error.Cancelled) try deps.push_system_notice(deps.ctx, if (err == error.ContractReviewPending) "Verification reached its evidence budget. The answer and review progress are retained; continue retries verification without repeating actions." else "Completion could not be verified; the answer and evidence remain retained for verification.");
         return err;
     };
     if (deps.report_usage) |report| report(deps.ctx, result.usage);
@@ -6888,6 +6892,7 @@ fn assessCompletionContract(
     _ = summary.reconcileTokenRequest(result.usage, false);
     debug_trace.eventf("agent", "contract_assessment", .{ .turn_id = input.turn_id }, "disposition={s} step={d}", .{ @tagName(result.decision.disposition), input.step });
     if (input.managed) |turn| {
+        try turn.sealReview();
         turn.assessment = result.assessment;
         if (result.decision.disposition == .blocked) turn.task = try turn.manager.setState(turn.task.id, .blocked);
     }
@@ -7020,11 +7025,44 @@ fn processQueuedPromptLoop(
     defer interrupted_persisted_ptr.* = interrupted_persisted;
     var silent_tool_steps: usize = 0;
     var continuation_injected = false;
+    var tool_name_correction_used = false;
     var last_step_ctx = finish_trace.ctx;
     var current_step_index: usize = 0;
     var last_tool_call_name: []const u8 = "none";
     var last_tool_call_id: []const u8 = "none";
     var last_gateway_message_count: usize = stable_prefix.items.len + history_messages.items.len + 1;
+    if (managed) |*turn| {
+        if (turn.review_only_candidate) |candidate| {
+            try deps.push_system_notice(deps.ctx, "Resuming verification of the retained answer; completed actions will not be repeated.");
+            const decision = try assessCompletionContract(deps, arena, &summary_accumulator, .{
+                .config = config,
+                .job = job,
+                .candidate = candidate,
+                .messages = &.{},
+                .api_key = active_api_key,
+                .model = job.model,
+                .root_user_context = root_user_intent_context,
+                .turn_id = turn_id,
+                .step = 0,
+                .managed = turn,
+            });
+            if (decision.disposition == .fulfilled) {
+                try turn.publish(candidate);
+                try deps.push_text(deps.ctx, .assistant_started);
+                try deps.push_text(deps.ctx, .{ .assistant_source = candidate });
+                try deps.push_text(deps.ctx, .{ .assistant_rendered = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, candidate) });
+                try finishCommonAssistantTerminal(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, .{ .history = candidate }, .completed, null, &finish_trace, "assistant", .{ .role = .assistant, .content = candidate });
+                try turn.manager.acknowledge(turn.task);
+                return;
+            }
+            if (decision.disposition == .blocked) {
+                try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, decision.feedback, "contract_blocked");
+                return;
+            }
+            try within_turn_suffix.append(arena, .{ .role = .assistant, .content = candidate });
+            try within_turn_suffix.append(arena, .{ .role = .user, .content = decision.feedback });
+        }
+    }
     var selected_dynamic_tools: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
     try selected_dynamic_tools.ensureTotalCapacity(arena, config.initial_dynamic_tools.len);
     for (config.initial_dynamic_tools) |tool| {
@@ -7840,6 +7878,30 @@ fn processQueuedPromptLoop(
                     debug_trace.logf("agent", "token progress publication failed source=gateway_error err={s}", .{@errorName(progress_err)});
                 };
                 const cancel_requested = config.cancel_flag.load(.seq_cst);
+                if (err == error.InvalidToolName and !cancel_requested) {
+                    var advertised: std.ArrayList([]const u8) = .empty;
+                    try advertised.appendSlice(arena, model_request.tools.advertised_names);
+                    for (model_request.tools.selected_dynamic) |tool| try advertised.append(arena, tool.name);
+                    const diagnostic = gateway_attempt_evidence.tool_identity_failure;
+                    const stage = if (gateway_attempt_evidence.provider_admitted) "response" else "request";
+                    if (managed) |*turn| try turn.manager.record(turn.task, "protocol_failure", .{
+                        .at_ms = io_mod.milliTimestamp(),
+                        .step = current_step_index,
+                        .stage = stage,
+                        .reason = "InvalidToolName",
+                        .rejected_name = if (diagnostic) |value| value.name() else "unavailable",
+                        .advertised_names = advertised.items,
+                        .corrective_attempt = tool_name_correction_used,
+                    });
+                    if (tool_name_correction_used or !gateway_attempt_evidence.provider_admitted) {
+                        try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, "A tool name was rejected before execution. Inspect the recorded protocol failure and current tool definitions; completed actions remain retained.", "invalid_tool_name");
+                        return;
+                    }
+                    tool_name_correction_used = true;
+                    try within_turn_suffix.append(arena, .{ .role = .user, .content = try arena.print("Your last tool proposal was rejected before execution because its name was missing, malformed, or absent from this request's tool definitions. No calls in that rejected response were executed. Use only the exact currently advertised names: {s}. Use capability_search to discover and load any other configured tool before calling it. Do not repeat earlier successful actions. Return a fresh corrected proposal.", .{try std.json.Stringify.valueAlloc(arena, advertised.items, .{})}) });
+                    try deps.push_system_notice(deps.ctx, "Refreshing tool selection after a rejected tool name...");
+                    continue :agent_steps_loop;
+                }
                 const consumed_attempts = semantic_attempt +
                     @as(usize, @intFromBool(gateway_attempt_evidence.provider_admitted));
                 const network_failure = gateway_attempt_evidence.network_failure;
