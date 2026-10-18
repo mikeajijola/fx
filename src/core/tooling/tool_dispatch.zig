@@ -254,6 +254,7 @@ pub const RunCommandBackend = struct {
 pub const DispatchContext = struct {
     allocator: Allocator,
     fossil_session_id: ?[]const u8 = null,
+    fossil_workspace_available: bool = false,
     permission_mode: permission_gate.PermissionMode = .ask,
     permission_decider: ?PermissionDecider = null,
     execution_authority: ?command_admission.ToolExecutionAuthority = null,

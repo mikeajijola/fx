@@ -219,6 +219,7 @@ pub fn Runtime(comptime App: type) type {
             else
                 provider_set.Bundle.Capabilities{};
             var ctx: tool_runtime.Context = .{
+                .fossil_workspace_available = if (comptime @hasDecl(App, "fossilWorkspaceAvailable")) app.fossilWorkspaceAvailable() else false,
                 .workspace_root = workspace.root,
                 .access_scope = workspace.access_scope,
                 .ignored_list_entries = ignored_list_entries,

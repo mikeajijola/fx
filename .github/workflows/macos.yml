@@ -161,6 +161,7 @@ jobs:
           command -v fossil >/dev/null 2>&1 || brew install fossil
           printf 'set-option -g history-limit 100000\n' > "$HOME/.tmux.conf"
           tmux -V
+          fossil version
           zsh --version
 
       - name: Install E2E dependencies

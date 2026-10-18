@@ -601,6 +601,7 @@ jobs:
           fi
           printf 'set-option -g history-limit 100000\n' > "$HOME/.tmux.conf"
           tmux -V
+          fossil version
           zsh --version
 
       - name: Install E2E dependencies

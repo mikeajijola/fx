@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const contract = @import("../agent/runtime/work_contract.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 const max_bytes = 8 * 1024 * 1024;
@@ -275,7 +276,7 @@ pub const Manager = struct {
     }
 
     fn merge(self: Manager, tree: []const u8, revision_id: []const u8, previous: Task) !void {
-        const output = self.run(tree, &.{ "merge", "--nosync", "--binary", "*", revision_id }) catch |err| {
+        const output = self.run(tree, &.{ "merge", "--binary", "*", revision_id }) catch |err| {
             if (err == error.WorkspaceMergeConflict) {
                 var task = try self.loadTask(previous.id);
                 task.state = .conflict;
@@ -414,14 +415,14 @@ pub const Manager = struct {
                 for (nonce) |ch| if (!std.ascii.isHex(ch)) {
                     valid = false;
                 };
-                if (!valid or (!allowedPath(path[0..marker]) and !std.mem.eql(u8, path[0..marker], "registry.json"))) return error.UnexpectedWorkspaceEntry;
+                if (!valid or (!allowedPath(path[0..marker]) and !std.mem.eql(u8, path[0..marker], "registry.json"))) return unexpectedEntry(tree, path);
                 try remove(try join(self.alloc, tree, path));
                 continue;
             }
-            if (!allowedPath(path) and !std.mem.eql(u8, path, "registry.json")) return error.UnexpectedWorkspaceEntry;
+            if (!allowedPath(path) and !std.mem.eql(u8, path, "registry.json")) return unexpectedEntry("checkout inventory", path);
         }
         _ = try self.run(tree, &.{ "addremove", "--dotfiles" });
-        _ = try self.run(tree, &.{ "commit", "--nosync", "--nosign", "--no-verify", "--no-warnings", "--no-verify-comment", "-m", message });
+        _ = try self.run(tree, &.{ "commit", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", message });
         const output = try self.run(tree, &.{"info"});
         var lines = std.mem.splitScalar(u8, output, '\n');
         while (lines.next()) |line| {
@@ -489,7 +490,7 @@ pub const Manager = struct {
         const id = try hash(self.alloc, &nonce);
         const branch = try self.alloc.print("task/{s}", .{id});
         const base = try self.revision(if (parent) |task| task.branch else "trunk");
-        _ = try self.run(null, &.{ "branch", "new", branch, base, "--nosync", "-R", self.repository });
+        _ = try self.run(null, &.{ "branch", "new", branch, base, "--nosign", "-R", self.repository });
         const request_text = try text_utils.maskSecrets(self.alloc, goal);
         var objective_len = @min(request_text.len, 8192);
         while (objective_len > 0 and !std.unicode.utf8ValidateSlice(request_text[0..objective_len])) objective_len -= 1;
@@ -633,7 +634,15 @@ pub const Manager = struct {
         var names: std.ArrayList([]const u8) = .empty;
         var iter = directory.iterate();
         while (try iter.next(io_mod.getIo())) |entry| {
-            if (entry.kind != .file) return error.UnexpectedWorkspaceEntry;
+            if (temporaryRecordFile(entry.name)) continue;
+            const kind = if (entry.kind == .unknown) blk: {
+                const stat = directory.statFile(io_mod.getIo(), entry.name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                    error.FileNotFound => continue,
+                    else => return err,
+                };
+                break :blk stat.kind;
+            } else entry.kind;
+            if (kind != .file) return unexpectedEntry(path, entry.name);
             try names.append(self.alloc, try self.alloc.dupe(u8, entry.name));
         }
         std.mem.sort([]const u8, names.items, {}, struct {
@@ -913,7 +922,6 @@ pub const Manager = struct {
         var result: std.ArrayList(Task) = .empty;
         const directory = try join(self.alloc, self.root, "tasks");
         for (try self.entries(directory)) |name| {
-            if (temporaryTaskFile(name)) continue;
             if (!std.mem.endsWith(u8, name, ".json")) return error.InvalidTaskId;
             try result.append(self.alloc, try self.loadTask(name[0 .. name.len - 5]));
         }
@@ -959,7 +967,7 @@ pub const Manager = struct {
             while (files.next()) |raw_path| {
                 const path = std.mem.trim(u8, raw_path, "\r");
                 if (path.len == 0) continue;
-                if (!allowedPath(path) and !std.mem.eql(u8, path, "registry.json")) return error.UnexpectedWorkspaceEntry;
+                if (!allowedPath(path) and !std.mem.eql(u8, path, "registry.json")) return unexpectedEntry("checkout inventory", path);
                 if (std.mem.startsWith(u8, path, "artifacts/")) {
                     const content_bytes = try self.run(null, &.{ "cat", path, "-r", branch, "-R", self.repository });
                     if (!std.mem.eql(u8, path[10..], try hash(self.alloc, content_bytes))) return error.InvalidArtifactIdentity;
@@ -1164,7 +1172,8 @@ pub const Manager = struct {
         // Current sessions keep metadata and append-only conversation events
         // separately. Use the canonical read-only archive projection; never
         // load the executable recovery checkpoint or rewrite the source log.
-        var dir: io_mod.VerifiedDir = .{ .dir = try io_mod.openDirAbsoluteNoFollow(directory, .{ .iterate = true }) };
+        const canonical = try io_mod.realpathAlloc(self.alloc, directory);
+        var dir: io_mod.VerifiedDir = .{ .dir = try io_mod.openDirAbsoluteNoFollow(canonical, .{ .iterate = true }) };
         defer dir.close();
         const events = try dir.dir.openFile(io_mod.getIo(), "events.jsonl", .{ .follow_symlinks = false });
         defer events.close(io_mod.getIo());
@@ -1310,21 +1319,25 @@ fn safeId(value: []const u8) bool {
 }
 
 // Readers may observe an in-flight durable replacement before its rename.
-// Only the exact host-generated temporary name is omitted from the registry.
-fn temporaryTaskFile(name: []const u8) bool {
-    const suffix = ".json.pending-";
-    if (name.len != 64 + suffix.len + 32) return false;
-    if (!safeId(name[0..64]) or !std.mem.startsWith(u8, name[64..], suffix)) return false;
-    for (name[64 + suffix.len ..]) |ch| if (!std.ascii.isHex(ch)) return false;
+// Only exact host-generated temporary names are omitted from record discovery.
+fn temporaryRecordFile(name: []const u8) bool {
+    const suffix = ".pending-";
+    const base_len: usize = if (name.len == 64 + suffix.len + 32) 64 else if (name.len == 64 + 5 + suffix.len + 32) 69 else return false;
+    if (!safeId(name[0..64])) return false;
+    if (base_len == 69 and !std.mem.eql(u8, name[64..69], ".json")) return false;
+    if (!std.mem.startsWith(u8, name[base_len..], suffix)) return false;
+    for (name[base_len + suffix.len ..]) |ch| if (!std.ascii.isHex(ch)) return false;
     return true;
 }
 
-test "workspace paths omit only valid atomic task registry temporaries" {
+test "workspace paths omit only valid atomic record temporaries" {
     const id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    try std.testing.expect(temporaryTaskFile(id ++ ".json.pending-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
-    try std.testing.expect(!temporaryTaskFile(id ++ ".json"));
-    try std.testing.expect(!temporaryTaskFile("unexpected.json.pending-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
-    try std.testing.expect(!temporaryTaskFile(id ++ ".json.pending-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbz"));
+    try std.testing.expect(temporaryRecordFile(id ++ ".json.pending-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+    try std.testing.expect(temporaryRecordFile(id ++ ".pending-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+    try std.testing.expect(!temporaryRecordFile(id ++ ".json"));
+    try std.testing.expect(!temporaryRecordFile(id ++ ".pending-short"));
+    try std.testing.expect(!temporaryRecordFile("unexpected.json.pending-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+    try std.testing.expect(!temporaryRecordFile(id ++ ".json.pending-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbz"));
 }
 
 fn allowedMutablePath(path: []const u8) bool {
@@ -1362,4 +1375,9 @@ fn fault(point: []const u8) !void {
 fn optionalEqual(a: ?[]const u8, b: ?[]const u8) bool {
     if (a) |value| return if (b) |other| std.mem.eql(u8, value, other) else false;
     return b == null;
+}
+
+fn unexpectedEntry(directory: []const u8, name: []const u8) error{UnexpectedWorkspaceEntry} {
+    debug_trace.logf("workspace", "Unexpected workspace entry in {s}: {s}", .{ directory, name });
+    return error.UnexpectedWorkspaceEntry;
 }

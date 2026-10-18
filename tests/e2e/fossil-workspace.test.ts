@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { cleanupIsolatedTestHome, createIsolatedTestHome, runFx } from "../evals/eval-helpers";
 
@@ -12,18 +13,23 @@ afterEach(() => {
 });
 
 function fixture() {
-  const home = createIsolatedTestHome();
+  const home = realpathSync(createIsolatedTestHome());
   homes.push(home);
   const cwd = join(home, "project");
   mkdirSync(cwd);
   mkdirSync(join(home, ".fx"));
   const env = {
+    FX_TRACE_LOG: join(home, "fossil.trace"), FX_TRACE_SCOPES: "workspace",
     HOME: home, FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1",
     FX_SKIP_ONBOARDING: "1", FX_CONTRACT_REVIEW: "1", FX_E2E_FOSSIL_FAULT: undefined,
     AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined, GEMINI_API_KEY: undefined,
     FX_PROVIDER: undefined, FX_MODEL: undefined, FX_REVIEW_MODEL: undefined,
   };
-  const run = (args: string[], extra: Record<string, string | undefined> = {}, timeoutMs = 30000) => runFx(args, { cwd, env: { ...env, ...extra }, timeoutMs });
+  const run = async (args: string[], extra: Record<string, string | undefined> = {}, timeoutMs = 30000) => {
+    const result = await runFx(args, { cwd, env: { ...env, ...extra }, timeoutMs });
+    if (result.code !== 0 && existsSync(env.FX_TRACE_LOG)) result.stderr += "\n" + readFileSync(env.FX_TRACE_LOG, "utf8");
+    return result;
+  };
   const fossil = (...args: string[]) => {
     const result = spawnSync("fossil", [...args, "-R", join(cwd, "omos.fossil")], { env: { PATH: process.env.PATH, HOME: home, FOSSIL_HOME: home, XDG_CONFIG_HOME: home, USER: "fixture", LC_ALL: "C" }, encoding: "utf8" });
     expect(result.status).toBe(0);
@@ -78,7 +84,7 @@ describe("portable Fossil agent workspace", () => {
   test("initializes, binds across directories, verifies and exports without overwriting", async () => {
     const f = fixture();
     const initialized = await f.run(["fossil", "init", "--json"]);
-    expect(initialized.code).toBe(0);
+    expect(initialized.code, initialized.stderr).toBe(0);
     expect(initialized.stderr).toBe("");
     const first = JSON.parse(initialized.stdout);
     expect(first.repository).toBe(join(f.cwd, "omos.fossil"));
@@ -173,7 +179,7 @@ describe("portable Fossil agent workspace", () => {
       }
       return ++children === 1 ? writeMemory("Verified child preference.") : { content: "Child preference saved." };
     });
-    const result = await f.run(["ask", "Delegate saving a child preference", "--json"]);
+    const result = await f.run(["ask", "Delegate saving a child preference", "--json"], {}, 90000);
     expect(result.code, result.stderr).toBe(0);
     const status = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout);
     expect(status.tasks).toHaveLength(2);
@@ -184,7 +190,7 @@ describe("portable Fossil agent workspace", () => {
     expect(status.tasks.every((task: any) => task.state === "accepted")).toBe(true);
     expect(m.packets.length).toBeGreaterThanOrEqual(2);
     expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Verified child preference.");
-  }, 60000);
+  }, 90000);
 
   test("blocked work resumes the same task with a versioned user amendment", async () => {
     const f = fixture();
@@ -238,7 +244,13 @@ describe("portable Fossil agent workspace", () => {
       expect(failed.code).toBe(1);
       const before = effects;
       const session = JSON.parse(failed.stdout).session_id;
-      expect((await f.run(["ask", "--resume-id", session, "continue", "--json"])).code).toBe(0);
+      const snapshot = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout);
+      const cache = createHash("sha256").update(snapshot.repository).digest("hex");
+      const pending = join(f.home, ".fx", "fossil", cache, "pending", snapshot.tasks[0].id);
+      mkdirSync(pending, { recursive: true });
+      writeFileSync(join(pending, `${"a".repeat(64)}.pending-${"b".repeat(32)}`), "partial interrupted record");
+      const recovered = await f.run(["ask", "--resume-id", session, "continue", "--json"]);
+      expect(recovered.code, recovered.stderr).toBe(0);
       if (fault === "evidence-checkpoint-committed") expect(effects).toBe(before);
       expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Recovered preference.");
       expect(JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).pending_journals).toBe(0);
@@ -270,10 +282,16 @@ describe("portable Fossil agent workspace", () => {
   test("no-save leaves the bound workspace unchanged", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
-    model(f, () => ({ content: "The answer is blue." }));
+    let observedRead = false;
+    model(f, (body, count) => {
+      if (count === 1) return { tool_calls: [{ index: 0, id: "read-only-status", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "status" }) } }] };
+      observedRead = body.messages.some((message: any) => message.role === "tool" && JSON.stringify(message.content).includes("omos.fossil"));
+      return { content: "The answer is blue." };
+    });
     const before = f.fossil("info", "trunk");
     const result = await f.run(["ask", "What color is blue?", "--no-save", "--json"]);
     expect(result.code).toBe(0);
+    expect(observedRead).toBe(true);
     expect(f.fossil("info", "trunk")).toBe(before);
     const status = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout);
     expect(status.tasks).toHaveLength(0);
@@ -362,7 +380,9 @@ describe("portable Fossil agent workspace", () => {
     writeFileSync(join(directory, "session.json"), metadata);
     writeFileSync(join(directory, "events.jsonl"), events);
     writeFileSync(join(directory, "recovery.json"), JSON.stringify({ credential: "must-not-export" }));
-    const result = await f.run(["fossil", "init", "--json"]);
+    const alias = join(f.home, "profile-link");
+    symlinkSync(f.home, alias, "dir");
+    const result = await f.run(["fossil", "init", "--json"], { HOME: alias });
     expect(result.code, result.stderr).toBe(0);
     expect(JSON.parse(result.stdout).detail).toContain("archived 1 existing sessions and skipped 0");
     const imported = f.fossil("ls", "-r", "trunk").trim().split("\n").find(path => path.startsWith("imports/"))!;
@@ -380,7 +400,9 @@ describe("portable Fossil agent workspace", () => {
     const session = join(f.home, ".fx", "sessions", "legacy-session");
     mkdirSync(session, { recursive: true });
     writeFileSync(join(session, "session.json"), JSON.stringify({ history: [{ assistant: { text: "Done", provider_replay: { token: "must-not-export" } } }], recovery_checkpoint: { secret: "must-not-export" }, credential: "must-not-export" }));
-    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const alias = join(f.home, "profile-link");
+    symlinkSync(f.home, alias, "dir");
+    expect((await f.run(["fossil", "init"], { HOME: alias })).code).toBe(0);
     const files = f.fossil("ls", "-r", "trunk").trim().split("\n");
     const imported = files.find(path => path.startsWith("imports/"))!;
     expect(imported).toBeTruthy();

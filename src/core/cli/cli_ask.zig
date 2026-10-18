@@ -280,6 +280,7 @@ fn runAskChild(
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
             .subagent_available = true,
+            .fossil_workspace_available = completion_review.enabled(),
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(ctx.alloc);
@@ -1157,6 +1158,7 @@ const AskContext = struct {
             });
         }
         var tc: tool_runtime.Context = .{
+            .fossil_workspace_available = completion_review.enabled(),
             .workspace_root = self.workspace_root,
             .access_scope = self.workspace_access.scope(self.workspace_root),
             .ignored_list_entries = self.cfg.ignored_list_entries,
@@ -2004,6 +2006,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .permission_mode = ctx.permission_mode,
         .permission_rules = ctx.permission_rules,
         .subagent_available = ctx.subagent_host != null,
+        .fossil_workspace_available = completion_review.enabled(),
     }, session_child_capability != null);
     defer tool_projection.deinit(alloc);
 

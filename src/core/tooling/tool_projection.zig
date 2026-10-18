@@ -12,6 +12,7 @@ pub const Options = struct {
     permission_mode: types.PermissionMode = .auto,
     permission_rules: types.PermissionRuleSet = .{},
     subagent_available: bool = false,
+    fossil_workspace_available: bool = false,
 };
 
 const BuildKind = enum { full, read_only };
@@ -558,6 +559,7 @@ fn appendBuiltinTool(
     options: Options,
 ) !void {
     if (!tool.model_visible) return;
+    if (tool.executor_kind == .fossil_workspace and !options.fossil_workspace_available) return;
     if (!includeBuiltinForKind(tool.name, kind, tool_set)) return;
     if (std.mem.eql(u8, tool.name, "subagent") and !options.subagent_available) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
@@ -784,4 +786,25 @@ test "subagent and shell selection follow host capability" {
     try expectContainsName(available.advertised_names, "subagent");
     try expectNotContainsName(available.advertised_names, "task");
     try expectContainsName(available.advertised_names, "shell");
+}
+
+test "Fossil workspace advertisement requires an explicit host capability" {
+    var fossil = test_tool_seed;
+    fossil.name = "fossil_workspace";
+    fossil.model_schema.name = fossil.name;
+    fossil.executor_kind = .fossil_workspace;
+    const tools = [_]tool_dispatch.Tool{fossil};
+    for ([_]bool{ false, true }) |available| {
+        var projection = try buildTestModelToolProjectionForRegistry(std.testing.allocator, &tools, .{
+            .permission_mode = .yolo,
+            .fossil_workspace_available = available,
+        });
+        defer projection.deinit(std.testing.allocator);
+        try std.testing.expectEqual(available, containsName(projection.advertised_names, "fossil_workspace"));
+    }
+    // A host-registered tool's spelling does not grant or require this capability.
+    fossil.executor_kind = .host;
+    var custom_projection = try buildTestModelToolProjectionForRegistry(std.testing.allocator, &.{fossil}, .{});
+    defer custom_projection.deinit(std.testing.allocator);
+    try std.testing.expect(containsName(custom_projection.advertised_names, "fossil_workspace"));
 }

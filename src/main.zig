@@ -2087,7 +2087,12 @@ const App = struct {
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
             .subagent_available = self.session_persistence.subagent_host != null,
+            .fossil_workspace_available = self.fossilWorkspaceAvailable(),
         });
+    }
+
+    pub fn fossilWorkspaceAvailable(_: *App) bool {
+        return @import("core/agent/runtime/completion_review.zig").enabled();
     }
 
     pub fn subagentToolContextForAdmission(

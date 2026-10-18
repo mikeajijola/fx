@@ -49,7 +49,7 @@ pub fn call(ctx: dispatch.DispatchContext, input: dispatch.ToolInput) dispatch.D
 }
 
 fn execute(alloc: std.mem.Allocator, ctx: dispatch.DispatchContext, input: Input) ![]const u8 {
-    if (!@import("../../core/agent/runtime/completion_review.zig").enabled()) return error.UnmanagedHost;
+    if (!ctx.fossil_workspace_available) return error.UnmanagedHost;
     const manager = (try workspace.Manager.bound(alloc)) orelse return error.NoFossilWorkspace;
     const task = if (ctx.fossil_session_id) |session| try manager.active(session) else null;
     if (input.action == .status) {
