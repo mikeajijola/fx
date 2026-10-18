@@ -843,7 +843,7 @@ pub const read_tool_result = ToolSpec{
 
 pub const fossil_workspace = ToolSpec{
     .name = "fossil_workspace",
-    .description = "Read or update the durable agent workspace. The host owns contracts, branches, checkpoints, and merges. Credentials and project source do not belong here.",
+    .description = "Inspect task state, read/write memory or skills, attach a content-addressed artifact, or inspect history/diff. Branch and merge operations are host-only.",
     .model_schema = .{
         .name = "fossil_workspace",
         .description = "Inspect task state, read/write memory or skills, attach a content-addressed artifact, or inspect history/diff. Branch and merge operations are host-only.",
@@ -977,7 +977,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "ca8b5aa265c6318fbd0604879fb2626826d9fcb83fa5d335dc0371fec7286b3f",
+        "7887bb8b1784dcf41ac1fb2325a6b4a47a50589fed98a584dc055449372bc19a",
         &actual_hex,
     );
 }

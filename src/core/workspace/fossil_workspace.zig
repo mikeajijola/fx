@@ -193,9 +193,12 @@ fn exists(path: []const u8) bool {
 const Lease = struct {
     file: std.Io.File,
     fn acquire(alloc: Allocator, root: []const u8) !Lease {
+        return acquireNamed(alloc, root, "writer.lock");
+    }
+    fn acquireNamed(alloc: Allocator, root: []const u8, name: []const u8) !Lease {
         if (comptime builtin.target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
         try mkdir(root);
-        const path = try join(alloc, root, "writer.lock");
+        const path = try join(alloc, root, name);
         const file = try std.Io.Dir.cwd().createFile(io_mod.getIo(), path, .{ .truncate = false, .permissions = .fromMode(0o600) });
         errdefer file.close(io_mod.getIo());
         var attempts: usize = 0;
@@ -239,7 +242,11 @@ pub const Manager = struct {
 
     fn run(self: Manager, cwd: ?[]const u8, arguments: []const []const u8) ![]const u8 {
         if (comptime builtin.target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
-        try mkdir(self.root);
+        // Fossil read commands can also take SQLite locks. Serialize each CLI
+        // process separately from the enclosing writer transaction, so status
+        // readers cannot abort a branch creation or checkpoint.
+        const command_lease = try Lease.acquireNamed(self.alloc, self.root, "command.lock");
+        defer command_lease.release();
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.appendSlice(self.alloc, &.{ "fossil", "--user", "omos" });
         try argv.appendSlice(self.alloc, arguments);
@@ -906,6 +913,7 @@ pub const Manager = struct {
         var result: std.ArrayList(Task) = .empty;
         const directory = try join(self.alloc, self.root, "tasks");
         for (try self.entries(directory)) |name| {
+            if (temporaryTaskFile(name)) continue;
             if (!std.mem.endsWith(u8, name, ".json")) return error.InvalidTaskId;
             try result.append(self.alloc, try self.loadTask(name[0 .. name.len - 5]));
         }
@@ -1126,14 +1134,13 @@ pub const Manager = struct {
                 skipped += 1;
                 continue;
             }
-            const conversation = value.object.get("history") orelse {
-                skipped += 1;
-                continue;
+            const conversation = self.importConversation(try join(self.alloc, sessions, entry.name), value) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    skipped += 1;
+                    continue;
+                },
             };
-            if (conversation != .array) {
-                skipped += 1;
-                continue;
-            }
             // History is archived as data; no imported claim becomes a task,
             // accepted contract, executable action, or resumable checkpoint.
             const archive = try json(self.alloc, .{ .format = 1, .kind = "legacy-history-archive", .source = try hash(self.alloc, entry.name), .history = conversation });
@@ -1147,6 +1154,32 @@ pub const Manager = struct {
         if (changes.len > 0 or extras.len > 0) _ = try self.commit(tree, "Archive existing session history");
         try remove(marker);
         return .{ .imported = count, .skipped = skipped };
+    }
+
+    fn importConversation(self: Manager, directory: []const u8, metadata: std.json.Value) !std.json.Value {
+        if (metadata.object.get("history")) |conversation| {
+            if (conversation != .array) return error.InvalidSessionFormat;
+            return conversation;
+        }
+        // Current sessions keep metadata and append-only conversation events
+        // separately. Use the canonical read-only archive projection; never
+        // load the executable recovery checkpoint or rewrite the source log.
+        var dir: io_mod.VerifiedDir = .{ .dir = try io_mod.openDirAbsoluteNoFollow(directory, .{ .iterate = true }) };
+        defer dir.close();
+        const events = try dir.dir.openFile(io_mod.getIo(), "events.jsonl", .{ .follow_symlinks = false });
+        defer events.close(io_mod.getIo());
+        if (try events.length(io_mod.getIo()) > max_bytes) return error.WorkspaceRecordTooLarge;
+        const turns = try @import("../session/session_log.zig").loadConversationArchive(self.alloc, &dir);
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        defer out.deinit();
+        try out.writer.writeByte('[');
+        for (turns, 0..) |turn, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try @import("../session/session_codec.zig").writeHistoryTurn(&out.writer, turn);
+            if (out.written().len > max_bytes) return error.WorkspaceRecordTooLarge;
+        }
+        try out.writer.writeByte(']');
+        return parse(self.alloc, std.json.Value, out.written());
     }
 
     /// Exports a verified clone after draining the journal cursor captured under
@@ -1274,6 +1307,24 @@ fn safeId(value: []const u8) bool {
     if (value.len != 64) return false;
     for (value) |ch| if (!std.ascii.isHex(ch)) return false;
     return true;
+}
+
+// Readers may observe an in-flight durable replacement before its rename.
+// Only the exact host-generated temporary name is omitted from the registry.
+fn temporaryTaskFile(name: []const u8) bool {
+    const suffix = ".json.pending-";
+    if (name.len != 64 + suffix.len + 32) return false;
+    if (!safeId(name[0..64]) or !std.mem.startsWith(u8, name[64..], suffix)) return false;
+    for (name[64 + suffix.len ..]) |ch| if (!std.ascii.isHex(ch)) return false;
+    return true;
+}
+
+test "workspace paths omit only valid atomic task registry temporaries" {
+    const id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    try std.testing.expect(temporaryTaskFile(id ++ ".json.pending-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+    try std.testing.expect(!temporaryTaskFile(id ++ ".json"));
+    try std.testing.expect(!temporaryTaskFile("unexpected.json.pending-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+    try std.testing.expect(!temporaryTaskFile(id ++ ".json.pending-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbz"));
 }
 
 fn allowedMutablePath(path: []const u8) bool {

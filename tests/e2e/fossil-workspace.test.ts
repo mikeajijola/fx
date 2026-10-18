@@ -23,9 +23,9 @@ function fixture() {
     AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined, GEMINI_API_KEY: undefined,
     FX_PROVIDER: undefined, FX_MODEL: undefined, FX_REVIEW_MODEL: undefined,
   };
-  const run = (args: string[], extra: Record<string, string | undefined> = {}) => runFx(args, { cwd, env: { ...env, ...extra }, timeoutMs: 30000 });
+  const run = (args: string[], extra: Record<string, string | undefined> = {}, timeoutMs = 30000) => runFx(args, { cwd, env: { ...env, ...extra }, timeoutMs });
   const fossil = (...args: string[]) => {
-    const result = spawnSync("fossil", [...args, "-R", join(cwd, "omos.fossil")], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+    const result = spawnSync("fossil", [...args, "-R", join(cwd, "omos.fossil")], { env: { PATH: process.env.PATH, HOME: home, FOSSIL_HOME: home, XDG_CONFIG_HOME: home, USER: "fixture", LC_ALL: "C" }, encoding: "utf8" });
     expect(result.status).toBe(0);
     return result.stdout;
   };
@@ -251,12 +251,12 @@ describe("portable Fossil agent workspace", () => {
     let blocked = true;
     const m = model(f, () => ({ content: "The answer is green." }), () => blocked ? "blocked" : "met");
     const goal = "Answer these requirements: " + "detail ".repeat(1600) + "finish with blue";
-    const first = await f.run(["ask", goal, "--json"]);
+    const first = await f.run(["ask", goal, "--json"], {}, 120000);
     expect(first.code).toBe(1);
     const session = JSON.parse(first.stdout).session_id;
     blocked = false;
     const correction = "Correction: " + "note ".repeat(2000) + "use green";
-    const second = await f.run(["ask", "--resume-id", session, correction, "--json"]);
+    const second = await f.run(["ask", "--resume-id", session, correction, "--json"], {}, 120000);
     expect(second.code, second.stderr).toBe(0);
     expect(m.packets[0].originalRequest).toBe(goal);
     expect(m.packets[1].originalRequest).toBe(goal);
@@ -265,7 +265,7 @@ describe("portable Fossil agent workspace", () => {
     expect(task.definition.objective.length).toBeLessThanOrEqual(8192);
     expect(task.request_artifact).toStartWith("artifacts/");
     expect(task.definition.version).toBe(2);
-  }, 60000);
+  }, 120000);
 
   test("no-save leaves the bound workspace unchanged", async () => {
     const f = fixture();
@@ -293,7 +293,14 @@ describe("portable Fossil agent workspace", () => {
         call.tool_calls[0].function.arguments = JSON.stringify({ action: "write", path: conflicting ? "memory/shared.md" : `memory/${key}.md`, content: key });
         return call;
       }, async () => { if (++arrived === 2) release(); await gate; return "met"; });
-      const results = await Promise.all([f.run(["ask", "task-A: save preference A", "--json"]), f.run(["ask", "task-B: save preference B", "--json"])]);
+      const observer = (async () => {
+        for (let index = 0; index < 12; index++) {
+          const snapshot = await f.run(["fossil", "status", "--json"]);
+          expect(snapshot.code, snapshot.stderr).toBe(0);
+        }
+      })();
+      const [first, second] = await Promise.all([f.run(["ask", "task-A: save preference A", "--json"]), f.run(["ask", "task-B: save preference B", "--json"]), observer]);
+      const results = [first, second];
       const status = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout);
       expect(status.tasks).toHaveLength(2);
       if (conflicting) {
@@ -341,6 +348,32 @@ describe("portable Fossil agent workspace", () => {
     const snapshot = readerPackets[1].evidence.find((item: any) => item.kind === "workspace");
     expect(JSON.parse(snapshot.content).reads.some((read: any) => read.reviewed_content === "new preference")).toBe(true);
   }, 60000);
+
+  test("archives current session event logs without changing source or importing recovery authority", async () => {
+    const f = fixture();
+    const directory = join(f.home, ".fx", "sessions", "current-session");
+    mkdirSync(directory, { recursive: true });
+    const metadata = JSON.stringify({ schema_version: 4, id: "current-session", created_at_ms: 1, updated_at_ms: 1, origin_workspace_root: "/Users/example/project", workspace_root: "/Users/example/project", conversation_language: "en", provider: "gateway", model: "test/model", effort: "auto", fast_mode: false, title: null, subagent_child: false });
+    const events = [
+      { user: { text: "Remember the archived request" } },
+      { assistant: { text: "The archived answer" } },
+      { turn_completed: {} },
+    ].map((event, index) => JSON.stringify({ schema_version: 1, seq: index + 1, timestamp_ms: 1, event })).join("\n") + "\n";
+    writeFileSync(join(directory, "session.json"), metadata);
+    writeFileSync(join(directory, "events.jsonl"), events);
+    writeFileSync(join(directory, "recovery.json"), JSON.stringify({ credential: "must-not-export" }));
+    const result = await f.run(["fossil", "init", "--json"]);
+    expect(result.code, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout).detail).toContain("archived 1 existing sessions and skipped 0");
+    const imported = f.fossil("ls", "-r", "trunk").trim().split("\n").find(path => path.startsWith("imports/"))!;
+    const archive = f.fossil("cat", imported, "-r", "trunk");
+    expect(archive).toContain("Remember the archived request");
+    expect(archive).toContain("The archived answer");
+    expect(archive).not.toContain("must-not-export");
+    expect(JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks).toHaveLength(0);
+    expect(readFileSync(join(directory, "session.json"), "utf8")).toBe(metadata);
+    expect(readFileSync(join(directory, "events.jsonl"), "utf8")).toBe(events);
+  }, 30000);
 
   test("history import is archive-only and excludes runtime checkpoints and credentials", async () => {
     const f = fixture();

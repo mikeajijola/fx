@@ -332,7 +332,6 @@ test "parse treats unknown and malformed command inputs as unknown" {
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/wat"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/output"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/output quiet"));
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/task"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/tasks"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/subagents"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "hello"));
@@ -350,6 +349,10 @@ test "parse tolerates trailing whitespace on exact-match commands" {
 }
 
 test "parse returns empty payload for bare prefix commands" {
+    switch (parse(testSlashRegistry(), "/task")) {
+        .task => |rest| try std.testing.expectEqualStrings("", rest),
+        else => return error.TestExpectedEqual,
+    }
     switch (parse(testSlashRegistry(), "/model")) {
         .model => |query| try std.testing.expectEqualStrings("", query),
         else => return error.TestExpectedEqual,
