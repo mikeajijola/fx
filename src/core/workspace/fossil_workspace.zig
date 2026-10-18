@@ -858,9 +858,9 @@ pub const Manager = struct {
         var paths: std.ArrayList([]const u8) = .empty;
         for (try self.inventory(revision_id)) |path| if (std.mem.startsWith(u8, path, prefix)) try paths.append(self.alloc, path);
         var records: std.ArrayList([]const u8) = .empty;
-        var start: usize = 0;
-        while (start < paths.items.len) : (start += 16) {
-            const batch = paths.items[start..@min(start + 16, paths.items.len)];
+        var record_start: usize = 0;
+        while (record_start < paths.items.len) : (record_start += 16) {
+            const batch = paths.items[record_start..@min(record_start + 16, paths.items.len)];
             if (self.historyBatch(batch, revision_id)) |values| {
                 try records.appendSlice(self.alloc, values);
             } else |err| {
@@ -889,7 +889,7 @@ pub const Manager = struct {
         try args.appendSlice(self.alloc, &.{ "-r", revision_id, "-R", self.repository });
         const bytes = try self.run(null, args.items);
         var records: std.ArrayList([]const u8) = .empty;
-        var start: usize = 0;
+        var record_start: usize = 0;
         var depth: usize = 0;
         var quoted = false;
         var escaped = false;
@@ -913,15 +913,15 @@ pub const Manager = struct {
                 if (depth == 0) return error.InvalidWorkspaceJournal;
                 depth -= 1;
                 if (depth == 0) {
-                    const record = bytes[start .. i + 1];
+                    const entry_bytes = bytes[record_start .. i + 1];
                     if (records.items.len >= paths.len) return error.InvalidWorkspaceJournal;
-                    try self.checkHistoryHash(paths[records.items.len], record);
-                    try records.append(self.alloc, record);
-                    start = i + 1;
+                    try self.checkHistoryHash(paths[records.items.len], entry_bytes);
+                    try records.append(self.alloc, entry_bytes);
+                    record_start = i + 1;
                 }
             }
         }
-        if (start != bytes.len or records.items.len != paths.len) return error.InvalidWorkspaceJournal;
+        if (record_start != bytes.len or records.items.len != paths.len) return error.InvalidWorkspaceJournal;
         return records.toOwnedSlice(self.alloc);
     }
 
