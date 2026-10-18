@@ -113,6 +113,7 @@ test {
 }
 
 pub const Context = struct {
+    fossil_workspace_available: bool = false,
     observer: ?*observation.Observer = null,
     workspace_root: []const u8,
     access_scope: ?workspace_access.AccessScope = null,
@@ -1166,6 +1167,8 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         ctx.web_search_runtime_ready and ctx.web_search_backend != null;
     return .{
         .allocator = arena,
+        .fossil_workspace_available = ctx.fossil_workspace_available,
+        .fossil_session_id = if (ctx.fossil_workspace_available) ctx.subagent_caller_id orelse ctx.lifecycle_scope.session_id else null,
         .observer = ctx.observer,
         .permission_mode = ctx.permission_mode,
         .workspace_root = ctx.workspace_root,

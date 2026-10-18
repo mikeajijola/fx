@@ -151,6 +151,7 @@ pub const RecoveryCheckpoint = struct {
     max_provider_attempts: usize,
     consumed_provider_attempts: usize,
     outstanding_reservation: bool = false,
+    workspace_binding_hash: ?[]u8 = null,
 
     /// Borrows the checkpoint's exact user and uncommitted response suffix.
     pub fn interruptedTurn(self: RecoveryCheckpoint) types.HistoryTurn {
@@ -167,6 +168,7 @@ pub const RecoveryCheckpoint = struct {
         alloc.free(self.assistant_source);
         session.freeExecutionMemory(alloc, self.execution);
         self.authority.deinit(alloc);
+        if (self.workspace_binding_hash) |value| alloc.free(value);
         self.* = undefined;
     }
 
@@ -177,8 +179,10 @@ pub const RecoveryCheckpoint = struct {
         errdefer alloc.free(assistant_source);
         const execution = try types.dupeExecutionMemory(alloc, self.execution);
         errdefer session.freeExecutionMemory(alloc, execution);
-        const authority = try self.authority.dupe(alloc);
+        var authority = try self.authority.dupe(alloc);
+        errdefer authority.deinit(alloc);
         return .{
+            .workspace_binding_hash = if (self.workspace_binding_hash) |value| try alloc.dupe(u8, value) else null,
             .version = self.version,
             .disposition = self.disposition,
             .turn_id = self.turn_id,
@@ -1098,6 +1102,10 @@ fn writeRecoveryCheckpointFrom(writer: *std.Io.Writer, checkpoint: RecoveryCheck
         checkpoint.version,
         checkpoint.turn_id,
     });
+    if (checkpoint.workspace_binding_hash) |value| {
+        try writer.writeAll(",\"workspace_binding_hash\":");
+        try writeJsonString(writer, value);
+    }
     if (delta == null) {
         try writer.writeAll(",\"user\":");
         try writeUserTurn(writer, checkpoint.user, {});
@@ -1345,7 +1353,21 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
     return state;
 }
 
-pub fn parseRecoveryCheckpoint(alloc: Allocator, value: std.json.Value) !RecoveryCheckpoint {
+pub fn parseRecoveryCheckpoint(alloc: Allocator, input_value: std.json.Value) !RecoveryCheckpoint {
+    var value = input_value;
+    var copy: ?std.json.ObjectMap = null;
+    defer if (copy) |*object| object.deinit(alloc);
+    var workspace_binding_hash: ?[]const u8 = null;
+    if (value == .object) {
+        if (value.object.get("workspace_binding_hash")) |binding| {
+            if (binding != .string or binding.string.len != 64) return error.InvalidDurableField;
+            for (binding.string) |ch| if (!std.ascii.isHex(ch)) return error.InvalidDurableField;
+            workspace_binding_hash = binding.string;
+            copy = try value.object.clone(alloc);
+            _ = copy.?.swapRemove("workspace_binding_hash");
+            value = .{ .object = copy.? };
+        }
+    }
     const raw_object = try requireObject(value);
     const version = try requireU64(raw_object, "version");
     const legacy_route = raw_object.contains("route_identity");
@@ -1411,8 +1433,11 @@ pub fn parseRecoveryCheckpoint(alloc: Allocator, value: std.json.Value) !Recover
         return error.InvalidDurableField;
     const consumed_provider_attempts = std.math.cast(usize, try requireU64(object, "consumed_provider_attempts")) orelse
         return error.InvalidDurableField;
+    const owned_workspace_binding = if (workspace_binding_hash) |binding| try alloc.dupe(u8, binding) else null;
+    errdefer if (owned_workspace_binding) |binding| alloc.free(binding);
     return .{
         .version = 2,
+        .workspace_binding_hash = owned_workspace_binding,
         .disposition = if (legacy_route) .history_only else .continuable,
         .turn_id = try requireU64(object, "turn_id"),
         .user = user,
@@ -5731,4 +5756,31 @@ test "ultrafast durable preference requires a bool when present" {
     } else |err| {
         try std.testing.expect(err == error.InvalidSessionFormat or err == error.InvalidDurableField);
     }
+}
+
+test "recovery checkpoint preserves native workspace binding and ownership" {
+    const alloc = std.testing.allocator;
+    const checkpoint: RecoveryCheckpoint = .{
+        .turn_id = 1,
+        .user = .{ .text = @constCast("Continue the task") },
+        .assistant_source = @constCast(""),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 1,
+        .workspace_binding_hash = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    };
+    const bytes = try encodeRecoveryCheckpoint(alloc, checkpoint);
+    defer alloc.free(bytes);
+    const value = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer value.deinit();
+    var restored = try parseRecoveryCheckpoint(alloc, value.value);
+    defer restored.deinit(alloc);
+    var copied = try restored.dupe(alloc);
+    defer copied.deinit(alloc);
+    try std.testing.expectEqualStrings(checkpoint.workspace_binding_hash.?, restored.workspace_binding_hash.?);
+    try std.testing.expect(copied.workspace_binding_hash.?.ptr != restored.workspace_binding_hash.?.ptr);
 }

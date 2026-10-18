@@ -175,6 +175,8 @@ Contract assessments use the existing cancellable host bridge, without adding a
 model-callable tool. `__libfx_contract_assess` is reserved. A core that does not
 advertise contract support is rejected before the first prompt.
 
+Hosts can pass an optional `workspaceBindingHash` to `createFxAgent()` or `createFxEngine()`. Checkpoints preserve it and reject restoration when the saved binding differs or the new host omits it. Bind the hash to the workspace identity, task, branch, base revision, contract version, and project root. The host owns those values. Existing clients can omit this option; the SDK does not start Fossil or load the CLI's personal workspace.
+
 ## Durability
 
 libfx stores a prompt before `turn.accepted` resolves, and stores each step of a turn while the turn runs. If the process running a turn dies, the next process that gets work for the session continues the turn from its last stored step. The model is told the turn was interrupted, so it can check what happened before going on.

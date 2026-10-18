@@ -2269,7 +2269,9 @@ export async function createFxEngine(options = {}) {
     toolSchemaHash: toolSchemaHash(hostTools.descriptors),
     model: options.model ?? "",
     contractHash: "",
+    workspaceBindingHash: options.workspaceBindingHash ?? "",
   };
+  if (typeof checkpointMeta.workspaceBindingHash !== "string" || encoder.encode(checkpointMeta.workspaceBindingHash).length > 1024) throw new TypeError("workspaceBindingHash must be a string of at most 1024 UTF-8 bytes");
   if (contract) {
     const canonical = JSON.stringify({
       id: contract.id, version: contract.version, objective: contract.objective,
@@ -2533,6 +2535,7 @@ export async function createFxEngine(options = {}) {
   // model still restores; the host hears what changed.
   const compareCheckpointMeta = (saved) => {
     if (!saved || typeof saved !== "object") return;
+    if (saved.workspaceBindingHash && saved.workspaceBindingHash !== checkpointMeta.workspaceBindingHash) throw new Error("Checkpoint requires the same workspace and task binding");
     if (saved.contractHash && saved.contractHash !== checkpointMeta.contractHash) throw new Error("Checkpoint requires the same work contract");
     const changed = Object.keys(checkpointMeta).filter((key) => typeof saved[key] === "string" && saved[key] !== "" && saved[key] !== checkpointMeta[key]);
     if (changed.length) emit("checkpoint.mismatch", { sessionId, changed, saved, current: checkpointMeta });

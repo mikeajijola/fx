@@ -2087,7 +2087,12 @@ const App = struct {
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
             .subagent_available = self.session_persistence.subagent_host != null,
+            .fossil_workspace_available = self.fossilWorkspaceAvailable(),
         });
+    }
+
+    pub fn fossilWorkspaceAvailable(_: *App) bool {
+        return @import("core/agent/runtime/completion_review.zig").enabled();
     }
 
     pub fn subagentToolContextForAdmission(
@@ -3806,7 +3811,8 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
             std.mem.eql(u8, effective_args[1], "approve") or
             std.mem.eql(u8, effective_args[1], "reject");
     }
-    return std.mem.eql(u8, command, "slack") or
+    return std.mem.eql(u8, command, "fossil") or
+        std.mem.eql(u8, command, "slack") or
         std.mem.eql(u8, command, "login") or
         std.mem.eql(u8, command, "logout") or
         std.mem.eql(u8, command, "teams") or
@@ -3894,6 +3900,7 @@ test "early threaded io is resolved after global launch args" {
 }
 
 test "full entry config commands also use early threaded io" {
+    try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "fossil")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "ask")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "acp")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "pr")}));

@@ -73,6 +73,19 @@ try { assert.equal((await consume(agent, 'Check the saved result')).stopReason, 
 finally { await agent.close(); }
 assert.equal(f.counts().effects, 1, 'restoration must not replay the saved action');
 
+// A host may bind checkpoints to a workspace and task without starting Fossil.
+const bound = fixture(undefined, { workspaceBindingHash: 'workspace-a/task-a' });
+let boundCheckpoint;
+agent = await createFxEngine(bound.options);
+try { await consume(agent); boundCheckpoint = await agent.checkpoint(); }
+finally { await agent.close(); }
+for (const workspaceBindingHash of [undefined, 'workspace-a/task-b']) {
+  await assert.rejects(createFxEngine({ ...bound.options, workspaceBindingHash, checkpoint: boundCheckpoint }), /same workspace and task binding/);
+}
+agent = await createFxEngine({ ...bound.options, checkpoint: boundCheckpoint });
+try { assert.equal((await consume(agent)).stopReason, 'end_turn'); }
+finally { await agent.close(); }
+
 const blocked = fixture(() => report('blocked'));
 agent = await createFxEngine(blocked.options);
 try {

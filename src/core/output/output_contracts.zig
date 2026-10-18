@@ -3800,3 +3800,14 @@ pub const SlackSnapshot = struct {
         return out.toOwnedSlice();
     }
 };
+
+/// Text and JSON project the same verified workspace snapshot.
+pub fn renderFossilWorkspace(alloc: std.mem.Allocator, snapshot: @import("../workspace/fossil_workspace.zig").Snapshot, format: OutputFormat) ![]u8 {
+    if (format == .json) return std.json.Stringify.valueAlloc(alloc, snapshot, .{});
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.print("Fossil workspace: {s}\nWorkspace: {s}\nTrunk: {s}\nPublication: {s}\nPending evidence: {d}\n", .{ snapshot.repository, snapshot.workspace_id, snapshot.trunk_revision, snapshot.publication, snapshot.pending_journals });
+    for (snapshot.tasks) |task| try out.writer.print("{s}  {s}  {s}\n", .{ task.id, @tagName(task.state), task.branch });
+    if (snapshot.detail.len > 0) try out.writer.print("{s}\n", .{snapshot.detail});
+    return out.toOwnedSlice();
+}

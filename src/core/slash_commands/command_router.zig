@@ -40,6 +40,7 @@ pub const ParsedCommand = union(enum) {
     notifications: []const u8,
     workspace: []const u8,
     shell: []const u8,
+    task: []const u8,
     version,
     unknown,
 };
@@ -80,6 +81,7 @@ pub const CommandHandlers = struct {
     rename_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_notifications: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_workspace: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    handle_task: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void = unavailableTask,
     handle_shell: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_version: *const fn (ctx: *anyopaque) anyerror!void,
     unknown: *const fn (ctx: *anyopaque, cmd: []const u8) anyerror!void,
@@ -124,6 +126,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .ultrafast => .{ .ultrafast = payload },
         .statusline => .{ .statusline = payload },
         .notifications => .{ .notifications = payload },
+        .task => .{ .task = payload },
         .workspace => .{ .workspace = payload },
         .shell => .{ .shell = payload },
         .version => .version,
@@ -178,6 +181,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .ultrafast => |rest| try handlers.handle_ultrafast(handlers.ctx, rest),
         .statusline => |rest| try handlers.handle_statusline(handlers.ctx, rest),
         .notifications => |rest| try handlers.handle_notifications(handlers.ctx, rest),
+        .task => |rest| try handlers.handle_task(handlers.ctx, rest),
         .workspace => |rest| try handlers.handle_workspace(handlers.ctx, rest),
         .shell => |rest| try handlers.handle_shell(handlers.ctx, rest),
         .version => try handlers.show_version(handlers.ctx),
@@ -328,7 +332,6 @@ test "parse treats unknown and malformed command inputs as unknown" {
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/wat"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/output"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/output quiet"));
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/task"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/tasks"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/subagents"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "hello"));
@@ -346,6 +349,10 @@ test "parse tolerates trailing whitespace on exact-match commands" {
 }
 
 test "parse returns empty payload for bare prefix commands" {
+    switch (parse(testSlashRegistry(), "/task")) {
+        .task => |rest| try std.testing.expectEqualStrings("", rest),
+        else => return error.TestExpectedEqual,
+    }
     switch (parse(testSlashRegistry(), "/model")) {
         .model => |query| try std.testing.expectEqualStrings("", query),
         else => return error.TestExpectedEqual,
@@ -611,4 +618,8 @@ test "route propagates callback errors" {
     handlers.show_status = failStatus;
 
     try std.testing.expectError(error.TestRouteFailure, route(testSlashRegistry(), &handlers, "/status"));
+}
+
+fn unavailableTask(_: *anyopaque, _: []const u8) !void {
+    return error.TaskCommandUnavailable;
 }

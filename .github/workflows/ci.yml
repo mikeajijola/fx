@@ -247,6 +247,7 @@ jobs:
       - name: Test libfx Wasm integrations
         run: |
           node --experimental-wasm-jspi sdk/tests/test-host-tools.mjs wasm
+          node --experimental-wasm-jspi sdk/tests/test-agent-contract.mjs wasm
           node --experimental-wasm-jspi sdk/tests/test-hooks.mjs wasm
           env LIBFX_TEST_HOOKS=1 node --experimental-wasm-jspi sdk/tests/test-agent-steering.mjs wasm
           node --experimental-wasm-jspi sdk/tests/test-host-tool-cancel.mjs wasm
@@ -293,6 +294,7 @@ jobs:
         run: |
           node sdk/tests/test-minimal-api.mjs
           node sdk/tests/test-host-tools.mjs native
+          node sdk/tests/test-agent-contract.mjs native
           node sdk/tests/test-hooks.mjs native
           env LIBFX_TEST_HOOKS=1 node sdk/tests/test-agent-steering.mjs native
           node sdk/tests/test-host-tool-cancel.mjs native
@@ -433,6 +435,7 @@ jobs:
             public.ecr.aws/lambda/nodejs@sha256:2472f0273d8848d8b2aa6528f5526b8a514b70703596199efe5a4b84d3d59b0b -euc '
               node sdk/tests/test-native-core-ready.mjs
               node sdk/tests/test-host-tools.mjs native
+          node sdk/tests/test-agent-contract.mjs native
               node sdk/tests/test-host-tool-cancel.mjs native
             '
 
@@ -564,6 +567,7 @@ jobs:
           missing=()
           command -v tmux >/dev/null 2>&1 || missing+=(tmux)
           command -v zsh >/dev/null 2>&1 || missing+=(zsh)
+          command -v fossil >/dev/null 2>&1 || missing+=(fossil)
           if [ "${#missing[@]}" -gt 0 ]; then
             retry() {
               local attempt
@@ -597,6 +601,7 @@ jobs:
           fi
           printf 'set-option -g history-limit 100000\n' > "$HOME/.tmux.conf"
           tmux -V
+          fossil version
           zsh --version
 
       - name: Install E2E dependencies

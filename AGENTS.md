@@ -26,6 +26,16 @@ When running fx for verification, **always use the freshly-built binary at** **`
 
 * In any shell invocation — tmux, direct run, scripts — reference fx as `/Users/<you>/path/to/repo/zig-out/bin/fx` (absolute) or `./zig-out/bin/fx` (when cwd is the repo root). Bare `fx` is always wrong for dev verification.
 
+## omos agent workspace
+
+This fork uses Fossil for agent state and Git for project source. `omos.fossil` is personal state and must remain ignored by Git. Do not add credentials, provider key files, opaque recovery checkpoints, or checkout caches to Fossil.
+
+Native interactive and `ask` turns started with `omos` or `omo` use the absolute workspace binding in `~/.fx/omos-workspace.json`. Initialize it with `omos fossil init`. Each saved task has a persistent contract, its own Fossil branch and checkout, and host-recorded evidence. Paused or blocked work continues on that branch. `/task new [goal]` pauses the previous task; `/task resume <id>` selects retained work. Child tasks branch from their parent's revision and publish to the parent.
+
+Use `fossil_workspace` for memory, skills, artifacts, and workspace inspection. The host creates branches, checkpoints evidence, verifies contracts, and publishes the exact reviewed revision. Do not ask the model to declare its own contract fulfilled or run manual merges to bypass publication. Completion requires a verified Fossil receipt. Preserve conflicted and pending branches; `omos fossil recover` retries durable publication without repeating model actions. `--no-save` turns have read-only workspace access.
+
+These runtime checks apply to turns hosted by omos. External coding agents should follow this guidance, but this file cannot enforce their behavior. Changes to this subsystem belong in `src/core/workspace/`; model tool schemas remain in `src/builtins/tools.zig`.
+
 ## Language and Toolchain
 
 This project is written in **Zig 0.17+**. There is no Node.js runtime, no `package.json` at the root, and no JavaScript build step for the main binary.

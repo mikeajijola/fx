@@ -219,6 +219,7 @@ pub fn Runtime(comptime App: type) type {
             else
                 provider_set.Bundle.Capabilities{};
             var ctx: tool_runtime.Context = .{
+                .fossil_workspace_available = if (comptime @hasDecl(App, "fossilWorkspaceAvailable")) app.fossilWorkspaceAvailable() else false,
                 .workspace_root = workspace.root,
                 .access_scope = workspace.access_scope,
                 .ignored_list_entries = ignored_list_entries,
@@ -1281,6 +1282,9 @@ pub fn Runtime(comptime App: type) type {
                 .cancel_flag = &app.worker.worker_cancel_requested,
                 .review_enabled = false,
                 .contract_review_enabled = completion_review.enabled(),
+                .fossil_session_id = if (completion_review.enabled()) app_session_runtime.Runtime(App).activeSessionId(app) else null,
+                .fossil_ephemeral = completion_review.enabled() and app.session_persistence.writable == null,
+
                 .contract_review_model = if (comptime @hasField(App, "review_model") and @hasDecl(App, "providerSet"))
                     completion_review.selectModel(app.review_model, job.provider, app.providerSet().definitions, job.model)
                 else

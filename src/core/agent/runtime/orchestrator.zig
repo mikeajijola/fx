@@ -1,4 +1,5 @@
 const work_contract = @import("work_contract.zig");
+const managed_task = @import("../../workspace/managed_task.zig");
 const completion_review = @import("completion_review.zig");
 const std = @import("std");
 const testing_allocator = @import("../../shared/testing_allocator.zig");
@@ -4000,6 +4001,7 @@ fn persistRecoveryCheckpoint(
     const effect = deps.recovery_checkpoint orelse return;
     try effect.set(deps.ctx, .{
         .turn_id = job.turn_id,
+        .workspace_binding_hash = if (job.workspace_binding_hash) |value| @constCast(value) else null,
         .user = user,
         .assistant_source = @constCast(assistant_source),
         .execution = projected,
@@ -5595,6 +5597,16 @@ fn processQueuedPromptInner(
     defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
     var job = borrowed_job;
+    if (job.recovery_checkpoint) |checkpoint| {
+        if (checkpoint.workspace_binding_hash) |saved| {
+            if (comptime builtin.target.cpu.arch.isWasm()) return error.WorkspaceBindingMismatch;
+            const session = config.fossil_session_id orelse return error.WorkspaceBindingMismatch;
+            const manager = (try @import("../../workspace/fossil_workspace.zig").Manager.bound(arena)) orelse return error.WorkspaceBindingMismatch;
+            const task = (try manager.active(session)) orelse return error.WorkspaceBindingMismatch;
+            if (!std.mem.eql(u8, config.workspace_root, task.project_root)) return error.WorkspaceBindingMismatch;
+            if (!std.mem.eql(u8, saved, try manager.bindingHash(task))) return error.WorkspaceBindingMismatch;
+        }
+    }
     job.account_id = if (borrowed_job.account_id) |account_id|
         try arena.dupe(u8, account_id)
     else
@@ -6824,6 +6836,7 @@ const ContractCandidate = struct {
     root_user_context: []const u8,
     turn_id: u64,
     step: usize,
+    managed: ?*managed_task.Turn = null,
 };
 
 fn assessCompletionContract(
@@ -6839,7 +6852,12 @@ fn assessCompletionContract(
     var delivery: agent_stream_provider.DeliveryCertainty = .init();
     var evidence: agent_stream_provider.AttemptEvidence = .{};
     var event_context: u8 = 0;
+    const prior_evidence = if (input.managed) |turn| try turn.beforeReview(arena, input.messages) else &.{};
     const result = completion_review.assess(arena, deps.agent_stream_provider, .{
+        .definition = if (input.managed) |turn| turn.task.definition else null,
+        .original_request = if (input.managed) |turn| try turn.manager.originalRequest(turn.task) else null,
+        .prior_evidence = prior_evidence,
+        .amendments = if (input.managed) |turn| turn.task.amendments else &.{},
         .prompt = input.job.prompt,
         .root_user_context = input.root_user_context,
         .candidate = input.candidate,
@@ -6869,6 +6887,10 @@ fn assessCompletionContract(
     summary.prepareTokenRequest();
     _ = summary.reconcileTokenRequest(result.usage, false);
     debug_trace.eventf("agent", "contract_assessment", .{ .turn_id = input.turn_id }, "disposition={s} step={d}", .{ @tagName(result.decision.disposition), input.step });
+    if (input.managed) |turn| {
+        turn.assessment = result.assessment;
+        if (result.decision.disposition == .blocked) turn.task = try turn.manager.setState(turn.task.id, .blocked);
+    }
     return result.decision;
 }
 
@@ -6879,7 +6901,7 @@ fn processQueuedPromptLoop(
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
     lifecycle: LifecycleContext,
     config: Config,
-    job: QueuedPrompt,
+    borrowed_job: QueuedPrompt,
     skills: PreparedSkills,
     initial_request_capabilities: model_capabilities.Capabilities,
     base_nested_terminal_advertised: bool,
@@ -6901,6 +6923,7 @@ fn processQueuedPromptLoop(
     stop_state: *CommonStopState,
     agent: *runtime_agent.Agent,
 ) !void {
+    var job = borrowed_job;
     var request_capabilities = initial_request_capabilities;
     var tool_image_capabilities_resolved = false;
     var stable_prefix = stable_prefix_ptr.*;
@@ -6965,7 +6988,27 @@ fn processQueuedPromptLoop(
                 job.history,
             ),
     };
-    const contract_enabled = deps.assess_contract != null or (config.contract_review_enabled and config.origin == .root);
+    var managed: ?managed_task.Turn = if (comptime builtin.target.cpu.arch.isWasm()) null else if (config.fossil_session_id != null and !config.fossil_ephemeral)
+        try managed_task.Turn.begin(arena, config.fossil_session_id.?, config.fossil_parent_session_id, config.workspace_root, job.prompt)
+    else
+        null;
+    defer if (managed) |*turn| turn.retain() catch |err| {
+        deps.push_system_notice(deps.ctx, @errorName(err)) catch {};
+    };
+    if (managed) |turn| {
+        if (turn.recovered_candidate) |candidate| {
+            try deps.push_system_notice(deps.ctx, "Recovered verified Fossil publication; no agent actions were replayed.");
+            try deps.push_text(deps.ctx, .assistant_started);
+            try deps.push_text(deps.ctx, .{ .assistant_source = candidate });
+            try deps.push_text(deps.ctx, .{ .assistant_rendered = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, candidate) });
+            try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+            try finishCommonAssistantTerminal(deps, finalization, arena, job, within_turn_suffix.items, summary_accumulator_ptr, .{ .history = candidate }, .completed, null, finish_trace_ptr, "assistant", .{ .role = .assistant, .content = candidate });
+            try turn.manager.acknowledge(turn.task);
+            return;
+        }
+    }
+    if (managed) |turn| job.workspace_binding_hash = try turn.manager.bindingHash(turn.task);
+    const contract_enabled = deps.assess_contract != null or (config.contract_review_enabled and (config.origin == .root or managed != null));
     var active_api_key: []const u8 = job.api_key;
     var owned_refreshed_api_key: ?[]u8 = null;
     defer if (owned_refreshed_api_key) |key| secret.zeroAndFree(std.heap.c_allocator, key);
@@ -7131,6 +7174,17 @@ fn processQueuedPromptLoop(
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
         if (skills.explicit) |section| {
             if (section.text.len > 0) try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = section.text });
+        }
+        if (managed) |*turn| {
+            try turn.progress(arena, within_turn_suffix.items);
+            job.workspace_binding_hash = try turn.manager.bindingHash(turn.task);
+            try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = try turn.manager.context(turn.task) });
+        } else if (config.fossil_ephemeral) {
+            if (comptime !builtin.target.cpu.arch.isWasm()) {
+                if (try @import("../../workspace/fossil_workspace.zig").Manager.bound(arena)) |workspace| {
+                    try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = try arena.print("Fossil workspace {s} is read-only for this --no-save turn. No task or history is written.", .{workspace.manifest.id}) });
+                }
+            }
         }
         try deps.append_runtime_context(deps.ctx, overlay_arena, &ephemeral_overlay);
         var parent_turn_delivery = try appendPreparedParentTurnContext(
@@ -9564,6 +9618,7 @@ fn processQueuedPromptLoop(
                         .config = config,
                         .job = job,
                         .candidate = history_text,
+                        .managed = if (managed) |*turn| turn else null,
                         .messages = within_turn_suffix.items,
                         .api_key = active_api_key,
                         .model = successful_gateway_model,
@@ -9594,6 +9649,21 @@ fn processQueuedPromptLoop(
             }
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
+                if (managed) |*turn| {
+                    if (disposition == .completed) turn.publish(history_text) catch |err| {
+                        if (err == error.WorkspaceReadDependencyChanged or err == error.WorkspaceRevisionChanged or err == error.ParentContractChanged) {
+                            turn.task = try turn.manager.refresh(turn.task);
+                            try within_turn_suffix.append(arena, .{ .role = .assistant, .content = history_text });
+                            try within_turn_suffix.append(arena, .{ .role = .user, .content = "Workspace dependencies changed during verification. The host refreshed the branch. Inspect the new memory and evidence and reassess the task; do not repeat completed external actions." });
+                            continue;
+                        }
+                        const notice = try arena.print("Work passed assessment but Fossil publication is pending: {s}. Continue to retry publication without repeating actions.", .{@errorName(err)});
+                        try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, notice, "workspace_publication_pending");
+                        return;
+                    };
+                    if (config.cancel_flag.load(.seq_cst)) return error.Cancelled;
+                }
+
                 if (!has_content) {
                     try deps.push_text(deps.ctx, .{ .operational = rendered });
                 }
@@ -9623,6 +9693,7 @@ fn processQueuedPromptLoop(
                     "assistant",
                     .{ .role = .assistant, .content = history_text, .provider_replay = history_replay },
                 );
+                if (managed) |turn| try turn.manager.acknowledge(turn.task);
                 return;
             }
 
@@ -10074,6 +10145,12 @@ fn processQueuedPromptLoop(
             else
                 provider_replay,
         );
+        if (managed) |*turn| {
+            const Intent = struct { id: []const u8, name: []const u8, arguments: []const u8 };
+            const intents = try arena.alloc(Intent, effective_tool_calls.len);
+            for (effective_tool_calls, intents) |call, *intent| intent.* = .{ .id = call.id, .name = call.name, .arguments = call.arguments_json };
+            try turn.manager.record(turn.task, "action_intent", .{ .calls = intents });
+        }
         try appendRunningToolCalls(deps, finalization, job, within_turn_suffix.items, effective_tool_calls);
 
         const step_has_content = !terminal_provider_completion and completion.content != null and completion.content.?.len > 0;
@@ -12409,6 +12486,7 @@ fn processQueuedPromptLoop(
                     .config = config,
                     .job = job,
                     .candidate = raw_final,
+                    .managed = if (managed) |*turn| turn else null,
                     .messages = within_turn_suffix.items,
                     .api_key = active_api_key,
                     .model = successful_gateway_model,
@@ -12436,6 +12514,21 @@ fn processQueuedPromptLoop(
             }
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
+                if (managed) |*turn| {
+                    turn.publish(raw_final) catch |err| {
+                        if (err == error.WorkspaceReadDependencyChanged or err == error.WorkspaceRevisionChanged or err == error.ParentContractChanged) {
+                            turn.task = try turn.manager.refresh(turn.task);
+                            try within_turn_suffix.append(arena, .{ .role = .assistant, .content = raw_final });
+                            try within_turn_suffix.append(arena, .{ .role = .user, .content = "Workspace dependencies changed during verification. The host refreshed the branch. Inspect the new memory and evidence and reassess the task; do not repeat completed external actions." });
+                            continue;
+                        }
+                        const notice = try arena.print("Work passed assessment but Fossil publication is pending: {s}. Continue to retry publication without repeating actions.", .{@errorName(err)});
+                        try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, notice, "workspace_publication_pending");
+                        return;
+                    };
+                    if (config.cancel_flag.load(.seq_cst)) return error.Cancelled;
+                }
+
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
 
                 const history_text = try arena.dupe(u8, raw_final);
@@ -12460,6 +12553,7 @@ fn processQueuedPromptLoop(
                     "assistant",
                     .{ .role = .assistant, .content = partial_assistant, .provider_replay = final_provider_replay },
                 );
+                if (managed) |turn| try turn.manager.acknowledge(turn.task);
                 return;
             }
 

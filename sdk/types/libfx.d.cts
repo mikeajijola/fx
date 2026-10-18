@@ -277,6 +277,7 @@ export interface FxCheckpointMeta {
   libfxVersion: string;
   toolSchemaHash: string;
   contractHash?: string;
+  workspaceBindingHash?: string;
   model: string;
 }
 
@@ -450,6 +451,8 @@ export interface FxWorkContract extends FxWorkContractDefinition {
 
 /** Options `createFxAgent()` and `createFxEngine()` share. */
 export interface FxSharedOptions<Event> {
+  /** Optional host-owned workspace/task binding. Restore rejects a different binding. No Fossil process is started by the SDK. */
+  workspaceBindingHash?: string;
   /** Zig continues normal model stops until the host establishes fulfilment or a blocker. */
   contract?: FxWorkContract;
   /** Host-owned instrumentation of native and Wasm execution. Disabled by default. */

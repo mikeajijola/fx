@@ -280,6 +280,7 @@ fn runAskChild(
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
             .subagent_available = true,
+            .fossil_workspace_available = completion_review.enabled(),
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(ctx.alloc);
@@ -1157,6 +1158,7 @@ const AskContext = struct {
             });
         }
         var tc: tool_runtime.Context = .{
+            .fossil_workspace_available = completion_review.enabled(),
             .workspace_root = self.workspace_root,
             .access_scope = self.workspace_access.scope(self.workspace_root),
             .ignored_list_entries = self.cfg.ignored_list_entries,
@@ -2004,6 +2006,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .permission_mode = ctx.permission_mode,
         .permission_rules = ctx.permission_rules,
         .subagent_available = ctx.subagent_host != null,
+        .fossil_workspace_available = completion_review.enabled(),
     }, session_child_capability != null);
     defer tool_projection.deinit(alloc);
 
@@ -2072,6 +2075,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .auto_compact_percent = startup.auto_compact_percent,
         .cancel_flag = ctx.cancelFlag(),
         .contract_review_enabled = completion_review.enabled(),
+        .fossil_session_id = if (completion_review.enabled()) ctx.activeSessionId() else null,
+        .fossil_ephemeral = completion_review.enabled() and ctx.writable == null,
+
         .contract_review_model = completion_review.selectModel(ctx.reviewer_model, ctx.provider, cfg.provider_set.definitions, ctx.model),
         .fast_mode = ctx.fast_mode,
         .ultrafast_mode = ctx.ultrafast_mode,

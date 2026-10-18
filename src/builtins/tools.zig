@@ -23,6 +23,7 @@ const glob_files_impl = @import("../tools/filesystem/glob_files.zig");
 const grep_files_impl = @import("../tools/filesystem/grep_files.zig");
 const read_file_impl = @import("../tools/filesystem/read_file.zig");
 const write_file_impl = @import("../tools/filesystem/write_file.zig");
+const fossil_workspace_impl = @import("../tools/session/fossil_workspace.zig");
 const read_tool_result_impl = @import("../tools/session/read_tool_result.zig");
 const shell_impl = @import("../tools/shell/shell.zig");
 const install_skill_impl = @import("../tools/skills/install_skill.zig");
@@ -840,7 +841,35 @@ pub const read_tool_result = ToolSpec{
     .irreversible_fn = read_tool_result_impl.isIrreversible,
 };
 
+pub const fossil_workspace = ToolSpec{
+    .name = "fossil_workspace",
+    .description = "Inspect task state, read/write memory or skills, attach a content-addressed artifact, or inspect history/diff. Branch and merge operations are host-only.",
+    .model_schema = .{
+        .name = "fossil_workspace",
+        .description = "Inspect task state, read/write memory or skills, attach a content-addressed artifact, or inspect history/diff. Branch and merge operations are host-only.",
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "status", "read", "write", "artifact", "diff", "history" } } },
+                .{ .name = "path", .json_type = .string },
+                .{ .name = "content", .json_type = .string },
+            },
+            .required = &.{"action"},
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .fossil_workspace,
+    .activity_kind = .read,
+    .requires_approval = true,
+    .action_label = "Accessing workspace",
+    .completed_action_label = "Accessed workspace",
+    .decode = fossil_workspace_impl.decode,
+    .call = fossil_workspace_impl.call,
+    .reads_only_fn = fossil_workspace_impl.readsOnly,
+    .irreversible_fn = fossil_workspace_impl.irreversible,
+};
+
 pub const all = [_]tool_dispatch.Tool{
+    fossil_workspace,
     glob_files,
     grep_files,
     read_file,
@@ -948,7 +977,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "ca8b5aa265c6318fbd0604879fb2626826d9fcb83fa5d335dc0371fec7286b3f",
+        "7887bb8b1784dcf41ac1fb2325a6b4a47a50589fed98a584dc055449372bc19a",
         &actual_hex,
     );
 }
@@ -987,6 +1016,7 @@ fn nameInSet(names: []const []const u8, wanted: []const u8) bool {
 
 test "built-in tools register exact active local order" {
     const expected_names = [_][]const u8{
+        "fossil_workspace",
         "glob_files",
         "grep_files",
         "read_file",

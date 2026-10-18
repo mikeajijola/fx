@@ -2224,7 +2224,12 @@ async function waitForSavedText(dir: string, needle: string, timeoutMs = TIMEOUT
     const files = existsSync(dir) ? (readdirSync(dir, { recursive: true }) as string[]) : [];
     for (const name of files) {
       const path = join(dir, name);
-      if (statSync(path).isFile() && readFileSync(path, "utf8").includes(needle)) return;
+      try {
+        if (statSync(path).isFile() && readFileSync(path, "utf8").includes(needle)) return;
+      } catch (error) {
+        // Atomic blob writes can rename a temporary after the directory scan.
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
     }
     await Bun.sleep(50);
   }
