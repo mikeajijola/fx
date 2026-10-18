@@ -253,6 +253,7 @@ pub const RunCommandBackend = struct {
 /// Context shared by core tool dispatch, validation, and execution.
 pub const DispatchContext = struct {
     allocator: Allocator,
+    fossil_session_id: ?[]const u8 = null,
     permission_mode: permission_gate.PermissionMode = .ask,
     permission_decider: ?PermissionDecider = null,
     execution_authority: ?command_admission.ToolExecutionAuthority = null,
@@ -406,6 +407,7 @@ pub const ExecutorKind = enum {
     grep_files,
     read_file,
     read_tool_result,
+    fossil_workspace,
     write_file,
     edit_file,
     web_fetch,

@@ -34,16 +34,18 @@ pub const Meta = struct {
     libfx_version: []const u8 = "",
     tool_schema_hash: []const u8 = "",
     contract_hash: []const u8 = "",
+    workspace_binding_hash: []const u8 = "",
     model: []const u8 = "",
 
     pub fn isEmpty(self: Meta) bool {
-        return self.libfx_version.len == 0 and self.tool_schema_hash.len == 0 and self.contract_hash.len == 0 and self.model.len == 0;
+        return self.libfx_version.len == 0 and self.tool_schema_hash.len == 0 and self.contract_hash.len == 0 and self.workspace_binding_hash.len == 0 and self.model.len == 0;
     }
 
     pub fn fits(self: Meta) bool {
         return self.libfx_version.len <= max_meta_field_bytes and
             self.tool_schema_hash.len <= max_meta_field_bytes and
             self.contract_hash.len <= max_meta_field_bytes and
+            self.workspace_binding_hash.len <= max_meta_field_bytes and
             self.model.len <= max_meta_field_bytes;
     }
 
@@ -55,7 +57,9 @@ pub const Meta = struct {
         errdefer alloc.free(tool_schema_hash);
         const contract_hash = try alloc.dupe(u8, self.contract_hash);
         errdefer alloc.free(contract_hash);
-        return .{ .libfx_version = libfx_version, .tool_schema_hash = tool_schema_hash, .contract_hash = contract_hash, .model = try alloc.dupe(u8, self.model) };
+        const workspace_binding_hash = try alloc.dupe(u8, self.workspace_binding_hash);
+        errdefer alloc.free(workspace_binding_hash);
+        return .{ .workspace_binding_hash = workspace_binding_hash, .libfx_version = libfx_version, .tool_schema_hash = tool_schema_hash, .contract_hash = contract_hash, .model = try alloc.dupe(u8, self.model) };
     }
 
     /// Frees a `Meta` that `dupe` or `decode` returned.
@@ -63,6 +67,7 @@ pub const Meta = struct {
         alloc.free(self.libfx_version);
         alloc.free(self.tool_schema_hash);
         alloc.free(self.contract_hash);
+        alloc.free(self.workspace_binding_hash);
         alloc.free(self.model);
     }
 
@@ -74,6 +79,10 @@ pub const Meta = struct {
         try std.json.Stringify.value(self.tool_schema_hash, .{}, writer);
         try writer.writeAll(",\"contractHash\":");
         try std.json.Stringify.value(self.contract_hash, .{}, writer);
+        if (self.workspace_binding_hash.len > 0) {
+            try writer.writeAll(",\"workspaceBindingHash\":");
+            try std.json.Stringify.value(self.workspace_binding_hash, .{}, writer);
+        }
         try writer.writeAll(",\"model\":");
         try std.json.Stringify.value(self.model, .{}, writer);
         try writer.writeByte('}');
@@ -276,7 +285,7 @@ fn decodeMeta(alloc: Allocator, value: ?std.json.Value) Error!Meta {
 pub fn metaFromJson(value: std.json.Value) error{InvalidMeta}!Meta {
     if (value != .object) return error.InvalidMeta;
     var meta: Meta = .{};
-    inline for (.{ .{ "libfxVersion", "libfx_version" }, .{ "toolSchemaHash", "tool_schema_hash" }, .{ "model", "model" }, .{ "contractHash", "contract_hash" } }) |field| {
+    inline for (.{ .{ "libfxVersion", "libfx_version" }, .{ "toolSchemaHash", "tool_schema_hash" }, .{ "model", "model" }, .{ "contractHash", "contract_hash" }, .{ "workspaceBindingHash", "workspace_binding_hash" } }) |field| {
         if (value.object.get(field[0])) |text| {
             if (text != .string) return error.InvalidMeta;
             @field(meta, field[1]) = text.string;
@@ -308,7 +317,7 @@ test "kernel checkpoint carries the saving agent's libfx, tools and model" {
         .user = .{ .text = @constCast("hello") },
         .assistant = @constCast("world"),
     } }};
-    const meta: Meta = .{ .libfx_version = "2", .tool_schema_hash = "1a2b3c4d", .model = "provider/model", .contract_hash = "contract-digest" };
+    const meta: Meta = .{ .libfx_version = "2", .tool_schema_hash = "1a2b3c4d", .model = "provider/model", .contract_hash = "contract-digest", .workspace_binding_hash = "workspace-task-binding" };
     const bytes = try encode(alloc, &history, .{}, meta);
     defer alloc.free(bytes);
     var decoded = try decode(alloc, bytes);
@@ -317,6 +326,7 @@ test "kernel checkpoint carries the saving agent's libfx, tools and model" {
     try std.testing.expectEqualStrings("1a2b3c4d", decoded.meta.tool_schema_hash);
     try std.testing.expectEqualStrings("provider/model", decoded.meta.model);
     try std.testing.expectEqualStrings("contract-digest", decoded.meta.contract_hash);
+    try std.testing.expectEqualStrings("workspace-task-binding", decoded.meta.workspace_binding_hash);
     try std.testing.expectEqualStrings("world", decoded.history[0].assistant.assistant);
 
     // A checkpoint saved without it, as older ones were, decodes with none.

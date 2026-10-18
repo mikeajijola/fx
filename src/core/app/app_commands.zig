@@ -1,3 +1,4 @@
+const session_codec = @import("../session/session_codec.zig");
 const std = @import("std");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
@@ -404,6 +405,7 @@ pub fn Handlers(comptime App: type) type {
                 .handle_statusline = commandHandleStatusline,
                 .rename_session = commandRenameSession,
                 .handle_notifications = commandHandleNotifications,
+                .handle_task = commandHandleTask,
                 .handle_workspace = commandHandleWorkspace,
                 .handle_shell = commandHandleShell,
                 .show_version = commandShowVersion,
@@ -1986,6 +1988,38 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleShell(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try handleShellCommand(app, rest);
+        }
+
+        fn commandHandleTask(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @import("builtin").target.cpu.arch.isWasm() or !@hasField(App, "session_persistence")) return error.TaskCommandUnavailable;
+            if (!app.worker.tryHoldTurnStart()) return error.AgentBusy;
+            defer app.worker.releaseTurnStartHold();
+            const session = app_session_runtime.Runtime(App).activeSessionId(app) orelse return error.SavedSessionRequired;
+            var arena = std.heap.ArenaAllocator.init(app.alloc);
+            defer arena.deinit();
+            const manager = (try @import("../workspace/fossil_workspace.zig").Manager.bound(arena.allocator())) orelse return error.NoFossilWorkspace;
+            if (try manager.active(session)) |previous| {
+                if (try app_session_runtime.Runtime(App).snapshotRecoveryCheckpoint(app, arena.allocator())) |checkpoint| {
+                    try manager.storeLocalCheckpoint(previous, try session_codec.encodeRecoveryCheckpoint(arena.allocator(), checkpoint));
+                }
+            }
+            const text = @import("../workspace/fossil_commands.zig").taskCommand(arena.allocator(), session, app.workspace_root, rest) catch |err| {
+                try app.writeDomainNotice(.{ .topic = "task", .tone = .@"error", .body = @errorName(err) }, true);
+                return;
+            };
+            try app_session_runtime.Runtime(App).clearRecoveryCheckpoint(app);
+            if (try manager.active(session)) |selected| {
+                if (try manager.loadLocalCheckpoint(selected)) |bytes| {
+                    const value = try std.json.parseFromSlice(std.json.Value, arena.allocator(), bytes, .{});
+                    const checkpoint = try session_codec.parseRecoveryCheckpoint(arena.allocator(), value.value);
+                    if (checkpoint.workspace_binding_hash) |saved| {
+                        if (!std.mem.eql(u8, saved, try manager.bindingHash(selected))) return error.WorkspaceBindingMismatch;
+                    }
+                    try app_session_runtime.Runtime(App).setRecoveryCheckpoint(app, checkpoint);
+                }
+            }
+            try app.writeDomainNotice(.{ .topic = "task", .tone = .neutral, .body = text }, true);
         }
 
         fn commandHandleWorkspace(ctx: *anyopaque, rest: []const u8) !void {

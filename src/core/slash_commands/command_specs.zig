@@ -34,6 +34,7 @@ pub const TopLevelKind = enum {
     upgrade,
     replay,
     workspace,
+    fossil,
 };
 
 pub const SlashKind = enum {
@@ -72,6 +73,7 @@ pub const SlashKind = enum {
     notifications,
     workspace,
     shell,
+    task,
     version,
 };
 

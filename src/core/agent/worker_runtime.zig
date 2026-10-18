@@ -104,6 +104,8 @@ pub const SteeringBoundaryResult = union(enum) {
 
 pub const QueuedPrompt = struct {
     turn_id: u64 = 0,
+    /// Borrowed only by the synchronous native runtime; never queued or owned.
+    workspace_binding_hash: ?[]const u8 = null,
     steering_receipt: ?*SteeringReceipt = null,
     /// Runtime-derived delivery state. The worker retains ownership in every state.
     delivery: PromptDelivery = .ordinary,

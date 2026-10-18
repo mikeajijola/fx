@@ -55,3 +55,9 @@ benchmarks/baseline.json
 .vibe/
 .windsurf/
 .zencoder/
+
+# Personal portable agent state and Fossil checkout metadata.
+/omos.fossil
+/omos.fossil-*
+/.fslckout
+/_FOSSIL_

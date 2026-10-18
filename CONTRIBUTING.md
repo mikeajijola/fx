@@ -52,7 +52,7 @@ omos
 
 The installer creates `omos` and `omo` links in `~/.local/bin`, or `XDG_BIN_HOME` when set. Both commands use this checkout's binary and enable work contracts for root user requests. They share the existing `~/.fx` profile, including your Gemini connection. The installer refuses to replace unrelated commands.
 
-Each request becomes a fixed contract requiring every requested outcome and acceptance criterion. When the acting model tries to finish, a separate model request reviews the original request, candidate answer, and recorded tool results. Pending work continues in the same turn. A blocker, invalid assessment, invented evidence reference, failed review request, or exhausted step limit cannot establish successful completion. Cancellation still stops the turn.
+Without a bound Fossil workspace, each request becomes a fixed contract requiring every requested outcome and acceptance criterion. When the acting model tries to finish, a separate model request reviews the original request, candidate answer, and recorded tool results. Pending work continues in the same turn. A blocker, invalid assessment, invented evidence reference, failed review request, or exhausted step limit cannot establish successful completion. Cancellation still stops the turn.
 
 The review adds a model request at each completion attempt and uses the same provider credentials. It uses `FX_REVIEW_MODEL` or the `review_model` setting when present, then the configured connection’s `reviewer_model`, then the acting model. It has no executable tools and grants no permissions. Its judgments about whether an outcome meets the request come from the reviewing model; the host validates the contract identity, required reports, and evidence references. For deterministic acceptance checks, an embedded host can supply its own assessor as described in [SDK work contracts](sdk/README.md#contract-dependent-execution).
 
@@ -63,6 +63,44 @@ FX_CONTRACT_REVIEW=1 ./zig-out/bin/fx ask "Read and summarize CONTRIBUTING.md"
 ```
 
 Test your changes with `./zig-out/bin/fx` from your checkout. A bare `fx` runs whichever copy comes first on your `PATH`, which is usually an installed release that doesn't include your change. Direct `fx` invocations keep their existing completion behavior unless `FX_CONTRACT_REVIEW=1` is set; `omos` and `omo` always enable the review.
+
+### Portable Fossil workspace
+
+Install the `fossil` CLI before using the managed workspace. Fossil stores agent goals, contracts, evidence, memory, skills, and artifacts. Git continues to store project source.
+
+Initialize the workspace from this checkout:
+
+```bash
+omos fossil init
+omos fossil status
+```
+
+The default repository is `./omos.fossil`. It is ignored by Git. The absolute path and workspace identity are remembered in `~/.fx/omos-workspace.json`, so later `omos` and `omo` turns use it from other directories. Initialization archives existing session history once, keeps the original sessions, and excludes credentials and runtime recovery checkpoints. Fossil autosync is disabled.
+
+Saved tasks use separate `task/<id>` branches and checkouts under your profile. A task's contract and branch survive follow-up turns, compaction, pauses, and restarts. User corrections advance the contract version. A child task publishes to its parent; a root task publishes to `trunk`. Publication requires a fulfilled assessment, the exact reviewed source revision, valid read dependencies, a conflict-free merge, and a verified committed receipt. The host retries a pending publication without rerunning completed actions.
+
+Use `/task new [goal]` to pause the active task and start another. Use `/task resume <id>` to return to retained work. The `fossil_workspace` tool reads workspace records, writes memory and skills, and attaches content-addressed artifacts through the normal permission policy. It cannot change contracts or publish branches. Every managed request receives fresh, bounded workspace context. Workspace content grants no tool permissions.
+
+Inspect or recover the workspace with:
+
+```bash
+omos fossil tasks --json
+omos fossil diff TASK_ID
+omos fossil history
+omos fossil verify
+omos fossil recover
+```
+
+Status distinguishes pending local evidence, branch checkpoints, pending publication, and accepted tasks. A conflict retains both branches and reports failure; the host never forces a merge. `--no-save` makes a turn ephemeral and leaves its managed workspace read-only.
+
+Export a portable copy after draining pending evidence:
+
+```bash
+omos fossil export /path/to/backup.fossil
+omos fossil use /path/to/backup.fossil
+```
+
+Export verifies the clone and refuses to replace an existing file. It includes the task registry and pending publication receipts. `use` rebuilds local task bindings from that registry. Credentials stay in the local profile and must be configured separately on another computer. Recovery never turns archived history into executable work. Project-root bindings still apply to retained tasks.
 
 fx keeps its settings and sessions in `~/.fx`. On macOS it stores Gateway API keys and OAuth credentials in your Keychain; pasted Gemini keys use the private profile file described above. To try a change against an empty profile without touching your own, give fx a temporary home directory and turn off Keychain storage:
 

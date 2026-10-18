@@ -2072,6 +2072,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .auto_compact_percent = startup.auto_compact_percent,
         .cancel_flag = ctx.cancelFlag(),
         .contract_review_enabled = completion_review.enabled(),
+        .fossil_session_id = if (completion_review.enabled()) ctx.activeSessionId() else null,
+        .fossil_ephemeral = completion_review.enabled() and ctx.writable == null,
+
         .contract_review_model = completion_review.selectModel(ctx.reviewer_model, ctx.provider, cfg.provider_set.definitions, ctx.model),
         .fast_mode = ctx.fast_mode,
         .ultrafast_mode = ctx.ultrafast_mode,

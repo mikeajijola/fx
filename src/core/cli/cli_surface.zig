@@ -56,6 +56,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
+const fossil_commands = @import("../workspace/fossil_commands.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
 const usage = @import("../../usage/usage.zig");
 const usage_host = @import("../app/usage_host.zig");
@@ -91,6 +92,7 @@ pub const Command = union(enum) {
     upgrade: []const [:0]const u8,
     replay: []const [:0]const u8,
     workspace: []const [:0]const u8,
+    fossil: []const [:0]const u8,
     unknown: []const u8,
 };
 
@@ -604,6 +606,9 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         },
         'd' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .doctor)) return .{ .doctor = args[1..] };
+        },
+        'f' => {
+            if (command_specs.matchesTopLevel(command_catalog, command, .fossil)) return .{ .fossil = args[1..] };
         },
         'i' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .issue)) return .{ .issue = args[1..] };
@@ -1767,6 +1772,23 @@ fn runNonInteractiveWithDeps(
             ) catch |err| return err;
             defer page.deinit(alloc);
             return writeSessionList(alloc, deps, page, opts);
+        },
+        .fossil => |rest| {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const options = fossil_commands.parse(rest) catch |err| {
+                try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .fossil, "fossil", err, rest);
+                return .handled_failure;
+            };
+            const snapshot = fossil_commands.execute(arena.allocator(), options) catch |err| {
+                try writeLookupFailure(alloc, deps, "fossil", err, if (options.json) .json else .text);
+                return .handled_failure;
+            };
+            const format: output_contracts.OutputFormat = if (options.json) .json else .text;
+            const output = try output_contracts.renderFossilWorkspace(alloc, snapshot, format);
+            defer alloc.free(output);
+            try writeFormattedOutput(deps, output, format);
+            return .handled_success;
         },
         .workspace => |rest| {
             const opts = parseWorkspaceArgs(rest) catch |err| {
@@ -6757,4 +6779,10 @@ const CreditsProviderProbe = struct {
 
 fn ownedCreditsErrorSnapshot(alloc: Allocator, message: []const u8) output_contracts.CreditsSnapshot {
     return .{ .err_message = alloc.dupe(u8, message) catch null };
+}
+
+test "fossil command routes to its native workspace surface" {
+    const result = parse(testCommandCatalog(), &.{ "fossil", "init", "--json" });
+    try std.testing.expect(result == .fossil);
+    try std.testing.expectEqualStrings("init", result.fossil[0]);
 }
