@@ -58,7 +58,8 @@ function model(f: ReturnType<typeof fixture>, actor: (body: any, count: number) 
       } else if (body.tools?.some((tool: any) => tool.function?.name === "omos_contract_assessment")) {
         assessments++;
         const packet = JSON.parse(body.messages.find((message: any) => message.role === "user").content);
-        packet.inspections = [...(packet.previousInspections ?? []), ...body.messages.filter((message: any) => message.role === "tool").map((message: any) => JSON.parse(message.content))];
+        packet.currentInspections = body.messages.filter((message: any) => message.role === "tool").map((message: any) => JSON.parse(message.content));
+        packet.inspections = [...(packet.previousInspections ?? []), ...packet.currentInspections];
         packets.push(packet);
         const status = await assess?.(packet) ?? "met";
         const evidence = packet.evidence.filter((item: any) => item.complete && (item.kind === "candidate" || item.status === "success")).map((item: any) => item.id);
@@ -118,6 +119,7 @@ describe("portable Fossil agent workspace", () => {
       { change(v) { delete v.spec.semantic.version; }, valid: false },
       { change(v) { v.spec.semantic.search = { version: 1, ranking: { relevance: 1, precedent: 1, evidence: 1, recency: 1 } }; }, valid: false },
       { change(v) { v.spec.semantic.relationships = [{ id: "self", from: "omos_task", to: "omos_task", kind: "containment" }]; }, valid: false },
+      { change(v) { v.spec.semantic.migration = { version: "omniseedos.data-migration/v1", defaults: { omos_task: { objective: "default" } } }; }, valid: false, upstreamValid: true },
     ];
     for (const [index, variant] of variants.entries()) {
       const value = structuredClone(seed);
@@ -167,12 +169,12 @@ describe("portable Fossil agent workspace", () => {
   test("stops a repeated successful search after three stalled progress checks", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
-    const m = model(f, (body, count) => body.tool_choice === "none" ? { content: "The search is unfinished. The repeated results are retained." } : {
+    const m = model(f, (body, count) => !body.tools?.length ? { content: "The search is unfinished. The repeated results are retained." } : {
       tool_calls: [{ index: 0, id: `search-${count}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "read", path: "workspace.json" }) } }],
     });
     const result = await f.run(["ask", "Inspect the workspace repeatedly until useful information is found", "--json"], {}, 180000);
     expect(result.code, result.stderr).toBe(1);
-    expect(result.stdout).toContain("Task paused");
+    expect(result.stderr).toContain("Task paused");
     expect(m.counts().actors).toBe(13);
     expect(m.counts().assessments).toBe(0);
     const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
@@ -189,12 +191,12 @@ describe("portable Fossil agent workspace", () => {
     writeFileSync(declaration, JSON.stringify(seed));
     writeFileSync(execution, JSON.stringify({ defaults: { max_actor_steps: 3 } }));
     expect((await f.run(["fossil", "definition", "propose", declaration, "--execution", execution, "--json"])).code).toBe(0);
-    const m = model(f, (body, count) => body.tool_choice === "none" ? { content: "Two workspace inspections completed; further work remains." } : {
+    const m = model(f, (body, count) => !body.tools?.length ? { content: "Two workspace inspections completed; further work remains." } : {
       tool_calls: [{ index: 0, id: `inspect-${count}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "read", path: "workspace.json" }) } }],
     });
     const first = await f.run(["ask", "Inspect this workspace until a useful result is found", "--json"], {}, 120000);
     expect(first.code, first.stderr).toBe(1);
-    expect(first.stdout).toContain("actor-step budget");
+    expect(first.stderr).toContain("actor-step budget");
     expect(m.counts().actors).toBe(3);
     const session = JSON.parse(first.stdout).session_id;
     const second = await f.run(["ask", "--resume-id", session, "continue", "--json"], {}, 120000);
@@ -206,7 +208,7 @@ describe("portable Fossil agent workspace", () => {
   test("a progress finalize decision still passes the independent completion gate", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
-    const m = model(f, (body, count) => body.tool_choice === "none" ? { content: "This is an omos agent workspace." } : {
+    const m = model(f, (body, count) => !body.tools?.length ? { content: "This is an omos agent workspace." } : {
       tool_calls: [{ index: 0, id: `inspect-${count}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "read", path: "workspace.json" }) } }],
     }, undefined, { progress: () => ({ outcome: "finalize", meaningful: false, evidence: [], remaining: ["request_complete"], note: "The actor has enough information to answer" }) });
     const result = await f.run(["ask", "Identify the workspace kind", "--json"], {}, 120000);
@@ -247,7 +249,7 @@ describe("portable Fossil agent workspace", () => {
     manifest.format = 1;
     writeFileSync(join(tree, "workspace.json"), JSON.stringify(manifest));
     fossil("rm", "omniform/company.json", "execution/omos.json");
-    fossil("commit", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", "Construct legacy fixture");
+    fossil("commit", "--hash", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", "Construct legacy fixture");
     model(f, () => ({ content: "Retain the original task" }), () => "blocked");
     expect((await f.run(["ask", "Retain the original task", "--json"])).code).toBe(1);
     const old = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
@@ -380,7 +382,7 @@ describe("portable Fossil agent workspace", () => {
     seeded = true;
     const pending = await f.run(["ask", "--resume-id", session, "continue", "--json"], {}, 120000);
     expect(pending.code, pending.stderr).toBe(1);
-    expect(pending.stderr).toContain("ContractReviewPending");
+    expect(pending.stderr).toContain("Verification reached its evidence budget");
     const actorCount = m.counts().actors;
     const resumed = await f.run(["ask", "--resume-id", session, "continue", "--json"], {}, 120000);
     expect(resumed.code, resumed.stderr).toBe(0);
@@ -389,6 +391,71 @@ describe("portable Fossil agent workspace", () => {
     expect(m.packets.at(-1).inspections.at(-1).fullyInspected).toBe(true);
     expect(m.packets.every(packet => JSON.stringify(packet).length < 524288)).toBe(true);
     expect(m.packets.at(-1).evidence.find((item: any) => item.id === target).complete).toBe(false);
+  }, 240000);
+
+  test("resumes independent segment assessment beyond a single review packet without replaying effects", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let seeded = false;
+    const target = "tool:large-receipt";
+    let maximumRequest = 0;
+    const m = model(f, () => ({ content: "The retained receipt confirms the fixture outcome." }), packet => {
+      if (!seeded) return "blocked";
+      maximumRequest = Math.max(maximumRequest, JSON.stringify(packet).length);
+      const receipt = packet.currentInspections.filter((p: any) => p.segment?.id === target).at(-1);
+      const saved = packet.previousAssessments.find((p: any) => p.id === target);
+      const assessed = receipt ? receipt.segment.offset + receipt.segment.bytes : saved?.assessed_bytes ?? 0;
+      const pages = packet.inspections.filter((p: any) => p.id === target && p.offset >= assessed);
+      const last = pages.at(-1);
+      const bytes = last?.bytes ?? saved?.bytes;
+      const offset = last ? last.offset + last.content.length : assessed;
+      if (bytes && assessed === bytes) return { name: "omos_contract_assessment", args: {
+        contractId: packet.contract.id, version: packet.contract.version,
+        obligations: packet.contract.obligations.map((o: any) => ({ id: o.id, status: "met", evidence: [target], note: "Every byte was independently assessed against the fixture receipt." })),
+      } };
+      if (pages.length >= 6 || (last && last.nextOffset === null)) return { name: "omos_review_checkpoint", args: {
+        id: target, offset: assessed, bytes: offset - assessed,
+        obligations: packet.contract.obligations.map((o: any) => ({ id: o.id, verdict: "supports", note: "This inspected fixture segment confirms the receipt; no contrary outcome occurs in these bytes." })),
+      } };
+      return { name: "omos_review_evidence", args: { action: "read", id: target, offset } };
+    });
+    const first = await f.run(["ask", "Verify the complete retained fixture receipt", "--json"]);
+    const session = JSON.parse(first.stdout).session_id;
+    const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    const tree = join(f.home, "large-receipt-checkout");
+    mkdirSync(tree);
+    const fossil = (...args: string[]) => {
+      const result = spawnSync("fossil", args, { cwd: tree, env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, USER: "fixture", LC_ALL: "C" }, encoding: "utf8" });
+      expect(result.status, result.stderr).toBe(0);
+    };
+    fossil("open", "--nosync", join(f.cwd, "omos.fossil"), task.branch);
+    const history = join(tree, "history", task.id);
+    mkdirSync(history, { recursive: true });
+    const record = JSON.stringify({ kind: "tool_evidence", task: task.id, contract_version: task.definition.version,
+      value: [{ id: target, kind: "tool", tool: "fixture_receipt", arguments: "{}", status: "success", content: JSON.stringify({ receipt: "confirmed", padding: "x".repeat(600000) }) }],
+    });
+    writeFileSync(join(history, createHash("sha256").update(record).digest("hex") + ".json"), record);
+    fossil("addremove");
+    fossil("commit", "--hash", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", "Retain large fixture receipt");
+    seeded = true;
+    let completed = false;
+    let lastPrefix = 0;
+    let actorCount: number | undefined;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const result = await f.run(["ask", "--resume-id", session, "continue", "--json"], {}, 120000);
+      actorCount ??= m.counts().actors;
+      expect(m.counts().actors).toBe(actorCount);
+      if (result.code === 0) { completed = true; break; }
+      expect(result.stderr).toContain("Verification reached its evidence budget");
+      const prefix = m.packets.at(-1).currentInspections.filter((p: any) => p.segment?.id === target).at(-1)?.segment;
+      const current = prefix ? prefix.offset + prefix.bytes : m.packets.at(-1).previousAssessments.find((p: any) => p.id === target)?.assessed_bytes ?? 0;
+      expect(current).toBeGreaterThan(lastPrefix);
+      lastPrefix = current;
+    }
+    expect(completed).toBe(true);
+    expect(maximumRequest).toBeLessThan(524288);
+    expect(m.packets.at(-1).previousAssessments.find((p: any) => p.id === target).segments).toBeGreaterThan(1);
+    expect(JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0].state).toBe("accepted");
   }, 240000);
 
   test("corrects one unadvertised tool proposal without executing it", async () => {
@@ -409,6 +476,41 @@ describe("portable Fossil agent workspace", () => {
     expect(failure.value.rejected_name).toBe("mcp_unavailable_fixture");
     expect(records.filter(record => record.kind === "action_intent").flatMap(record => record.value.calls).some(call => call.name === "mcp_unavailable_fixture")).toBe(false);
   }, 60000);
+
+  test("reviews read dependencies above the former aggregate content limit", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const tree = join(f.home, "dependency-checkout");
+    mkdirSync(tree);
+    const fossil = (...args: string[]) => {
+      const result = spawnSync("fossil", args, { cwd: tree, env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, USER: "fixture", LC_ALL: "C" }, encoding: "utf8" });
+      expect(result.status, result.stderr).toBe(0);
+    };
+    fossil("open", "--nosync", join(f.cwd, "omos.fossil"), "trunk");
+    mkdirSync(join(tree, "memory"), { recursive: true });
+    for (const name of ["first", "second"]) writeFileSync(join(tree, "memory", `${name}.txt`), name + "x".repeat(150000));
+    fossil("addremove");
+    fossil("commit", "--hash", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", "Seed dependency fixtures");
+    const m = model(f, (_body, count) => count <= 2 ? {
+      tool_calls: [{ index: 0, id: `dependency-${count}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "read", path: `memory/${count === 1 ? "first" : "second"}.txt` }) } }],
+    } : { content: "The recorded dependencies are memory/first.txt and memory/second.txt." }, packet => {
+      const snapshot = packet.evidence.find((e: any) => e.kind === "workspace" && e.id.startsWith("workspace:"));
+      const page = packet.inspections.find((p: any) => p.id === snapshot.id);
+      if (!page) return { name: "omos_review_evidence", args: { action: "read", id: snapshot.id } };
+      const state = JSON.parse(JSON.parse(page.content).content);
+      expect(state.reads).toHaveLength(2);
+      expect(state.reads.reduce((n: number, read: any) => n + read.bytes, 0)).toBeGreaterThan(262144);
+      expect(state.reads.every((read: any) => !read.complete)).toBe(true);
+      return { name: "omos_contract_assessment", args: {
+        contractId: packet.contract.id, version: packet.contract.version,
+        obligations: packet.contract.obligations.map((o: any) => ({ id: o.id, status: "met", evidence: [snapshot.id], note: "The host records both dependency paths at the reviewed revision." })),
+      } };
+    });
+    const result = await f.run(["ask", "Read both memory fixtures and report the recorded dependency paths", "--json"], {}, 120000);
+    expect(result.code, result.stderr).toBe(0);
+    expect(m.counts().actors).toBe(3);
+    expect(m.packets.at(-1).evidence.filter((e: any) => e.id.startsWith("workspace-file:")).map((e: any) => e.bytes).every((bytes: number) => bytes > 150000)).toBe(true);
+  }, 150000);
 
   test("continues a failed review from its retained candidate without repeating actor work", async () => {
     const f = fixture();
@@ -639,7 +741,16 @@ process.exit(result.exitCode);
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
     let blocked = true;
-    const m = model(f, () => ({ content: "The answer is green." }), () => blocked ? "blocked" : "met");
+    const m = model(f, () => ({ content: "The answer is green." }), packet => {
+      if (blocked) return "blocked";
+      for (const record of packet.evidence.filter((e: any) => e.kind === "context" && !e.complete)) {
+        const previous = packet.inspections.filter((p: any) => p.id === record.id).at(-1);
+        if (!previous || previous.nextOffset !== null) return { name: "omos_review_evidence", args: {
+          action: "read", id: record.id, offset: previous?.nextOffset ?? 0,
+        } };
+      }
+      return "met";
+    });
     const goal = "Answer these requirements: " + "detail ".repeat(1600) + "finish with blue";
     const first = await f.run(["ask", goal, "--json"], {}, 120000);
     expect(first.code).toBe(1);
@@ -648,9 +759,12 @@ process.exit(result.exitCode);
     const correction = "Correction: " + "note ".repeat(2000) + "use green";
     const second = await f.run(["ask", "--resume-id", session, correction, "--json"], {}, 120000);
     expect(second.code, second.stderr).toBe(0);
-    expect(m.packets[0].originalRequest).toBe(goal);
-    expect(m.packets[1].originalRequest).toBe(goal);
-    expect(m.packets[1].userSteering).toContain(correction);
+    expect(goal.startsWith(m.packets[0].originalRequest)).toBe(true);
+    expect(m.packets[0].originalRequestEvidence).toBe("context:original");
+    const packet = m.packets.at(-1);
+    const inspected = (id: string) => JSON.parse(packet.inspections.filter((p: any) => p.id === id).sort((a: any, b: any) => a.offset - b.offset).map((p: any) => p.content).join("")).content;
+    expect(inspected(packet.originalRequestEvidence)).toBe(goal);
+    expect(JSON.parse(inspected(packet.userSteeringEvidence))).toContain(correction);
     const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
     expect(task.definition.objective.length).toBeLessThanOrEqual(8192);
     expect(task.request_artifact).toStartWith("artifacts/");

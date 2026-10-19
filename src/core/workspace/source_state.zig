@@ -5,6 +5,9 @@ const io = @import("../shared/io.zig");
 const indexer = @import("../indexer/indexer.zig");
 
 pub fn fingerprint(alloc: std.mem.Allocator, root: []const u8, repository: []const u8) ![]const u8 {
+    // Managed workspaces belong to the native CLI. The shared orchestrator is
+    // also compiled for SDK hosts, where no native indexer may be instantiated.
+    if (comptime @import("builtin").target.cpu.arch.isWasm()) return error.NativeWorkspaceUnavailable;
     var scan = try indexer.scan(alloc, root, .{ .candidate_cap = 100_000, .max_workers = 2 }, null);
     defer scan.deinit();
     if (scan.tree.incomplete or scan.tree.cap_reached) return error.SourceStateIncomplete;

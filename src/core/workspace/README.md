@@ -11,6 +11,21 @@ arguments and content. The assessor must inspect every byte of a cited record
 before that record can establish a met obligation. Pagination never grants
 permission to execute an action.
 
+When a record exceeds one review attempt, the assessor uses
+`omos_review_checkpoint` to record decisions about contiguous inspected bytes.
+Each segment identifies the obligations it supports, contradicts, or does not
+address. The host binds these decisions to the exact payload hash, byte range,
+and contract version. Resumption restores their verified coverage and continues
+at the next byte without resending every earlier page. Changed evidence or
+contracts invalidate the affected decisions. Raw page cursors alone never
+establish inspection, and contradictory segment decisions prevent acceptance
+based on those checkpoints.
+
+The initial manifest lists 16 evidence records. Further records remain available
+through the evidence interface's `list` action. Its `assessments` action retrieves
+retained segment decisions by evidence ID. Large requests and steering are also
+retrievable records; completion requires inspection of their omitted contents.
+
 A review attempt permits at most eight auxiliary model calls under one deadline.
 Exhausting the review budget retains the answer, evidence, and review records.
 Continuing a task with a retained failed-review candidate starts with verification.
@@ -29,9 +44,12 @@ and returns a bounded receipt. This establishes consistency with the supplied
 manifest. Source provenance and external effects require their own evidence.
 
 Configured-provider responses with invalid tool names are rejected before tool
-execution. The runtime records a bounded name diagnostic and the advertised
-tool identities, then permits one corrected response. Repeated rejection pauses
-the turn. Earlier successful actions remain retained.
+execution. The runtime distinguishes missing, malformed, and unadvertised names
+from invalid outgoing definitions. It records bounded diagnostics and the
+advertised tool identities, then permits one corrected response when effects are
+known to be absent. Possible provider effects use the existing reconciliation
+path before any retry. Repeated rejection pauses the turn. Earlier successful
+actions remain retained.
 
 ## Declare the workspace model
 
@@ -49,6 +67,7 @@ omo fossil definition validate company.json --json
 omos fossil definition propose company.json --json
 omos fossil definition propose company.json --execution execution.json --json
 omos fossil query omos_task --json
+omo fossil query omos_task --offset 32 --json
 ```
 
 The JSON snapshot exposes model results in `model_data`. Validation reports

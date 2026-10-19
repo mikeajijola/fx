@@ -27,6 +27,20 @@ pub const View = struct {
     records: []const Evidence,
     inspected: []usize,
     payloads: []const []const u8,
+    raw_ranges: std.ArrayList(struct { ordinal: usize, start: usize, end: usize }) = .empty,
+
+    pub fn rawInspected(self: View, ordinal: usize, offset: usize, bytes: usize) bool {
+        var cursor = offset;
+        while (cursor < offset + bytes) {
+            var next = cursor;
+            for (self.raw_ranges.items) |range| {
+                if (range.ordinal == ordinal and range.start <= cursor) next = @max(next, range.end);
+            }
+            if (next == cursor) return false;
+            cursor = next;
+        }
+        return true;
+    }
 
     pub fn init(alloc: std.mem.Allocator, records: []const Evidence) !View {
         const inspected = try alloc.alloc(usize, records.len);
@@ -52,7 +66,10 @@ pub const View = struct {
             std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
             const complete = payload.len <= 2048;
             const content = if (complete) record.content else prefix(record.content, 256);
-            if (complete) self.inspected[ordinal] = payload.len;
+            if (complete) {
+                self.inspected[ordinal] = payload.len;
+                try self.raw_ranges.append(alloc, .{ .ordinal = ordinal, .start = 0, .end = payload.len });
+            }
             entry.* = .{
                 .id = record.id,
                 .kind = record.kind,
@@ -88,6 +105,8 @@ pub const View = struct {
             const payload = self.payloads[ordinal];
             if (command.offset > payload.len or (command.offset < payload.len and (payload[command.offset] & 0xc0) == 0x80)) return error.InvalidEvidenceOffset;
             const chunk = prefix(payload[command.offset..], @min(command.limit, 16384));
+            if (chunk.len == 0 and command.offset < payload.len) return error.InvalidEvidenceOffset;
+            try self.raw_ranges.append(alloc, .{ .ordinal = ordinal, .start = command.offset, .end = command.offset + chunk.len });
             if (command.offset <= self.inspected[ordinal]) self.inspected[ordinal] = @max(self.inspected[ordinal], command.offset + chunk.len);
             return std.json.Stringify.valueAlloc(alloc, .{
                 .id = id,
@@ -108,7 +127,9 @@ pub const View = struct {
         const Saved = struct { id: []const u8, offset: usize, bytes: usize, sha256: []const u8, content: []const u8 };
         var pages: std.ArrayList(Saved) = .empty;
         for (saved) |raw| {
-            const page_value = (try std.json.parseFromSlice(Saved, alloc, raw, .{ .ignore_unknown_fields = true })).value;
+            // List replies are journaled too, but contain no record bytes.
+            const parsed = std.json.parseFromSlice(Saved, alloc, raw, .{ .ignore_unknown_fields = true }) catch continue;
+            const page_value = parsed.value;
             try pages.append(alloc, page_value);
         }
         std.mem.sort(Saved, pages.items, {}, struct {
@@ -130,9 +151,18 @@ pub const View = struct {
                 const payload = self.payloads[i];
                 if (payload.len != page_value.bytes or !std.mem.eql(u8, try payloadHash(alloc, payload), page_value.sha256)) break;
                 if (page_value.offset > payload.len or page_value.content.len > payload.len - page_value.offset or !std.mem.eql(u8, payload[page_value.offset..][0..page_value.content.len], page_value.content)) break;
-                if (total + page_value.content.len > 256 * 1024) break;
+                if (page_value.offset + page_value.content.len <= self.inspected[i]) break;
+                // Large records advance through independent segment decisions,
+                // rather than accumulating all earlier raw pages in one packet.
+                const previous_inspected = self.inspected[i];
                 const regenerated = try self.page(alloc, try std.json.Stringify.valueAlloc(alloc, .{ .action = "read", .id = page_value.id, .offset = page_value.offset, .limit = page_value.content.len }, .{}));
-                total += page_value.content.len;
+                if (total + regenerated.len > 160 * 1024) {
+                    // This page was not delivered in the next packet.
+                    self.raw_ranges.items.len -= 1;
+                    self.inspected[i] = previous_inspected;
+                    break;
+                }
+                total += regenerated.len;
                 try restored.append(alloc, (try std.json.parseFromSlice(std.json.Value, alloc, regenerated, .{})).value);
                 break;
             }
@@ -173,4 +203,23 @@ test "completion review pages require contiguous inspection and preserve UTF-8" 
     }
     try view.requireInspected("tool:large");
     try std.testing.expectEqualStrings("", View.prefix("£", 1));
+}
+
+test "completion review restores record pages without interpreting manifest lists as records" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const content = try alloc.alloc(u8, 8192);
+    @memset(content, 'x');
+    var original = try View.init(alloc, &.{.{ .id = "receipt", .content = content }});
+    const list = try original.page(alloc, "{\"action\":\"list\"}");
+    const read = try original.page(alloc, "{\"action\":\"read\",\"id\":\"receipt\"}");
+    var resumed = try View.init(alloc, original.records);
+    const pages = try resumed.restorePages(alloc, &.{ list, read });
+    try std.testing.expectEqual(@as(usize, 1), pages.len);
+    try resumed.requireInspected("receipt");
+    var changed = try View.init(alloc, &.{.{ .id = "receipt", .content = "changed" }});
+    try std.testing.expectEqual(@as(usize, 0), (try changed.restorePages(alloc, &.{read})).len);
+    try std.testing.expectError(error.UninspectedContractEvidence, changed.requireInspected("receipt"));
+    try std.testing.expectError(error.InvalidEvidenceOffset, original.page(alloc, "{\"action\":\"read\",\"id\":\"receipt\",\"limit\":0}"));
 }

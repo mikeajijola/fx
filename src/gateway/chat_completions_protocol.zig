@@ -1123,6 +1123,10 @@ pub fn consume_stream_diagnostic(alloc: Allocator, source: *std.Io.Reader, reque
             failure.advertised_hash = std.fmt.bytesToHex(&digest, .lower);
             for (reducer.tools.items) |tool| {
                 if (reducer.known_name(tool.name.items)) continue;
+                failure.kind = if (tool.name.items.len == 0) .missing else blk: {
+                    validate_name(tool.name.items) catch break :blk .malformed;
+                    break :blk .unadvertised;
+                };
                 failure.name_len = @min(tool.name.items.len, failure.name_bytes.len);
                 for (tool.name.items[0..failure.name_len], failure.name_bytes[0..failure.name_len]) |byte, *dest| dest.* = if (std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-' or byte == '.') byte else '?';
                 break;
@@ -1177,7 +1181,24 @@ test "chat completions retain bounded rejected tool identity diagnostics" {
     var diagnostic: ?stream_provider.ToolIdentityFailure = null;
     try std.testing.expectError(error.InvalidToolName, consume_stream_diagnostic(std.testing.allocator, &source, test_tool_request(), .{}, null, &cancelled, &diagnostic));
     try std.testing.expectEqualStrings("not_advertised", diagnostic.?.name());
+    try std.testing.expectEqual(.unadvertised, diagnostic.?.kind);
     try std.testing.expect(diagnostic.?.advertised_count > 0);
+}
+
+test "chat completions retain bounded malformed and missing tool name diagnostics" {
+    for ([_]struct { name: []const u8, kind: @FieldType(stream_provider.ToolIdentityFailure, "kind") }{
+        .{ .name = "bad name", .kind = .malformed },
+        .{ .name = "", .kind = .missing },
+    }) |case| {
+        const bytes = try std.testing.allocator.print("data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"bad\",\"function\":{{\"name\":\"{s}\",\"arguments\":\"{{}}\"}}}}]}}}}]}}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n", .{case.name});
+        defer std.testing.allocator.free(bytes);
+        var source = std.Io.Reader.fixed(bytes);
+        var cancelled = std.atomic.Value(bool).init(false);
+        var diagnostic: ?stream_provider.ToolIdentityFailure = null;
+        try std.testing.expectError(error.InvalidToolName, consume_stream_diagnostic(std.testing.allocator, &source, test_tool_request(), .{}, null, &cancelled, &diagnostic));
+        try std.testing.expectEqual(case.kind, diagnostic.?.kind);
+        try std.testing.expect(std.mem.findScalar(u8, diagnostic.?.name(), ' ') == null);
+    }
 }
 
 fn test_request() stream_provider.RequestData {

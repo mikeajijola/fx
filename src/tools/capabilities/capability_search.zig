@@ -182,6 +182,10 @@ fn addWorkspaceResults(ctx: tool_dispatch.DispatchContext, input: *const Input, 
                     var parsed_output = try std.json.parseFromSlice(std.json.Value, arena.allocator(), combined, .{});
                     try parsed_output.value.object.put(arena.allocator(), "workspace_capabilities", .{ .array = declared.toManaged(arena.allocator()) });
                     try parsed_output.value.object.put(arena.allocator(), "workspace_basis", model.field(snapshot, "basis").?);
+                    if (declared.items.len > 0) {
+                        _ = parsed_output.value.object.swapRemove("state");
+                        if (parsed_output.value.object.getPtr("counts")) |counts| try counts.object.put(arena.allocator(), "workspace_capabilities", .{ .integer = @intCast(declared.items.len) });
+                    }
                     const augmented = try std.json.Stringify.valueAlloc(ctx.allocator, parsed_output.value, .{});
                     if (augmented.len <= output_cap) {
                         ctx.allocator.free(combined);

@@ -14,6 +14,7 @@ pub const Turn = struct {
     review_only_candidate: ?[]const u8 = null,
     source_basis: ?[]const u8 = null,
     prior_review_pages: []const []const u8 = &.{},
+    prior_review_checkpoints: []const []const u8 = &.{},
     recorded_evidence: std.ArrayList([]const u8) = .empty,
 
     pub fn begin(alloc: std.mem.Allocator, session: []const u8, parent_session: ?[]const u8, project: []const u8, prompt: []const u8) !?Turn {
@@ -82,11 +83,15 @@ pub const Turn = struct {
         self.reviewed_revision = try self.manager.checkpoint(self.task);
         var evidence: std.ArrayList(review.Evidence) = .empty;
         var pages: std.ArrayList([]const u8) = .empty;
+        var checkpoints: std.ArrayList([]const u8) = .empty;
         for (try self.manager.taskHistory(self.task, self.reviewed_revision.?)) |bytes| {
             const Entry = struct { kind: []const u8, task: []const u8, contract_version: u32, value: std.json.Value };
             const entry = (try std.json.parseFromSlice(Entry, alloc, bytes, .{})).value;
             if (std.mem.eql(u8, entry.kind, "review_evidence_page") and entry.contract_version == self.task.definition.version) {
                 if (entry.value == .object) if (entry.value.object.get("data")) |data| if (data == .string) try pages.append(alloc, data.string);
+            }
+            if (std.mem.eql(u8, entry.kind, "review_segment_assessment") and entry.contract_version == self.task.definition.version) {
+                if (entry.value == .object) if (entry.value.object.get("data")) |data| if (data == .string) try checkpoints.append(alloc, data.string);
             }
             if (!std.mem.eql(u8, entry.kind, "tool_evidence")) continue;
             const records = (try std.json.parseFromValue([]review.Evidence, alloc, entry.value, .{})).value;
@@ -98,6 +103,7 @@ pub const Turn = struct {
             }
         }
         self.prior_review_pages = pages.items;
+        self.prior_review_checkpoints = checkpoints.items;
         const inputs = try self.manager.reviewInputs(self.task, self.reviewed_revision.?);
         self.review_snapshot = inputs.snapshot;
         if (self.source_basis) |source| try evidence.append(alloc, .{ .id = try alloc.print("source-state:{s}", .{source}), .kind = .verification, .content = try std.json.Stringify.valueAlloc(alloc, .{ .source_hash = source, .note = "Current source bytes observed by the host; validation requires a matching successful command receipt." }, .{}) });

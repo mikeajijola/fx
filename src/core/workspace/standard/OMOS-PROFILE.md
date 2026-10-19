@@ -25,3 +25,8 @@ fields are `progress_interval` (1–100), `stalled_checks` (1–20) and
 `semantic.ts` is an unchanged reference copy of the SaaS extension from commit
 `e3d1d5f1ed7d5918f9d6997949a942c7fcdcb2f1`. Parity tests use it with the SaaS's
 pinned Zod version, 4.6.5. The native runtime uses the Zig implementation.
+
+The first native profile does not rewrite existing company data from migration
+defaults. Nonempty `migration.defaults`, field removals and type removals are
+rejected explicitly. Compatible model additions use new entity types or
+optional fields and require no rewrite of active task data.

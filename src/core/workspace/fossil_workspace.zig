@@ -1099,13 +1099,14 @@ pub const Manager = struct {
         _ = try self.run(null, &.{ "test-integrity", "-R", self.repository });
         const bytes = try self.run(null, &.{ "cat", manifest_path, "-r", "trunk", "-R", self.repository });
         const manifest = try parse(self.alloc, Manifest, bytes);
-        if (!std.mem.eql(u8, manifest.id, self.manifest.id) or manifest.format != 1) return error.WorkspaceBindingMismatch;
+        if (!std.mem.eql(u8, manifest.id, self.manifest.id) or (manifest.format != 1 and manifest.format != 2)) return error.WorkspaceBindingMismatch;
+        if (manifest.format == 2 and try self.modelBasis("trunk") == null) return error.WorkspaceDefinitionMissing;
         const branches = try self.run(null, &.{ "branch", "list", "--all", "-R", self.repository });
         var branch_lines = std.mem.splitScalar(u8, branches, '\n');
         while (branch_lines.next()) |raw| {
             const branch = std.mem.trim(u8, raw, " *\r\t");
             if (branch.len == 0) continue;
-            if (!std.mem.eql(u8, branch, "trunk") and !(std.mem.startsWith(u8, branch, "task/") and safeId(branch[5..]))) return error.UnexpectedWorkspaceBranch;
+            if (!std.mem.eql(u8, branch, "trunk") and !(std.mem.startsWith(u8, branch, "task/") and safeId(branch[5..])) and !(std.mem.startsWith(u8, branch, "definition/") and safeId(branch[11..]))) return error.UnexpectedWorkspaceBranch;
             const listing = try self.run(null, &.{ "ls", "-r", branch, "-R", self.repository });
             var files = std.mem.splitScalar(u8, listing, '\n');
             while (files.next()) |raw_path| {
@@ -1434,7 +1435,11 @@ pub const Manager = struct {
         // never confused with a legacy workspace.
         var present = false;
         for (try self.inventory(revision_id)) |path| present = present or std.mem.eql(u8, path, model.declaration_path);
-        if (!present) return null;
+        if (!present) {
+            const at_revision = try parse(self.alloc, Manifest, try self.contentAt(manifest_path, revision_id));
+            if (at_revision.format >= 2) return error.WorkspaceDefinitionMissing;
+            return null;
+        }
         const declaration_value = try self.loadDeclaration(revision_id);
         const execution = try model.parseExecution(self.alloc, try self.contentAt(model.execution_path, revision_id));
         return .{ .definition_hash = declaration_value.hash, .revision = revision_id, .execution = execution };

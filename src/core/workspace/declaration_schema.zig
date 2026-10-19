@@ -66,7 +66,8 @@ pub fn boundary(value: Value, depth: usize, count: *usize) !void {
 
 pub fn equal(a: Value, b: Value) bool {
     if ((a == .integer or a == .float) and (b == .integer or b == .float)) return number(a) == number(b);
-    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    const Tag = @typeInfo(Value).@"union".tag_type.?;
+    if (@as(Tag, a) != @as(Tag, b)) return false;
     return switch (a) {
         .null => true,
         .bool => |v| v == b.bool,

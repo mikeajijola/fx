@@ -6862,6 +6862,7 @@ fn assessCompletionContract(
         .original_request = if (input.managed) |turn| try turn.manager.originalRequest(turn.task) else null,
         .prior_evidence = prior_evidence,
         .prior_review_pages = if (input.managed) |turn| turn.prior_review_pages else &.{},
+        .prior_review_checkpoints = if (input.managed) |turn| turn.prior_review_checkpoints else &.{},
         .amendments = if (input.managed) |turn| turn.task.amendments else &.{},
         .prompt = input.job.prompt,
         .root_user_context = input.root_user_context,
@@ -7673,10 +7674,29 @@ fn processQueuedPromptLoop(
             var prepared_request_body: ?[]const u8 = null;
             var request_cost_for_attempt: ?runtime_prompt_context.RequestCost = null;
             var request_images_for_attempt: usize = 0;
-            if (try deps.agent_stream_provider.buildRequest(
+            const prepared = deps.agent_stream_provider.buildRequest(
                 overlay_arena,
                 request_data,
-            )) |built_request_body| {
+            ) catch |err| {
+                if (managed) |*turn| switch (err) {
+                    error.InvalidToolName, error.InvalidToolSelection, error.InvalidToolSchema => {
+                        try turn.manager.record(turn.task, "protocol_failure", .{
+                            .at_ms = io_mod.milliTimestamp(),
+                            .step = step,
+                            .stage = "request",
+                            .reason = @errorName(err),
+                            .failure_kind = "invalid_outgoing_definition",
+                            .advertised_names = request_data.tools.advertised_names,
+                            .corrective_attempt = false,
+                        });
+                        try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, "The outgoing tool definitions are invalid. Inspect the recorded request failure; completed actions remain retained.", "invalid_tool_definition");
+                        return;
+                    },
+                    else => {},
+                };
+                return err;
+            };
+            if (prepared) |built_request_body| {
                 const request_body = try fitRequestImages(
                     overlay_arena,
                     deps.agent_stream_provider,
@@ -7975,6 +7995,11 @@ fn processQueuedPromptLoop(
                     var advertised: std.ArrayList([]const u8) = .empty;
                     try advertised.appendSlice(arena, model_request.tools.advertised_names);
                     for (model_request.tools.selected_dynamic) |tool| try advertised.append(arena, tool.name);
+                    for (model_request.tools.additional_functions) |tool| try advertised.append(arena, tool.name);
+                    const manifest_bytes = try std.json.Stringify.valueAlloc(arena, advertised.items, .{});
+                    var manifest_hash: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(manifest_bytes, &manifest_hash, .{});
+                    const manifest_id = try arena.print("tool-manifest:{s}", .{std.fmt.bytesToHex(&manifest_hash, .lower)});
                     const diagnostic = gateway_attempt_evidence.tool_identity_failure;
                     const stage = if (gateway_attempt_evidence.provider_admitted) "response" else "request";
                     if (managed) |*turn| try turn.manager.record(turn.task, "protocol_failure", .{
@@ -7982,18 +8007,31 @@ fn processQueuedPromptLoop(
                         .step = current_step_index,
                         .stage = stage,
                         .reason = "InvalidToolName",
+                        .failure_kind = if (diagnostic) |value| @tagName(value.kind) else "unavailable",
                         .rejected_name = if (diagnostic) |value| value.name() else "unavailable",
                         .advertised_names = advertised.items,
+                        .advertised_manifest = manifest_id,
                         .corrective_attempt = tool_name_correction_used,
                     });
-                    if (tool_name_correction_used or !gateway_attempt_evidence.provider_admitted) {
-                        try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, "A tool name was rejected before execution. Inspect the recorded protocol failure and current tool definitions; completed actions remain retained.", "invalid_tool_name");
-                        return;
+                    const effects_uncertain = switch (effectiveRecoveryToolEvidence(preserved_tool_evidence, null, &stream_ctx)) {
+                        .none, .proven_unexecuted => false,
+                        .confirmed, .uncertain => true,
+                    };
+                    if (effects_uncertain) {
+                        // Keep the diagnostic, then use normal reconciliation
+                        // below. A rejected name does not prove remote effects
+                        // were absent.
+                        try deps.push_system_notice(deps.ctx, "A tool identity was rejected with possible provider effects; reconciling the retained attempt before retrying.");
+                    } else {
+                        if (tool_name_correction_used or !gateway_attempt_evidence.provider_admitted) {
+                            try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, "A tool name was rejected before execution. Inspect the recorded protocol failure and current tool definitions; completed actions remain retained.", "invalid_tool_name");
+                            return;
+                        }
+                        tool_name_correction_used = true;
+                        try within_turn_suffix.append(arena, .{ .role = .user, .content = try arena.print("Your last tool proposal was rejected before execution because its name was missing, malformed, or absent from this request's tool definitions. No calls in that rejected response were executed. Use only the exact currently advertised names: {s}. Use capability_search to discover and load any other configured tool before calling it. Do not repeat earlier successful actions. Return a fresh corrected proposal.", .{try std.json.Stringify.valueAlloc(arena, advertised.items, .{})}) });
+                        try deps.push_system_notice(deps.ctx, "Refreshing tool selection after a rejected tool name...");
+                        continue :agent_steps_loop;
                     }
-                    tool_name_correction_used = true;
-                    try within_turn_suffix.append(arena, .{ .role = .user, .content = try arena.print("Your last tool proposal was rejected before execution because its name was missing, malformed, or absent from this request's tool definitions. No calls in that rejected response were executed. Use only the exact currently advertised names: {s}. Use capability_search to discover and load any other configured tool before calling it. Do not repeat earlier successful actions. Return a fresh corrected proposal.", .{try std.json.Stringify.valueAlloc(arena, advertised.items, .{})}) });
-                    try deps.push_system_notice(deps.ctx, "Refreshing tool selection after a rejected tool name...");
-                    continue :agent_steps_loop;
                 }
                 const consumed_attempts = semantic_attempt +
                     @as(usize, @intFromBool(gateway_attempt_evidence.provider_admitted));

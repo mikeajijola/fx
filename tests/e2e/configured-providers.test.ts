@@ -845,7 +845,9 @@ describe("CLI work contracts", () => {
     const f = fixture(body => {
       if (isReview(body)) {
         reviews++;
-        expect(body.tools).toHaveLength(1);
+        expect(body.tools.map((tool: any) => tool.function.name)).toEqual([
+          "omos_contract_assessment", "omos_review_evidence", "omos_review_checkpoint",
+        ]);
         const packet = JSON.parse(body.messages.at(-1).content);
         expect(packet.originalRequest).toBe("Read note.txt and report its contents");
         expect(JSON.stringify(packet)).not.toContain("own-provider-token");

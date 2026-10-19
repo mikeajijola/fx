@@ -6,6 +6,7 @@ pub const Options = struct {
     path: ?[]const u8 = null,
     definition_action: enum { show, validate, propose } = .show,
     execution_path: ?[]const u8 = null,
+    offset: usize = 0,
     json: bool = false,
 };
 
@@ -13,10 +14,17 @@ pub fn parse(args: []const [:0]const u8) !Options {
     var options: Options = .{};
     var positional: usize = 0;
     var index: usize = 0;
+    var offset_seen = false;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--json")) {
             options.json = true;
+        } else if (std.mem.eql(u8, arg, "--offset")) {
+            if (offset_seen) return error.UnexpectedArgument;
+            offset_seen = true;
+            index += 1;
+            if (index >= args.len) return error.MissingOffset;
+            options.offset = std.fmt.parseInt(usize, args[index], 10) catch return error.InvalidOffset;
         } else if (std.mem.eql(u8, arg, "--execution")) {
             index += 1;
             if (index >= args.len) return error.MissingPath;
@@ -43,6 +51,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
         .init, .diff, .query => {},
         else => if (options.path != null) return error.UnexpectedArgument,
     }
+    if (offset_seen and options.action != .query) return error.UnexpectedArgument;
     if (options.execution_path != null and !(options.action == .definition and options.definition_action == .propose)) return error.UnexpectedArgument;
     return options;
 }
@@ -92,7 +101,7 @@ pub fn execute(alloc: std.mem.Allocator, options: Options) !workspace.Snapshot {
             },
             .propose => model_data = (try std.json.parseFromSlice(std.json.Value, alloc, try manager.proposeDefinition(null, try readDefinition(alloc, options.path.?), if (options.execution_path) |path| try readDefinition(alloc, path) else null), .{})).value,
         },
-        .query => model_data = (try std.json.parseFromSlice(std.json.Value, alloc, try manager.queryRecords(null, options.path, 0), .{})).value,
+        .query => model_data = (try std.json.parseFromSlice(std.json.Value, alloc, try manager.queryRecords(null, options.path, options.offset), .{})).value,
         .status, .tasks => {},
     }
     var snapshot = try manager.snapshot(detail);
@@ -119,4 +128,12 @@ fn readDefinition(alloc: std.mem.Allocator, path: []const u8) ![]const u8 {
     var file = try std.Io.Dir.cwd().openFile(@import("../shared/io.zig").getIo(), path, .{ .allow_directory = false, .follow_symlinks = false });
     defer file.close(@import("../shared/io.zig").getIo());
     return @import("../shared/io.zig").readFileToEnd(alloc, &file, 1_000_000);
+}
+
+test "fossil command query pagination validates offsets" {
+    try std.testing.expectEqual(@as(usize, 32), (try parse(&.{ "query", "omos_task", "--offset", "32" })).offset);
+    try std.testing.expectError(error.InvalidOffset, parse(&.{ "query", "--offset", "-1" }));
+    try std.testing.expectError(error.MissingOffset, parse(&.{ "query", "--offset" }));
+    try std.testing.expectError(error.UnexpectedArgument, parse(&.{ "status", "--offset", "0" }));
+    try std.testing.expectError(error.UnexpectedArgument, parse(&.{ "query", "--offset", "0", "--offset", "1" }));
 }

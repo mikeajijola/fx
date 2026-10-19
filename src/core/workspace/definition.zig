@@ -393,6 +393,7 @@ fn migration(alloc: Allocator, semantic: Semantic) !void {
     if (m.removeFields != .null and m.removeFields != .object) return error.InvalidDataMigration;
     if (m.defaults == .null) return;
     if (m.defaults != .object) return error.InvalidDataMigration;
+    if (m.defaults.object.count() > 0) return error.UnsupportedDataMigrationDefaults;
     var it = m.defaults.object.iterator();
     while (it.next()) |entry| {
         try validateRecord(semantic, entry.key_ptr.*, entry.value_ptr.*, false);

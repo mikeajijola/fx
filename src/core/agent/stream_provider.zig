@@ -114,6 +114,7 @@ pub const AttemptEvidence = struct {
 
 /// Bounded parser diagnostics; never retains arguments or provider reasoning.
 pub const ToolIdentityFailure = struct {
+    kind: enum { missing, malformed, unadvertised } = .missing,
     name_bytes: [128]u8 = @splat(0),
     name_len: usize = 0,
     advertised_count: usize = 0,
