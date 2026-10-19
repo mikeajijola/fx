@@ -6840,7 +6840,8 @@ const ContractCandidate = struct {
     managed: ?*managed_task.Turn = null,
 };
 
-fn assessCompletionContract(
+// Share auxiliary review paths instead of expanding them at each stopping point.
+noinline fn assessCompletionContract(
     deps: *const AgentRuntimeDeps,
     arena: Allocator,
     summary: *runtime_telemetry.TurnSummaryAccumulator,
@@ -6906,7 +6907,7 @@ fn assessCompletionContract(
     return result.decision;
 }
 
-fn governManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, summary: *runtime_telemetry.TurnSummaryAccumulator, input: ContractCandidate, planning: bool) !task_governance.Reply {
+noinline fn governManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, summary: *runtime_telemetry.TurnSummaryAccumulator, input: ContractCandidate, planning: bool) !task_governance.Reply {
     const turn = input.managed orelse return error.UnmanagedHost;
     var delivery: agent_stream_provider.DeliveryCertainty = .init();
     var attempt: agent_stream_provider.AttemptEvidence = .{};

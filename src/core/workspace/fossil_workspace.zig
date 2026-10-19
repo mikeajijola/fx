@@ -91,10 +91,18 @@ fn readBounded(alloc: Allocator, path: []const u8, limit: usize) ![]const u8 {
 }
 
 fn json(alloc: Allocator, value: anytype) ![]const u8 {
-    const raw = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    return portableJson(alloc, try std.json.Stringify.valueAlloc(alloc, value, .{}));
+}
+
+// Keep parsing and redaction shared across all serialized record types.
+noinline fn portableJson(alloc: Allocator, raw: []const u8) ![]const u8 {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    return portableValue(alloc, parsed.value);
+}
+
+fn portableValue(alloc: Allocator, value: std.json.Value) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
-    try writePortableValue(alloc, &out.writer, parsed.value);
+    try writePortableValue(alloc, &out.writer, value);
     return out.toOwnedSlice();
 }
 
@@ -633,12 +641,24 @@ pub const Manager = struct {
     /// Immutable content-addressed journal entries survive a failed checkpoint.
     /// The caller supplies only public task data, never opaque session state.
     pub fn record(self: Manager, task: Task, kind: []const u8, value: anytype) !void {
+        const raw = try std.json.Stringify.valueAlloc(self.alloc, value, .{});
+        try self.recordJson(task, kind, raw);
+    }
+
+    // The durable journal path is independent of the caller's payload type.
+    noinline fn recordJson(self: Manager, task: Task, kind: []const u8, raw: []const u8) !void {
         const lease = try Lease.acquire(self.alloc, self.root);
         defer lease.release();
         const current = try self.loadTask(task.id);
         if (current.definition.version != task.definition.version) return error.StaleWorkContract;
         if (current.state == .accepted or current.state == .publication_pending) return error.TaskIsReadOnly;
-        const bytes = try json(self.alloc, .{ .kind = kind, .task = task.id, .contract_version = task.definition.version, .value = value });
+        const value = (try std.json.parseFromSlice(std.json.Value, self.alloc, raw, .{})).value;
+        var envelope: std.json.ObjectMap = .empty;
+        try envelope.put(self.alloc, "kind", .{ .string = kind });
+        try envelope.put(self.alloc, "task", .{ .string = task.id });
+        try envelope.put(self.alloc, "contract_version", .{ .integer = task.definition.version });
+        try envelope.put(self.alloc, "value", value);
+        const bytes = try portableValue(self.alloc, .{ .object = envelope });
         try atomicWrite(self.alloc, try join(self.alloc, try self.journalDir(task), try hash(self.alloc, bytes)), bytes);
         if (std.mem.eql(u8, kind, "action_intent")) try fault("action-recorded");
     }

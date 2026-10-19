@@ -52,7 +52,8 @@ pub const Turn = struct {
         return turn;
     }
 
-    pub fn progress(self: *Turn, alloc: std.mem.Allocator, messages: []const types.ChatMessage) !void {
+    // Checkpoints and reviews share these retained-evidence traversal paths.
+    pub noinline fn progress(self: *Turn, alloc: std.mem.Allocator, messages: []const types.ChatMessage) !void {
         const evidence = try review.collectToolEvidence(alloc, messages);
         const coding = if (self.task.model_basis) |basis| if (basis.capability) |id| std.mem.eql(u8, id, "coding_task") else false else false;
         const source = if (coding) try @import("source_state.zig").fingerprint(alloc, self.task.project_root, self.manager.repository) else null;
@@ -78,7 +79,7 @@ pub const Turn = struct {
         }
     }
 
-    pub fn beforeReview(self: *Turn, alloc: std.mem.Allocator, messages: []const types.ChatMessage) ![]const review.Evidence {
+    pub noinline fn beforeReview(self: *Turn, alloc: std.mem.Allocator, messages: []const types.ChatMessage) ![]const review.Evidence {
         try self.progress(alloc, messages);
         self.reviewed_revision = try self.manager.checkpoint(self.task);
         var evidence: std.ArrayList(review.Evidence) = .empty;
