@@ -81,13 +81,17 @@ pages.
 
 Two size passes in [`ir_size.py`](ir_size.py) run through the pinned LLVM C
 library. Right after Zig emits bitcode, `outline-helpers` marks small shared
-std helpers `noinline`: the allocator's slice `free`, `remap`, and aligned
-allocation, the writer's `write`, `writeAll`, and allocating-writer setup and
-teardown, and the byte list's `appendSlice` and `deinit`. Zig otherwise copies
+std helpers `noinline`: the allocator's slice `free`, `remap`, aligned
+allocation, `dupe`, and `destroy`, the writer's `write`, `writeAll`, and
+allocating-writer setup and teardown, the byte list's `appendSlice`, and
+list, arena, and parsed-value teardown. Zig otherwise copies
 them into thousands of call sites (`free` alone into about 11,000). The pass
 runs before instrumentation, so training, profile use, and the recorded
 bitcode identity all include it. It reports matches per pattern and fails if
-the allocator `free` helper does not match. After profile use and outlining,
+the allocator `free` helper does not match. A matching `alwaysinline` helper
+also fails instead of emitting conflicting attributes. Changes to this pass
+require fresh training; profiles from another inlining graph cannot qualify
+the candidate. After profile use and outlining,
 `sparse-constants` rewrites copies from mostly undefined internal constants
 into stores of their defined bytes, then `globaldce,verify` drops the dead
 constants. Zig emits such a constant for each `return error.X` from a

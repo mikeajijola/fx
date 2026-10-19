@@ -126,6 +126,12 @@ class IrSizeTests(unittest.TestCase):
             '"array_list.Aligned(u8,null).deinit"',
             "mem.Allocator.dupe",
             '"array_list.Aligned(u16,null).deinit"',
+            "mem.Allocator.dupe__func_3",
+            "mem.Allocator.destroy__func_4",
+            '"json.static.Parsed(example.Record).deinit"',
+            "heap.ArenaAllocator.deinit",
+            "json.static.freeAllocated",
+            '"json.static.Parsed(example.Record).other"',
         )
         body = "".join(f"define internal void @{name}(ptr %p) {{\n  ret void\n}}\n" for name in names)
         calls = "".join(f"  call void @{name}(ptr %p)\n" for name in names)
@@ -133,7 +139,7 @@ class IrSizeTests(unittest.TestCase):
         result, output = self.run_pass("outline-helpers", source)
 
         self.assertEqual(0, result.returncode, result.stderr)
-        self.assertIn('"marked_functions": 5', result.stdout)
+        self.assertIn('"marked_functions": 11', result.stdout)
         # The pipeline validates this output before it records the identity.
         _require_bitcode_header(output)
         ir = subprocess.run(
@@ -149,12 +155,32 @@ class IrSizeTests(unittest.TestCase):
             ("Io.Writer.writeAll", True),
             ('"array_list.Aligned(u8,null).deinit"', True),
             ("mem.Allocator.dupe", False),
-            ('"array_list.Aligned(u16,null).deinit"', False),
+            ('"array_list.Aligned(u16,null).deinit"', True),
+            ("mem.Allocator.dupe__func_3", True),
+            ("mem.Allocator.destroy__func_4", True),
+            ('"json.static.Parsed(example.Record).deinit"', True),
+            ("heap.ArenaAllocator.deinit", True),
+            ("json.static.freeAllocated", True),
+            ('"json.static.Parsed(example.Record).other"', False),
         ):
             definition = next(line for line in ir.splitlines() if line.startswith("define") and f"@{name}(" in line)
             group = definition.rsplit("#", 1)[1].split()[0] if "#" in definition else None
             marked = group is not None and "noinline" in attributes.get(f"attributes #{group}", "")
             self.assertEqual(expected, marked, definition)
+
+    def test_helper_pass_rejects_conflicting_alwaysinline_attributes(self) -> None:
+        source = self.assemble(
+            "inline_conflict",
+            "define internal void @mem.Allocator.free__func_1(ptr %p) {\n  ret void\n}\n"
+            "define internal void @mem.Allocator.dupe__func_3(ptr %p) alwaysinline {\n  ret void\n}\n"
+            "define void @use(ptr %p) {\n"
+            "  call void @mem.Allocator.free__func_1(ptr %p)\n"
+            "  call void @mem.Allocator.dupe__func_3(ptr %p)\n  ret void\n}\n",
+        )
+        result, output = self.run_pass("outline-helpers", source)
+        self.assertEqual(1, result.returncode)
+        self.assertIn("helper is alwaysinline: mem.Allocator.dupe__func_3", result.stderr)
+        self.assertFalse(output.exists())
 
     def test_helper_pass_fails_closed_without_the_allocator_free_helper(self) -> None:
         source = self.assemble(
