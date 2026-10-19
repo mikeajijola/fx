@@ -17,7 +17,7 @@ def main():
     for name in ["seed", "retained", "output"]:
         parser.add_argument("--" + name, type=pathlib.Path, required=True)
     parser.add_argument("--llvm-bin", required=True)
-    parser.add_argument("--mode", choices=["rounds", "helpers", "backend", "os", "oz", "baseline", "generic", "namespace", "cleanup", "promote", "promote-baseline", "promote-twice", "promote-round", "attrs", "promote-tail", "promote-three", "promote-four", "finish", "globals"], required=True)
+    parser.add_argument("--mode", choices=["rounds", "helpers", "backend", "os", "oz", "baseline", "generic", "namespace", "cleanup", "promote", "promote-baseline", "promote-twice", "promote-round", "attrs", "promote-tail", "promote-three", "promote-four", "finish", "globals", "equality"], required=True)
     parser.add_argument("--prepared", type=pathlib.Path)
     args = parser.parse_args()
     seed = json.loads((args.seed / "manifest.json").read_text())
@@ -62,6 +62,30 @@ def main():
         report["results"].append(item)
         (paths.root / "comparison.json").write_text(json.dumps(report, indent=2))
         print(json.dumps(item), flush=True)
+
+    if args.mode == "equality":
+        script = pathlib.Path(__file__).with_name("equality_experiment.py")
+        modified = paths.bitcode.with_name("equality.bc")
+        result = command([sys.executable, script, "--libllvm", toolchain.libllvm, paths.bitcode, modified], "equality-call-sites", 300)
+        report["call_site_pass"] = json.loads(result.stdout)
+        shutil.move(modified, paths.bitcode)
+        report["transformed_bitcode_sha256"] = sha256_file(paths.bitcode)
+        # Any profile mismatch or optimizer diagnostic rejects this comparison.
+        # This remains comparison-only even if the retained CFG profiles match.
+        p.apply_profile(toolchain, paths, sha256_file(paths.bitcode))
+        before = p._defined_external_symbols(toolchain, paths.profile_use_bitcode, paths.logs / "equality-symbols-before.json")
+        passes = "cgscc(argpromotion),ipsccp,deadargelim,globalopt,function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,memcpyopt,dse,adce),globaldce,mergefunc,verify"
+        for index in range(2):
+            temporary = paths.profile_use_bitcode.with_name("equality-cleanup.bc")
+            command([toolchain.opt, "-passes=" + passes, paths.profile_use_bitcode, "-o", temporary], "equality-cleanup-" + str(index))
+            shutil.move(temporary, paths.profile_use_bitcode)
+            p.rewrite_sparse_constants(toolchain, paths)
+        after = p._defined_external_symbols(toolchain, paths.profile_use_bitcode, paths.logs / "equality-symbols-after.json")
+        assert before == after, "Comparison changed public symbols"
+        p.FX_MACHINE_OUTLINER_FLAGS = ("-machine-outliner-reruns=1", "-enable-tail-merge", "-tail-merge-threshold=1000")
+        shutil.copy2(paths.profile_use_bitcode, paths.root / "equality-pass.bc")
+        measure("control-equality")
+        return
 
     if args.mode == "globals":
         prepared = json.loads((args.prepared / "comparison.json").read_text())
