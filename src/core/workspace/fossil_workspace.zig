@@ -284,7 +284,7 @@ pub const Manager = struct {
     }
 
     fn merge(self: Manager, tree: []const u8, revision_id: []const u8, previous: Task) !void {
-        const output = self.run(tree, &.{ "merge", "--binary", "*", revision_id }) catch |err| {
+        self.mergeRevision(tree, revision_id) catch |err| {
             if (err == error.WorkspaceMergeConflict) {
                 var task = try self.loadTask(previous.id);
                 task.state = .conflict;
@@ -292,10 +292,11 @@ pub const Manager = struct {
             }
             return err;
         };
+    }
+
+    fn mergeRevision(self: Manager, tree: []const u8, revision_id: []const u8) !void {
+        const output = try self.run(tree, &.{ "merge", "--binary", "*", revision_id });
         if (std.mem.find(u8, output, "CONFLICT") != null or std.mem.find(u8, output, "conflict") != null or std.mem.find(u8, output, "Cannot merge") != null) {
-            var task = try self.loadTask(previous.id);
-            task.state = .conflict;
-            try self.saveTask(task);
             return error.WorkspaceMergeConflict;
         }
     }
@@ -1500,7 +1501,7 @@ pub const Manager = struct {
             // Commit without --allow-fork is the cross-process publication fence.
             const target = try self.checkout("trunk");
             if (!std.mem.eql(u8, base, try self.revision("trunk"))) return error.WorkspaceRevisionChanged;
-            _ = try self.run(target, &.{ "merge", "--nosync", source });
+            try self.mergeRevision(target, source);
             if (compatible) try atomicWrite(self.alloc, try join(self.alloc, target, try self.alloc.print("activations/{s}.json", .{proposal_id})), try json(self.alloc, .{ .proposal = proposal_id, .source = source, .hash = proposed.hash, .verified_by = "omos-compatible-definition-v1" }));
             _ = try self.commit(target, "Activate compatible definition for future tasks");
         }

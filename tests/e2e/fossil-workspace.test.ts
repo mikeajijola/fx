@@ -348,6 +348,11 @@ describe("portable Fossil agent workspace", () => {
     const target = "tool:fixture:0";
     const m = model(f, () => ({ content: "The retained receipt confirms the requested outcome." }), packet => {
       if (!seeded) return "blocked";
+      // The target can be on any manifest page. Exercise list retrieval on
+      // every attempt without assuming history files have a particular order.
+      if (!packet.currentInspections.some((page: any) => page.evidence)) return {
+        name: "omos_review_evidence", args: { action: "list", offset: packet.nextEvidenceOffset ?? 0, limit: 32 },
+      };
       const previous = packet.inspections.filter((page: any) => page.id === target).at(-1);
       if (!previous || previous.nextOffset !== null) return {
         name: "omos_review_evidence", args: { action: "read", id: target, offset: previous?.nextOffset ?? 0 },
@@ -390,7 +395,8 @@ describe("portable Fossil agent workspace", () => {
     expect(m.packets.at(-1).previousInspections.length).toBeGreaterThan(0);
     expect(m.packets.at(-1).inspections.at(-1).fullyInspected).toBe(true);
     expect(m.packets.every(packet => JSON.stringify(packet).length < 524288)).toBe(true);
-    expect(m.packets.at(-1).evidence.find((item: any) => item.id === target).complete).toBe(false);
+    const manifest = [...m.packets.at(-1).evidence, ...m.packets.at(-1).inspections.flatMap((page: any) => page.evidence ?? [])];
+    expect(manifest.find((item: any) => item.id === target).complete).toBe(false);
   }, 240000);
 
   test("resumes independent segment assessment beyond a single review packet without replaying effects", async () => {
