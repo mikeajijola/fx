@@ -17,7 +17,7 @@ def main():
     for name in ["seed", "retained", "output"]:
         parser.add_argument("--" + name, type=pathlib.Path, required=True)
     parser.add_argument("--llvm-bin", required=True)
-    parser.add_argument("--mode", choices=["rounds", "helpers", "backend", "os", "oz", "baseline", "generic", "namespace", "cleanup", "promote", "promote-baseline", "promote-twice", "promote-round"], required=True)
+    parser.add_argument("--mode", choices=["rounds", "helpers", "backend", "os", "oz", "baseline", "generic", "namespace", "cleanup", "promote", "promote-baseline", "promote-twice", "promote-round", "attrs", "promote-tail", "promote-three", "promote-four"], required=True)
     parser.add_argument("--prepared", type=pathlib.Path)
     args = parser.parse_args()
     seed = json.loads((args.seed / "manifest.json").read_text())
@@ -63,7 +63,7 @@ def main():
         (paths.root / "comparison.json").write_text(json.dumps(report, indent=2))
         print(json.dumps(item), flush=True)
 
-    if args.mode in ("cleanup", "promote", "promote-baseline", "promote-twice", "promote-round"):
+    if args.mode in ("cleanup", "promote", "promote-baseline", "promote-twice", "promote-round", "attrs", "promote-tail", "promote-three", "promote-four"):
         prepared = json.loads((args.prepared / "comparison.json").read_text())
         assert prepared["baseline_source"] == identity["source_sha"]
         assert prepared["input_bitcode_sha256"] == identity["bitcode_sha256"]
@@ -74,12 +74,20 @@ def main():
             "promote-twice": "ce08587787650e4d6ef32d97dff1535c066b63f1af9dcf9a2def2af628ef1435",
             "promote-round": "ce08587787650e4d6ef32d97dff1535c066b63f1af9dcf9a2def2af628ef1435",
         }
+        hashes.update({name: "2a3cf4364680725d32309f54622946f7033aa99ec459e83d2ce92ad962d9cd54" for name in ("attrs", "promote-tail", "promote-three", "promote-four")})
         assert sha256_file(first) == hashes.get(args.mode, "6cd1d7f8741ccef7fb9ea217ab7a77647a0b178f5bd579e5e17014b06955d8ba")
         report["prepared_ir_sha256"] = sha256_file(first)
         before = p._defined_external_symbols(toolchain, first, paths.logs / "cleanup-symbols-before.json")
         passes = "ipsccp,deadargelim,globalopt,function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,memcpyopt,dse,adce),globaldce,mergefunc,verify"
         if args.mode.startswith("promote"):
             passes = "cgscc(argpromotion)," + passes
+        if args.mode == "attrs":
+            passes = "cgscc(function-attrs,argpromotion)," + passes
+        if args.mode in ("promote-three", "promote-four"):
+            passes = ",".join([passes] * (2 if args.mode == "promote-three" else 3))
+        if args.mode == "promote-tail":
+            passes = ""
+            p.FX_MACHINE_OUTLINER_FLAGS += ("-enable-tail-merge", "-tail-merge-threshold=1000")
         report["cleanup_passes"] = passes
         if args.mode == "promote-round":
             prefix = paths.root / "cleanup-round-part."
@@ -93,8 +101,11 @@ def main():
             command([toolchain.llvm_link, *outlined, "-o", joined], "cleanup-round-link", 300)
             first = paths.root / "cleanup-round-internal.bc"
             command([toolchain.opt, *p.OUTLINE_CLEANUP_FLAGS, joined, "-o", first], "cleanup-round-internalize", 300)
-        command([toolchain.opt, "-passes=" + passes, first, "-o", paths.profile_use_bitcode], "extra-cleanup")
-        p.rewrite_sparse_constants(toolchain, paths)
+        if passes:
+            command([toolchain.opt, "-passes=" + passes, first, "-o", paths.profile_use_bitcode], "extra-cleanup")
+            p.rewrite_sparse_constants(toolchain, paths)
+        else:
+            shutil.copy2(first, paths.profile_use_bitcode)
         after = p._defined_external_symbols(toolchain, paths.profile_use_bitcode, paths.logs / "cleanup-symbols-after.json")
         assert before == after, "Comparison changed public symbols"
         shutil.copy2(paths.profile_use_bitcode, paths.root / "first-pass.bc")
