@@ -12,7 +12,7 @@ from scripts.pgso.pipeline import (
     ARGUMENT_CLEANUP_FLAGS,
     ARGUMENT_CLEANUP_ROUNDS,
     BENCHMARK_USE_FLAGS,
-    FX_MACHINE_OUTLINER_FLAGS,
+    MACHINE_OUTLINER_FLAGS,
     GENERATION_FLAGS,
     IR_OUTLINER_FLAGS,
     OUTLINE_CLEANUP_FLAGS,
@@ -318,15 +318,37 @@ prefix = pathlib.Path(sys.argv[sys.argv.index('--prefix') + 1])
         self.assertEqual(b"BC\xc0\xdestaged", self.paths.bitcode.read_bytes())
         self.assertEqual(sha256_file(self.paths.bitcode), digest)
         lines = actions.read_text().splitlines()
-        self.assertEqual(2, len(lines))
+        self.assertEqual(3, len(lines))
         self.assertTrue(lines[0].startswith("zig build pgso-ir "))
         self.assertEqual(
             f"ir_size --libllvm {toolchain.libllvm} outline-helpers "
             f"{self.paths.bitcode} {self.paths.bitcode}.staged",
             lines[1],
         )
+        self.assertEqual(
+            f"ir_size --libllvm {toolchain.libllvm} outline-equality "
+            f"{self.paths.bitcode} {self.paths.bitcode}.staged",
+            lines[2],
+        )
         self.assertFalse(self.paths.bitcode.with_name("fx.bc.staged").exists())
         emit_bitcode(toolchain, self.spec, self.paths, expected_sha256=digest)
+
+    def test_emitted_identity_rejects_a_failed_equality_pass(self) -> None:
+        actions = self.root / "equality-emit-failure"
+        ir_size = self.write_executable(
+            "equality-failure",
+            "import pathlib,sys\n"
+            "if sys.argv[3] == 'outline-equality':\n"
+            "    sys.stderr.write('missing verified comparison')\n"
+            "    sys.exit(1)\n"
+            "pathlib.Path(sys.argv[-1]).write_bytes(b'BC\\xc0\\xdehelper-verified')\n",
+        )
+        toolchain = dataclasses.replace(self.toolchain, zig=self.write_bitcode_zig(actions), ir_size=ir_size)
+        self.spec.repo_root.mkdir(parents=True)
+        with self.assertRaisesRegex(PgsoError, "failed with exit code 1"):
+            emit_bitcode(toolchain, self.spec, self.paths)
+        self.assertEqual(b"BC\xc0\xdehelper-verified", self.paths.bitcode.read_bytes())
+        self.assertFalse(self.paths.candidate_binary.exists())
 
     def test_emitted_bitcode_accepts_the_darwin_bitcode_wrapper(self) -> None:
         actions = self.root / "emit-wrapper"
@@ -441,8 +463,10 @@ pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'BC\\xc0\\xdebitco
         self.assertEqual(
             (
                 "-machine-outliner-reruns=1",
+                "-enable-tail-merge",
+                "-tail-merge-threshold=1000",
             ),
-            FX_MACHINE_OUTLINER_FLAGS,
+            MACHINE_OUTLINER_FLAGS,
         )
         self.assertEqual(
             (
@@ -656,9 +680,9 @@ pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'BC\\xc0\\xdebitco
             ),
             candidate,
         )
-        for flag in FX_MACHINE_OUTLINER_FLAGS:
+        for flag in MACHINE_OUTLINER_FLAGS:
             self.assertIn(flag, candidate_object)
-            self.assertNotIn(flag, benchmark_object)
+            self.assertIn(flag, benchmark_object)
 
     def test_candidate_object_and_signing_contract(self) -> None:
         actions = self.root / "candidate-actions.txt"
@@ -760,7 +784,8 @@ pathlib.Path(sys.argv[sys.argv.index('-map') + 1]).write_bytes({link_map!r}.enco
                 f"{self.paths.profile_use_bitcode} -o "
                 f"{self.paths.profile_use_ir}",
                 "artifact -filetype=obj -O=2 "
-                "-machine-outliner-reruns=1 "
+                "-machine-outliner-reruns=1 -enable-tail-merge "
+                "-tail-merge-threshold=1000 "
                 f"{self.paths.profile_use_bitcode} -o "
                 f"{self.paths.profile_use_object}",
                 "probe cc -### -target aarch64-macos -O2 -Wl,-dead_strip -s "

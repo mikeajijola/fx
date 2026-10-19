@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -27,7 +28,7 @@ ERROR_UNION = (
 )
 
 
-@unittest.skipUnless(AVAILABLE, "pinned LLVM 21 with libLLVM is not installed")
+@unittest.skipUnless(AVAILABLE, "pinned LLVM 22 with libLLVM is not installed")
 class IrSizeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory(prefix="fx-pgso-ir-size-")
@@ -182,6 +183,55 @@ class IrSizeTests(unittest.TestCase):
         self.assertIn("no out-of-line helper matched", result.stderr)
         self.assertFalse(output.exists())
 
+
+    def equality_source(self, anchor: str, *, control: bool = True) -> str:
+        source = "define internal i1 @mem.eql__func_1(ptr %a, ptr %b) {\n  %r = icmp eq ptr %a, %b\n  ret i1 %r\n}\n"
+        for name in [anchor, "core.indexer.example", "ui.example", "core.agent.presentation.example"] + (["core.agent.example"] if control else []):
+            source += f"define i1 @{name}(ptr %a, ptr %b) {{\n  %r = call i1 @mem.eql__func_1(ptr %a, ptr %b)\n  ret i1 %r\n}}\n"
+        return source
+
+    def test_equality_pass_shares_scoped_calls_without_changing_bodies(self) -> None:
+        source = self.assemble("equality_scope", self.equality_source("json.static.innerParse__func_2"))
+        result, output = self.run_pass("outline-equality", source)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn('"call_sites": 2', result.stdout)
+        before = subprocess.run([str(LLVM_BIN / "llvm-dis"), str(source), "-o", "-"], check=True, capture_output=True, text=True).stdout
+        after = subprocess.run([str(LLVM_BIN / "llvm-dis"), str(output), "-o", "-"], check=True, capture_output=True, text=True).stdout
+        attributes = dict(re.findall(r"attributes #(\d+) = \{([^}]*)\}", after))
+        for name, expected in [("json.static.innerParse__func_2", True), ("core.agent.example", True), ("core.indexer.example", False), ("ui.example", False), ("core.agent.presentation.example", False)]:
+            body = re.search(r"define [^\n]*@" + re.escape(name) + r"\([^}]+\}", after).group(0)
+            call = next(line for line in body.splitlines() if "call i1" in line)
+            group = re.search(r"#(\d+)", call)
+            self.assertEqual(expected, group is not None and "noinline" in attributes[group[1]])
+        def instructions(ir: str) -> list[str]:
+            return [re.sub(r" #\d+", "", line).strip() for line in ir.splitlines() if line.strip() and not line.startswith((";", "attributes "))]
+        self.assertEqual(instructions(before), instructions(after))
+        subprocess.run([str(LLVM_BIN / "opt"), "-passes=verify", str(output), "-o", str(self.root / "verified.bc")], check=True)
+
+    def test_equality_pass_uses_string_map_anchors_in_benchmark_modules(self) -> None:
+        for control in [True, False]:
+            with self.subTest(control=control):
+                source = self.assemble("equality_map_" + str(control), self.equality_source("array_hash_map.eqlString", control=control))
+                result, _ = self.run_pass("outline-equality", source)
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertIn('"call_sites": ' + str(int(control)), result.stdout)
+
+    def test_equality_pass_rejects_missing_ambiguous_and_forced_inline_targets(self) -> None:
+        base = self.equality_source("json.static.innerParse__func_2")
+        ambiguous = base.replace("  %r = call i1", "  %unused = call i1 @mem.eql__func_3(ptr %a, ptr %b)\n  %r = call i1", 1)
+        ambiguous += "define internal i1 @mem.eql__func_3(ptr %a, ptr %b) { ret i1 false }\n"
+        call_inline = base.replace("%r = call i1 @mem.eql__func_1(ptr %a, ptr %b)", "%r = call i1 @mem.eql__func_1(ptr %a, ptr %b) #0", 1) + "attributes #0 = { alwaysinline }\n"
+        for index, (text, error) in enumerate([
+            (self.equality_source("core.example.anchor"), "expected one verified byte-comparison instantiation"),
+            (ambiguous, "expected one verified byte-comparison instantiation"),
+            (base.replace("ptr %b) {", "ptr %b) alwaysinline {", 1), "byte comparison is alwaysinline"),
+            (call_inline, "comparison call site is alwaysinline"),
+        ]):
+            with self.subTest(error=error, index=index):
+                result, output = self.run_pass("outline-equality", self.assemble("equality_invalid_" + str(index), text))
+                self.assertEqual(1, result.returncode)
+                self.assertIn(error, result.stderr)
+                self.assertFalse(output.exists())
 
     def test_argument_cleanup_preserves_checked_math_nullable_reads_and_writes(self) -> None:
         source = self.assemble("argument_cleanup", """

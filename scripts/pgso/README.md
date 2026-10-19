@@ -61,11 +61,12 @@ python3 -m scripts.pgso all \
 
 The production workflow runs the same gate as a distributed DAG. One seed job
 builds the control, bitcode, and instrumented binary. Up to twenty training
-jobs execute non-overlapping corpus assignments, one coordinator validates and
+shards execute non-overlapping corpus assignments, with at most four active
+jobs to limit runner-allocation failures. One coordinator validates and
 merges every shard profile, builds three dedicated heavy-workload benchmark
 pairs, adds their hash-compatible speed evidence to the production profile,
 and builds the candidate. Up to twenty behavior jobs then verify
-non-overlapping candidate assignments. The six startup and six heavy-workload
+non-overlapping candidate assignments, also with at most four active jobs. The six startup and six heavy-workload
 comparisons run on twelve fresh machines. Every performance job measures its
 immutable control and candidate on the same machine.
 
@@ -80,7 +81,7 @@ Generated IR helpers are kept in one dense linker cluster ordered by their
 hottest profiled caller so outlining does not scatter startup code across cold
 pages.
 
-Two size passes in [`ir_size.py`](ir_size.py) run through the pinned LLVM C
+Three size passes in [`ir_size.py`](ir_size.py) run through the pinned LLVM C
 library. Right after Zig emits bitcode, `outline-helpers` marks small shared
 std helpers `noinline`: the allocator's slice `free`, `remap`, and aligned
 allocation, the writer's `write`, `writeAll`, and allocating-writer setup and
@@ -91,13 +92,21 @@ bitcode identity all include it. It reports matches per pattern and fails if
 the allocator `free` helper does not match. A matching `alwaysinline` helper
 also fails instead of emitting conflicting attributes. Changes to this pass
 require fresh training; profiles from another inlining graph cannot qualify
-the candidate. After profile use and outlining,
+the candidate. `outline-equality` then shares byte-comparison code at selected
+control-layer call sites. It discovers the exact comparator from the pinned
+standard library's JSON and string-map functions. It adds call-site `noinline`
+attributes and preserves the comparator's body and attributes. Indexer,
+renderer, agent-presentation, and shared-primitive call sites retain their
+existing policy. Ambiguous discovery and conflicting `alwaysinline` attributes
+fail before the transformed bitcode is recorded. The same discovery and scope
+rules apply to every benchmark module. Changes require fresh training because
+they affect the graph seen by instrumentation. After profile use and outlining,
 `sparse-constants` rewrites copies from mostly undefined internal constants
 into stores of their defined bytes, then `globaldce,verify` drops the dead
 constants. Zig emits such a constant for each `return error.X` from a
 function returning a large error union. Undefined bytes become "destination
 unchanged", a refinement of copying undefined bytes; explicit values,
-including zeros, are still stored. Benchmark artifacts receive both passes so
+including zeros, are still stored. Benchmark artifacts receive all three passes so
 their candidates keep the production code shape. The candidate link passes
 `-no_compact_unwind`: fx builds without unwind tables, and newer Apple linkers
 otherwise emit about 160 KB of compact unwind data.
@@ -109,7 +118,10 @@ opportunities exposed by the first caller cleanup. Conditional pointer reads,
 writes, and checked arithmetic retain their semantics. Each round verifies IR
 and rejects warnings or an invalid bitcode header before atomically replacing
 the previous output. Sparse rewriting runs again after each round, with
-separate audit logs. A changed public symbol surface rejects the candidate.
+separate audit logs. A changed public symbol surface rejects the candidate. CLI and benchmark
+candidates also share the backend policy: one machine-outliner rerun and a
+tail-merge comparison threshold of 1,000. The size and performance gates
+qualify this complete policy together.
 
 `python3 -m scripts.pgso.distributed plan` emits deterministic, non-empty
 GitHub Actions matrices. The remaining distributed subcommands are workflow

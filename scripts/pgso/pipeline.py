@@ -87,8 +87,10 @@ BENCHMARK_USE_FLAGS = (
     f"-passes={PROFILE_PREPARATION_PASSES},default<O2>,mergefunc,iroutliner",
 )
 
-FX_MACHINE_OUTLINER_FLAGS = (
+MACHINE_OUTLINER_FLAGS = (
     "-machine-outliner-reruns=1",
+    "-enable-tail-merge",
+    "-tail-merge-threshold=1000",
 )
 
 CANDIDATE_SIGNING_PAGE_SIZE = 16 * 1024
@@ -848,8 +850,8 @@ def candidate_object_argv(
     paths: PipelinePaths,
 ) -> tuple[str, ...]:
     # A second AArch64 outliner pass can fold sequences exposed by the first.
-    # Keep benchmark artifacts on their established code-generation contract.
-    outliner_flags = FX_MACHINE_OUTLINER_FLAGS if paths.selector == "fx" else ()
+    # Benchmark candidates use the same backend policy as the CLI candidate.
+    outliner_flags = MACHINE_OUTLINER_FLAGS
     return (
         str(toolchain.llc),
         "-filetype=obj",
@@ -896,17 +898,19 @@ def emit_bitcode(
     # Every job derives instrumentation and profile use from this file, so
     # the helper attributes are part of the recorded bitcode identity.
     staged = paths.bitcode.with_name(paths.bitcode.name + ".staged")
-    run_checked(
-        ir_size_argv(toolchain, "outline-helpers", paths.bitcode, staged),
-        cwd=paths.root,
-        env=os.environ.copy(),
-        timeout_s=300,
-        log_path=paths.logs / "outline-helpers.json",
-        require_empty_stderr=True,
-    )
-    _require_nonempty_file(staged, "outlined-helper bitcode")
-    _require_bitcode_header(staged)
-    os.replace(staged, paths.bitcode)
+    for command in ("outline-helpers", "outline-equality"):
+        run_checked(
+            ir_size_argv(toolchain, command, paths.bitcode, staged),
+            cwd=paths.root,
+            env=os.environ.copy(),
+            timeout_s=300,
+            log_path=paths.logs / f"{command}.json",
+            require_empty_stderr=True,
+        )
+        _require_nonempty_file(staged, f"{command} bitcode")
+        _require_bitcode_header(staged)
+        os.replace(staged, paths.bitcode)
+
     digest = sha256_file(paths.bitcode)
     if expected_sha256 is not None:
         validate_bitcode_hash(paths.bitcode, expected_sha256)
