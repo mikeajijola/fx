@@ -88,8 +88,9 @@ def main():
         # This is a changed comparison input. Final qualification must retrain
         # with any chosen helper pass running before instrumentation.
         ir_size.OUT_OF_LINE_HELPERS += (
-            r"Io\.Writer\.writeByte",
-            r"json\.Stringify\.(?:beginArray|beginObject|endArray|endObject|objectField|stringValue|valueStart|valueDone|objectFieldStart|indent|outputSpecialEscape)",
+            r"mem\.Allocator\.(?:dupe|destroy)__func_\d+",
+            r"json\.static\.Parsed\(.+\)\.deinit",
+            r"array_list\.Aligned\(.+\)\.deinit",
         )
         transformed = paths.bitcode.with_name("helpers.bc")
         report["helper_pass"] = ir_size.outline_helpers(ir_size.Llvm(toolchain.libllvm), paths.bitcode, transformed)
