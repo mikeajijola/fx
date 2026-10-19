@@ -96,6 +96,12 @@ def main():
         report["helper_pass"] = ir_size.outline_helpers(ir_size.Llvm(toolchain.libllvm), paths.bitcode, transformed)
         shutil.move(transformed, paths.bitcode)
         report["transformed_bitcode_sha256"] = sha256_file(paths.bitcode)
+        # Changing pre-instrumentation inlining changes some CFG hashes. This
+        # estimate intentionally drops mismatched counters; it cannot qualify
+        # performance or release. Any selected helper pass needs fresh training.
+        report["profile_mismatch_allowed_for_size_estimate"] = True
+        report["fresh_training_required"] = True
+        p.USE_FLAGS += ("-no-pgo-warn-mismatch",)
         p.apply_profile(toolchain, paths, sha256_file(paths.bitcode))
         measure("helpers")
         return
