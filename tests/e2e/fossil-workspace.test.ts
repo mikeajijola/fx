@@ -425,7 +425,7 @@ describe("portable Fossil agent workspace", () => {
     const tree = join(f.home, "large-receipt-checkout");
     mkdirSync(tree);
     const fossil = (...args: string[]) => {
-      const result = spawnSync("fossil", args, { cwd: tree, env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, USER: "fixture", LC_ALL: "C" }, encoding: "utf8" });
+      const result = spawnSync("fossil", args, { cwd: tree, env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, USER: "omos", LC_ALL: "C" }, encoding: "utf8" });
       expect(result.status, result.stderr).toBe(0);
     };
     fossil("open", "--nosync", join(f.cwd, "omos.fossil"), task.branch);
@@ -483,7 +483,7 @@ describe("portable Fossil agent workspace", () => {
     const tree = join(f.home, "dependency-checkout");
     mkdirSync(tree);
     const fossil = (...args: string[]) => {
-      const result = spawnSync("fossil", args, { cwd: tree, env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, USER: "fixture", LC_ALL: "C" }, encoding: "utf8" });
+      const result = spawnSync("fossil", args, { cwd: tree, env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, USER: "omos", LC_ALL: "C" }, encoding: "utf8" });
       expect(result.status, result.stderr).toBe(0);
     };
     fossil("open", "--nosync", join(f.cwd, "omos.fossil"), "trunk");
