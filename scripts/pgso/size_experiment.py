@@ -45,6 +45,11 @@ def main():
                            require_empty_stderr=True)
 
     def measure(name):
+        # Each link extracts into a fresh generated directory, as production
+        # does. Keep its nonempty-directory safety check intact.
+        runtime = paths.candidate_binary.parent / "compiler-runtime"
+        if runtime.exists():
+            shutil.rmtree(runtime)
         p.link_candidate(toolchain, paths)
         command([paths.candidate_binary, "--version"], name + "-version", 30)
         destination = paths.root / (name + "-fx")
@@ -93,6 +98,8 @@ def main():
     after = p._defined_external_symbols(toolchain, paths.profile_use_bitcode, paths.logs / "round-two-symbols-after.json")
     assert before == after, "Comparison changed public symbols"
     measure("round-two")
+    p.FX_MACHINE_OUTLINER_FLAGS = ("-machine-outliner-reruns=3",)
+    measure("round-two-machine-three")
 
 
 if __name__ == "__main__":

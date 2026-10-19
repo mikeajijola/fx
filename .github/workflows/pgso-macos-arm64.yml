@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: [rounds, helpers]
+        mode: [rounds]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Setup pinned tools
@@ -56,4 +56,7 @@ jobs:
             ${{ runner.temp }}/comparison/comparison.json
             ${{ runner.temp }}/comparison/logs
             ${{ runner.temp }}/comparison/*-fx
+            ${{ runner.temp }}/comparison/first-pass.bc
+            ${{ runner.temp }}/comparison/candidate/fx.bc
+            ${{ runner.temp }}/comparison/candidate/fx.o
           if-no-files-found: warn
