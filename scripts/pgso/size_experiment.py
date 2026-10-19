@@ -17,7 +17,7 @@ def main():
     for name in ["seed", "retained", "output"]:
         parser.add_argument("--" + name, type=pathlib.Path, required=True)
     parser.add_argument("--llvm-bin", required=True)
-    parser.add_argument("--mode", choices=["rounds", "helpers", "backend", "os", "oz", "baseline", "generic", "namespace", "cleanup", "promote", "promote-baseline", "promote-twice", "promote-round", "attrs", "promote-tail", "promote-three", "promote-four"], required=True)
+    parser.add_argument("--mode", choices=["rounds", "helpers", "backend", "os", "oz", "baseline", "generic", "namespace", "cleanup", "promote", "promote-baseline", "promote-twice", "promote-round", "attrs", "promote-tail", "promote-three", "promote-four", "finish"], required=True)
     parser.add_argument("--prepared", type=pathlib.Path)
     args = parser.parse_args()
     seed = json.loads((args.seed / "manifest.json").read_text())
@@ -62,6 +62,40 @@ def main():
         report["results"].append(item)
         (paths.root / "comparison.json").write_text(json.dumps(report, indent=2))
         print(json.dumps(item), flush=True)
+
+    if args.mode == "finish":
+        prepared = json.loads((args.prepared / "comparison.json").read_text())
+        assert prepared["baseline_source"] == identity["source_sha"]
+        assert prepared["input_bitcode_sha256"] == identity["bitcode_sha256"]
+        assert prepared["profile_sha256"] == report["profile_sha256"]
+        first = args.prepared / "first-pass.bc"
+        assert sha256_file(first) == "2a3cf4364680725d32309f54622946f7033aa99ec459e83d2ce92ad962d9cd54"
+        report["prepared_ir_sha256"] = sha256_file(first)
+        before = p._defined_external_symbols(toolchain, first, paths.logs / "finish-symbols-before.json")
+        base = "ipsccp,deadargelim,globalopt,function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,memcpyopt,dse,adce),globaldce,mergefunc,verify"
+        normal = "cgscc(argpromotion)," + base
+        attrs = "cgscc(function-attrs,argpromotion)," + base
+        tail = ("-enable-tail-merge", "-tail-merge-threshold=1000")
+        for name, passes, flags in [
+            ("attributes", attrs, ()),
+            ("one-cleanup-tail", "", tail),
+            ("two-cleanups-tail", normal, tail),
+            ("two-cleanups-attributes-tail", attrs, tail),
+        ]:
+            p.FX_MACHINE_OUTLINER_FLAGS = ("-machine-outliner-reruns=1",) + flags
+            if passes:
+                command([toolchain.opt, "-passes=" + passes, first, "-o", paths.profile_use_bitcode], name + "-cleanup")
+                p.rewrite_sparse_constants(toolchain, paths)
+            else:
+                shutil.copy2(first, paths.profile_use_bitcode)
+            after = p._defined_external_symbols(toolchain, paths.profile_use_bitcode, paths.logs / (name + "-symbols-after.json"))
+            assert before == after, "Comparison changed public symbols"
+            shutil.copy2(paths.profile_use_bitcode, paths.root / (name + "-pass.bc"))
+            measure(name)
+            report["results"][-1]["cleanup_passes"] = passes
+            report["results"][-1]["ir_sha256"] = sha256_file(paths.profile_use_bitcode)
+            (paths.root / "comparison.json").write_text(json.dumps(report, indent=2))
+        return
 
     if args.mode in ("cleanup", "promote", "promote-baseline", "promote-twice", "promote-round", "attrs", "promote-tail", "promote-three", "promote-four"):
         prepared = json.loads((args.prepared / "comparison.json").read_text())
