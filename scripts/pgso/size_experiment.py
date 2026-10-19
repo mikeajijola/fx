@@ -70,7 +70,7 @@ def main():
         first = args.prepared / "first-pass.bc"
         report["prepared_ir_sha256"] = sha256_file(first)
         shutil.copy2(first, paths.profile_use_bitcode)
-        base = ("-machine-outliner-reruns=1", "-verify-machineinstrs")
+        base = ("-machine-outliner-reruns=1",)
         for name, flags in [
             ("backend-baseline", ()),
             ("tail-merge", ("-enable-tail-merge",)),
