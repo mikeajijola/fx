@@ -134,8 +134,10 @@ the normal completion assessment and verified publication remain required.
 Pause retains a partial result and leaves the task unaccepted.
 
 Start coding tasks in the repository they change. A scan that stops at a nested
-repository cannot establish a source basis. Coding validation is associated with a hash of the repository files exposed by
-the native indexer. A command must run across an unchanged source state to
+repository cannot establish a source basis. Coding validation is associated
+with a hash of the repository files exposed by the native indexer. The hash
+includes paths, file types, permissions, contents, and symbolic-link targets.
+A command must run across an unchanged source state to
 provide current validation evidence. A later source edit invalidates that basis.
 Incomplete scans, unreadable or oversized files cannot establish validation.
 Generated files should follow the repository's ignore rules; changes to visible

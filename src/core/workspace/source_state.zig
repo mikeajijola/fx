@@ -1,4 +1,4 @@
-//! Hash the files the native repository indexer exposes. No repository program
+//! Hash indexed file paths, kinds, permissions, and contents. No repository program
 //! runs. An incomplete scan cannot establish a current validation basis.
 const std = @import("std");
 const io = @import("../shared/io.zig");
@@ -23,9 +23,7 @@ pub fn fingerprint(alloc: std.mem.Allocator, root: []const u8, repository: []con
         if (stat.kind == .sym_link) {
             var link: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const length = try std.Io.Dir.cwd().readLink(io.getIo(), path, &link);
-            hasher.update(entry.path);
-            hasher.update(&.{0});
-            hasher.update(link[0..length]);
+            hashEntry(&hasher, entry.path, .link, @intCast(stat.permissions.toMode() & 0o7777), link[0..length]);
             continue;
         }
         var file = try std.Io.Dir.cwd().openFile(io.getIo(), path, .{ .allow_directory = false, .follow_symlinks = false });
@@ -34,13 +32,75 @@ pub fn fingerprint(alloc: std.mem.Allocator, root: []const u8, repository: []con
         defer alloc.free(bytes);
         total += bytes.len;
         if (total > 256 * 1024 * 1024) return error.SourceStateTooLarge;
-        hasher.update(entry.path);
-        hasher.update(&.{0});
-        var content_hash: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(bytes, &content_hash, .{});
-        hasher.update(&content_hash);
+        hashEntry(&hasher, entry.path, .file, @intCast(stat.permissions.toMode() & 0o7777), bytes);
     }
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
     return alloc.dupe(u8, &std.fmt.bytesToHex(&digest, .lower));
+}
+
+fn hashEntry(hasher: *std.crypto.hash.sha2.Sha256, path: []const u8, kind: enum(u8) { file, link }, permissions: u16, bytes: []const u8) void {
+    hasher.update(path);
+    hasher.update(&.{ 0, @backingInt(kind) });
+    var mode: [2]u8 = undefined;
+    std.mem.writeInt(u16, &mode, permissions, .little);
+    hasher.update(&mode);
+    // Fixed-width content digests keep link targets from running into the next
+    // path. The kind also distinguishes a link from a file with the same bytes.
+    var content_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &content_hash, .{});
+    hasher.update(&content_hash);
+}
+
+test "source fingerprints frame link targets, file kinds, and permissions" {
+    const Hash = std.crypto.hash.sha2.Sha256;
+    var first = Hash.init(.{});
+    hashEntry(&first, "a", .link, 0o777, "x");
+    hashEntry(&first, "bc", .file, 0o644, "payload");
+    var second = Hash.init(.{});
+    hashEntry(&second, "a", .link, 0o777, "xb");
+    hashEntry(&second, "c", .file, 0o644, "payload");
+    // The earlier unframed encoding hashed both as a\0xbc\0<content hash>.
+    var a: [32]u8 = undefined;
+    var b: [32]u8 = undefined;
+    first.final(&a);
+    second.final(&b);
+    try std.testing.expect(!std.mem.eql(u8, &a, &b));
+
+    first = Hash.init(.{});
+    second = Hash.init(.{});
+    hashEntry(&first, "a", .file, 0o777, "target");
+    hashEntry(&second, "a", .link, 0o777, "target");
+    first.final(&a);
+    second.final(&b);
+    try std.testing.expect(!std.mem.eql(u8, &a, &b));
+
+    first = Hash.init(.{});
+    second = Hash.init(.{});
+    hashEntry(&first, "a", .file, 0o644, "script");
+    hashEntry(&second, "a", .file, 0o755, "script");
+    first.final(&a);
+    second.final(&b);
+    try std.testing.expect(!std.mem.eql(u8, &a, &b));
+}
+
+test "source fingerprint observes executable permission changes through the indexer" {
+    if (@import("builtin").target.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "script.sh", .{ .permissions = .fromMode(0o644) });
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, "#!/bin/sh\nexit 0\n");
+    const root = try io.dirRealpathAlloc(alloc, tmp.dir, ".");
+    const repository = try std.Io.Dir.path.join(alloc, &.{ root, "omos.fossil" });
+    const before = try fingerprint(alloc, root, repository);
+    try file.setPermissions(std.testing.io, .fromMode(0o755));
+    const after = try fingerprint(alloc, root, repository);
+    try std.testing.expect(!std.mem.eql(u8, before, after));
+    try file.setPermissions(std.testing.io, .fromMode(0o4755));
+    const special = try fingerprint(alloc, root, repository);
+    try std.testing.expect(!std.mem.eql(u8, after, special));
 }
