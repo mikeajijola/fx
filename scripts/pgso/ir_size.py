@@ -5,13 +5,12 @@
     ir_size.py --libllvm <libLLVM.dylib> sparse-constants <in.bc> <out.bc>
 
 outline-helpers marks small shared std helpers as noinline: the allocator's
-slice free, remap, aligned allocation, copying, and destruction, the writer's
-write, writeAll, and allocating writer setup and teardown, the byte list's
-append, and list, arena, and parsed-value teardown. Zig inlines them at
-thousands of call sites (free alone at about 11,000 in fx); one out-of-line
-copy per instantiation keeps the same checks, poisoning, and calls. Run it on
-the emitted bitcode, before instrumentation, so training and profile use see
-the same inlining.
+slice free, remap, and aligned allocation, the writer's write, writeAll, and
+allocating writer setup and teardown, and the byte list's append and
+teardown. Zig inlines them at thousands of call sites (free alone at about
+11,000 in fx); one out-of-line copy per instantiation keeps the same checks,
+poisoning, and calls. Run it on the emitted bitcode, before instrumentation,
+so training and profile use see the same inlining.
 
 sparse-constants rewrites copies from mostly undefined internal constants
 into stores of their defined scalar leaves. Zig materializes `return error.X`
@@ -38,11 +37,6 @@ OUT_OF_LINE_HELPERS = (
     r"mem\.Allocator\.(?:remap|allocBytesAligned)__func_\d+",
     r"Io\.Writer\.(?:writeAll|write|Allocating\.deinit|Allocating\.initCapacity)",
     r"array_list\.Aligned\(u8,null\)\.(?:appendSlice|deinit)",
-    r"mem\.Allocator\.(?:dupe|destroy)__func_\d+",
-    r"json\.static\.Parsed\(.+\)\.deinit",
-    r"array_list\.Aligned\(.+\)\.deinit",
-    r"heap\.ArenaAllocator\.deinit",
-    r"json\.static\.freeAllocated",
 )
 
 MIN_CONSTANT_BYTES = 32
