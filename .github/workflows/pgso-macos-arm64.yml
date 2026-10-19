@@ -1,72 +1,76 @@
-name: PGSO size experiments
+name: macOS 26 PGSO compatibility probe
 on:
   workflow_dispatch:
 permissions:
   actions: read
   contents: read
 concurrency:
-  group: pgso-size-experiments-${{ github.ref }}-${{ github.sha }}
+  group: pgso-macos26-probe-${{ github.ref }}
   cancel-in-progress: true
 env:
   FX_SOUND: "0"
 jobs:
-  compare:
-    name: Compare ${{ matrix.mode }}
-    runs-on: macos-15
+  probe:
+    name: Probe native macOS 26
+    runs-on: macos-26
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        mode: [equality]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 7ae66239d832ce0902b76b3349927509579281aa
+          fetch-depth: 0
+      - name: Require native ARM64
+        run: test "$(uname -m)" = arm64
       - name: Setup pinned tools
         id: setup
         uses: ./.github/actions/setup-pgso
         with:
           llvm: "true"
-      - name: Download retained seed
+          bun: "true"
+      - name: Download immutable current seed
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: pgso-seed-b6d78488dd1939475f91b3d31e4b8c9b61d98f21-attempt-1
-          run-id: 39257938998
+          artifact-ids: 12213020636
+          run-id: 39301690448
           github-token: ${{ github.token }}
+          merge-multiple: true
           path: ${{ runner.temp }}/seed
-      - name: Download retained production profile
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: pgso-candidate-b6d78488dd1939475f91b3d31e4b8c9b61d98f21-attempt-1
-          run-id: 39257938998
-          github-token: ${{ github.token }}
-          path: ${{ runner.temp }}/retained
-      - name: Download pinned retained IR
-        if: matrix.mode != 'equality'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: pgso-size-comparison-finish
-          run-id: 39293908195
-          github-token: ${{ github.token }}
-          path: ${{ runner.temp }}/prepared
-      - name: Compare immutable inputs without release eligibility
-        run: >-
-          python3 -m scripts.pgso.size_experiment
-          --seed "$RUNNER_TEMP/seed"
-          --retained "$RUNNER_TEMP/retained"
-          --output "$RUNNER_TEMP/comparison"
-          --llvm-bin "${{ steps.setup.outputs.llvm-bin }}"
-          --mode "${{ matrix.mode }}"
-          --prepared "$RUNNER_TEMP/prepared"
-      - name: Upload comparison only
+      - name: Validate original artifacts and run one assigned shard
+        env:
+          LLVM_BIN: ${{ steps.setup.outputs.llvm-bin }}
+          BUN_BIN: ${{ steps.setup.outputs.bun-bin }}
+        run: |
+          chmod +x "$RUNNER_TEMP/seed/control/bin/fx" "$RUNNER_TEMP/seed/instrumented/fx"
+          python3 - <<'PY'
+          import pathlib,subprocess,os,json,hashlib,platform
+          from scripts.pgso.toolchain import Toolchain
+          from scripts.pgso.pipeline import read_macos_link_contract
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])
+          seed=root/'seed';output=root/'probe';output.mkdir()
+          manifest=json.loads((seed/'manifest.json').read_text());identity=manifest['evidence']['identity']
+          assert identity['source_sha']=='7ae66239d832ce0902b76b3349927509579281aa'
+          assert identity['bitcode_sha256']=='f0490cb0a050056a091c709eb5de9b3a0d3aeccae62f452085bf6f7fead36940'
+          assert subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()==identity['source_sha']
+          for name,path in [('control','control/bin/fx'),('instrumented','instrumented/fx')]:
+              assert hashlib.sha256((seed/path).read_bytes()).hexdigest()==manifest['evidence'][name]['sha256']
+          toolchain=Toolchain.discover('zig',os.environ['LLVM_BIN'],identity['target'])
+          assert toolchain.llvm_version==identity['llvm_version'] and toolchain.zig_version==identity['zig_version']
+          contract=read_macos_link_contract(toolchain,seed/'control/bin/fx',output/'control-contract.json')
+          assert contract.min_macos=='15.0' and contract.sdk_version=='27.0'
+          print('Original macOS 15 deployment contract preserved on macOS 26',flush=True)
+          version=subprocess.run([seed/'control/bin/fx','--version'],capture_output=True,text=True,check=True)
+          assert not version.stderr
+          matrix=json.loads(subprocess.check_output(['python3','-m','scripts.pgso.distributed','plan','--phase','training','--maximum-shards','20'],text=True))
+          assigned=matrix['include'][0]
+          subprocess.run(['python3','-m','scripts.pgso.distributed','train-shard','--seed-dir',str(seed),'--output-dir',str(output/'training'),'--shard-id',assigned['id'],'--scenarios',assigned['scenarios'],'--llvm-bin',os.environ['LLVM_BIN'],'--bun',os.environ['BUN_BIN']],check=True)
+          report={'probe_only':True,'eligible_for_release':False,'source_sha':identity['source_sha'],'host_arch':platform.machine(),'os_version':platform.mac_ver()[0],'cpu':subprocess.check_output(['sysctl','-n','machdep.cpu.brand_string'],text=True).strip(),'minimum_macos':contract.min_macos,'sdk':contract.sdk_version,'identity':identity,'training':assigned}
+          (output/'probe.json').write_text(json.dumps(report,indent=2))
+          print(json.dumps(report),flush=True)
+          PY
+      - name: Upload compatibility probe
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: pgso-size-comparison-${{ matrix.mode }}
-          path: |
-            ${{ runner.temp }}/comparison/comparison.json
-            ${{ runner.temp }}/comparison/routing.json
-            ${{ runner.temp }}/comparison/logs
-            ${{ runner.temp }}/comparison/*-fx
-            ${{ runner.temp }}/comparison/*-pass.bc
-            ${{ runner.temp }}/comparison/candidate/fx.bc
-            ${{ runner.temp }}/comparison/candidate/fx.o
+          name: pgso-macos26-compatibility-probe
+          path: ${{ runner.temp }}/probe
           if-no-files-found: warn
