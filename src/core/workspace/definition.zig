@@ -1,5 +1,6 @@
 //! Shared OmniForm declarations and the explicitly versioned native host profile.
 const std = @import("std");
+const sort_utils = @import("../shared/sort_utils.zig");
 const schema = @import("declaration_schema.zig");
 const record_json = @import("../shared/record_json.zig");
 const Value = std.json.Value;
@@ -360,7 +361,7 @@ fn writeCanonical(alloc: Allocator, writer: *std.Io.Writer, value: Value) anyerr
     switch (value) {
         .object => |object| {
             const keys = try alloc.dupe([]const u8, object.keys());
-            std.mem.sort([]const u8, keys, {}, struct {
+            sort_utils.sort([]const u8, keys, {}, struct {
                 fn less(_: void, a: []const u8, b: []const u8) bool {
                     return std.mem.lessThan(u8, a, b);
                 }

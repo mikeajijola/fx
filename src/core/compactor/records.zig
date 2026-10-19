@@ -16,6 +16,7 @@
 //! that match best.
 
 const std = @import("std");
+const sort_utils = @import("../shared/sort_utils.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const trace = @import("trace.zig");
 
@@ -270,7 +271,7 @@ pub fn search(alloc: Allocator, store: Store, queries: []const []const u8, limit
     }
     const weights = try score(arena, docs.items, query);
 
-    std.mem.sort(Doc, docs.items, {}, Doc.better);
+    sort_utils.sort(Doc, docs.items, {}, Doc.better);
     var found: usize = 0;
     while (found < @min(limit, docs.items.len) and docs.items[found].score > 0) found += 1;
     return formatResults(alloc, arena, queries, query, weights, docs.items, found);

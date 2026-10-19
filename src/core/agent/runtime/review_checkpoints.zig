@@ -1,6 +1,7 @@
 //! Independent segment assessments survive review budgets. The host binds each
 //! decision to inspected bytes; neither a preview nor a saved cursor is proof.
 const std = @import("std");
+const sort_utils = @import("../../shared/sort_utils.zig");
 const evidence = @import("review_evidence.zig");
 const contract = @import("work_contract.zig");
 const record_json = @import("../../shared/record_json.zig");
@@ -117,7 +118,7 @@ pub const Ledger = struct {
             const receipt = record_json.decode(Receipt, alloc, raw, .{}) catch continue;
             try receipts.append(alloc, receipt);
         }
-        std.mem.sort(Receipt, receipts.items, {}, struct {
+        sort_utils.sort(Receipt, receipts.items, {}, struct {
             fn less(_: void, a: Receipt, b: Receipt) bool {
                 const order = std.mem.order(u8, a.segment.id, b.segment.id);
                 return order == .lt or (order == .eq and a.segment.offset < b.segment.offset);

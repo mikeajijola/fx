@@ -1,6 +1,7 @@
 //! Portable agent state. Git continues to own project source. All Fossil
 //! operations use its supported CLI; opaque runtime checkpoints stay local.
 const std = @import("std");
+const sort_utils = @import("../shared/sort_utils.zig");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -685,7 +686,7 @@ pub const Manager = struct {
             if (kind != .file) return unexpectedEntry(path, entry.name);
             try names.append(self.alloc, try self.alloc.dupe(u8, entry.name));
         }
-        std.mem.sort([]const u8, names.items, {}, struct {
+        sort_utils.sort([]const u8, names.items, {}, struct {
             fn less(_: void, a: []const u8, b: []const u8) bool {
                 return std.mem.lessThan(u8, a, b);
             }

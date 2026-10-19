@@ -1,5 +1,6 @@
 //! Bounded views of retained evidence. A preview is never proof of unseen bytes.
 const std = @import("std");
+const sort_utils = @import("../../shared/sort_utils.zig");
 const types = @import("../../shared/types.zig");
 const record_json = @import("../../shared/record_json.zig");
 
@@ -130,7 +131,7 @@ pub const View = struct {
             const page_value = record_json.decode(Saved, alloc, raw, .{ .ignore_unknown_fields = true }) catch continue;
             try pages.append(alloc, page_value);
         }
-        std.mem.sort(Saved, pages.items, {}, struct {
+        sort_utils.sort(Saved, pages.items, {}, struct {
             fn less(_: void, a: Saved, b: Saved) bool {
                 const order = std.mem.order(u8, a.id, b.id);
                 return order == .lt or (order == .eq and a.offset < b.offset);
