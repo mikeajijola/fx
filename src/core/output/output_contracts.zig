@@ -3809,5 +3809,9 @@ pub fn renderFossilWorkspace(alloc: std.mem.Allocator, snapshot: @import("../wor
     try out.writer.print("Fossil workspace: {s}\nWorkspace: {s}\nTrunk: {s}\nPublication: {s}\nPending evidence: {d}\n", .{ snapshot.repository, snapshot.workspace_id, snapshot.trunk_revision, snapshot.publication, snapshot.pending_journals });
     for (snapshot.tasks) |task| try out.writer.print("{s}  {s}  {s}\n", .{ task.id, @tagName(task.state), task.branch });
     if (snapshot.detail.len > 0) try out.writer.print("{s}\n", .{snapshot.detail});
+    if (snapshot.model_data) |data| {
+        try std.json.Stringify.value(data, .{ .whitespace = .indent_2 }, &out.writer);
+        try out.writer.writeByte('\n');
+    }
     return out.toOwnedSlice();
 }

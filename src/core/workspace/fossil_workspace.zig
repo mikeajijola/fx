@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const contract = @import("../agent/runtime/work_contract.zig");
+const model = @import("definition.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
@@ -29,6 +30,7 @@ pub const Task = struct {
     request_artifact: ?[]const u8 = null,
     amendments: []const []const u8 = &.{},
     dependencies: []const ReadDependency = &.{},
+    model_basis: ?model.Basis = null,
     state: enum { active, paused, blocked, conflict, publication_pending, accepted } = .active,
 };
 pub const Review = struct {
@@ -40,6 +42,8 @@ pub const Review = struct {
     assessment: []const u8 = "",
     workspace_snapshot: []const u8 = "",
 };
+pub const ReviewFile = struct { path: []const u8, content: []const u8, hash: []const u8 };
+pub const ReviewInputs = struct { snapshot: []const u8, files: []const ReviewFile };
 const Publication = struct {
     operation: []const u8,
     source: []const u8,
@@ -63,6 +67,7 @@ pub const Snapshot = struct {
     pending_journals: usize,
     publication: []const u8,
     detail: []const u8 = "",
+    model_data: ?std.json.Value = null,
 };
 
 pub fn hash(alloc: Allocator, data: []const u8) ![]const u8 {
@@ -204,7 +209,7 @@ const Lease = struct {
         errdefer file.close(io_mod.getIo());
         var attempts: usize = 0;
         while (!try file.tryLock(io_mod.getIo(), .exclusive)) {
-            if (attempts >= 500) return error.WorkspaceBusy;
+            if (attempts >= 3000) return error.WorkspaceBusy;
             attempts += 1;
             io_mod.sleep(10 * std.time.ns_per_ms);
         }
@@ -304,7 +309,7 @@ pub const Manager = struct {
             .manifest = undefined,
         };
         self.manifest = try parse(alloc, Manifest, try self.run(null, &.{ "cat", manifest_path, "-r", "trunk", "-R", repository }));
-        if (self.manifest.format != 1 or !std.mem.eql(u8, self.manifest.kind, "omos-agent-workspace") or !safeId(self.manifest.id)) return error.InvalidWorkspaceFormat;
+        if ((self.manifest.format != 1 and self.manifest.format != 2) or !std.mem.eql(u8, self.manifest.kind, "omos-agent-workspace") or !safeId(self.manifest.id)) return error.InvalidWorkspaceFormat;
         return self;
     }
 
@@ -330,7 +335,7 @@ pub const Manager = struct {
         try mkdir(std.Io.Dir.path.dirname(absolute) orelse ".");
         var nonce: [32]u8 = undefined;
         io_mod.getIo().random(&nonce);
-        var self: Manager = .{ .alloc = alloc, .repository = absolute, .root = try join(alloc, try join(alloc, try profile(alloc), "fossil"), try hash(alloc, absolute)), .manifest = .{ .id = try hash(alloc, &nonce) } };
+        var self: Manager = .{ .alloc = alloc, .repository = absolute, .root = try join(alloc, try join(alloc, try profile(alloc), "fossil"), try hash(alloc, absolute)), .manifest = .{ .format = 2, .id = try hash(alloc, &nonce) } };
         const lease = try Lease.acquire(alloc, self.root);
         defer lease.release();
         _ = try self.run(null, &.{ "init", "--admin-user", "omos", absolute });
@@ -341,6 +346,8 @@ pub const Manager = struct {
         _ = try self.run(null, &.{ "settings", "autosync", "off", "-R", absolute });
         const tree = try self.checkout("trunk");
         try atomicWrite(alloc, try join(alloc, tree, manifest_path), try json(alloc, self.manifest));
+        try atomicWrite(alloc, try join(alloc, tree, model.declaration_path), model.seed);
+        try atomicWrite(alloc, try join(alloc, tree, model.execution_path), try json(alloc, model.Execution{}));
         _ = try self.commit(tree, "Initialize omos agent workspace");
         return self;
     }
@@ -512,6 +519,11 @@ pub const Manager = struct {
             .base_revision = base,
             .project_root = project,
             .request_artifact = request_artifact,
+            .model_basis = if (parent) |p| blk: {
+                var basis = p.model_basis;
+                if (basis) |*pinned| pinned.capability = null;
+                break :blk basis;
+            } else try self.modelBasis(base),
             .definition = .{
                 .id = id,
                 .version = 1,
@@ -927,6 +939,10 @@ pub const Manager = struct {
 
     pub fn writeContent(self: Manager, task: Task, path: []const u8, bytes: []const u8) !void {
         if (!allowedMutablePath(path)) return error.WorkspacePathDenied;
+        return self.writeContentInternal(task, path, bytes);
+    }
+
+    fn writeContentInternal(self: Manager, task: Task, path: []const u8, bytes: []const u8) !void {
         if (std.mem.startsWith(u8, path, "artifacts/") and !std.mem.eql(u8, path[10..], try hash(self.alloc, bytes))) return error.InvalidArtifactIdentity;
         const lease = try Lease.acquire(self.alloc, self.root);
         defer lease.release();
@@ -995,6 +1011,7 @@ pub const Manager = struct {
             .parent = latest.parent,
             .baseRevision = latest.base_revision,
             .contract = latest.definition,
+            .model = try self.definitionSnapshot(latest),
             .projectRoot = latest.project_root,
             .publication = @tagName(latest.state),
             .revision = try self.revision(task.branch),
@@ -1002,15 +1019,22 @@ pub const Manager = struct {
     }
 
     pub fn reviewSnapshot(self: Manager, task: Task, revision_id: []const u8) ![]const u8 {
+        return (try self.reviewInputs(task, revision_id)).snapshot;
+    }
+
+    pub fn reviewInputs(self: Manager, task: Task, revision_id: []const u8) !ReviewInputs {
         const latest = try self.loadTask(task.id);
         const Read = struct { path: []const u8, observed_hash: []const u8, reviewed_hash: []const u8, bytes: usize, reviewed_content: []const u8, complete: bool };
         var reads: std.ArrayList(Read) = .empty;
+        var files: std.ArrayList(ReviewFile) = .empty;
         for (latest.dependencies) |dependency| {
             const bytes = try self.run(null, &.{ "cat", dependency.path, "-r", revision_id, "-R", self.repository });
+            const digest = try hash(self.alloc, bytes);
             const preview = @import("../agent/runtime/review_evidence.zig").View.prefix(bytes, 1024);
-            try reads.append(self.alloc, .{ .path = dependency.path, .observed_hash = dependency.observed_hash, .reviewed_hash = try hash(self.alloc, bytes), .bytes = bytes.len, .reviewed_content = preview, .complete = preview.len == bytes.len });
+            try reads.append(self.alloc, .{ .path = dependency.path, .observed_hash = dependency.observed_hash, .reviewed_hash = digest, .bytes = bytes.len, .reviewed_content = preview, .complete = preview.len == bytes.len });
+            try files.append(self.alloc, .{ .path = dependency.path, .content = bytes, .hash = digest });
         }
-        return json(self.alloc, .{ .workspace = self.manifest.id, .task = task.id, .branch = task.branch, .reviewed_revision = revision_id, .contract_version = task.definition.version, .reads = reads.items });
+        return .{ .snapshot = try json(self.alloc, .{ .workspace = self.manifest.id, .task = task.id, .branch = task.branch, .reviewed_revision = revision_id, .contract_version = task.definition.version, .reads = reads.items }), .files = try files.toOwnedSlice(self.alloc) };
     }
 
     pub fn verifyManifest(self: Manager, task: Task, path: []const u8) ![]const u8 {
@@ -1401,6 +1425,172 @@ pub const Manager = struct {
         try remove(marker);
     }
 
+    pub fn loadDeclaration(self: Manager, revision_id: []const u8) !model.Declaration {
+        return model.parse(self.alloc, try self.contentAt(model.declaration_path, revision_id));
+    }
+
+    pub fn modelBasis(self: Manager, revision_id: []const u8) !?model.Basis {
+        // Presence is checked through inventory, so transport or corruption is
+        // never confused with a legacy workspace.
+        var present = false;
+        for (try self.inventory(revision_id)) |path| present = present or std.mem.eql(u8, path, model.declaration_path);
+        if (!present) return null;
+        const declaration_value = try self.loadDeclaration(revision_id);
+        const execution = try model.parseExecution(self.alloc, try self.contentAt(model.execution_path, revision_id));
+        return .{ .definition_hash = declaration_value.hash, .revision = revision_id, .execution = execution };
+    }
+
+    pub fn migrate(self: Manager) ![]const u8 {
+        if (try self.modelBasis("trunk") != null) return "Workspace already uses omos.workspace/v1; task contracts were preserved.";
+        // A portable verified backup is made before the first model write.
+        const backup = try self.alloc.print("{s}.pre-omniform-{d}.fossil", .{ self.repository, io_mod.milliTimestamp() });
+        try self.exportRepository(backup);
+        const lease = try Lease.acquire(self.alloc, self.root);
+        defer lease.release();
+        const tree = try self.checkout("trunk");
+        var manifest = self.manifest;
+        manifest.format = 2;
+        try atomicWrite(self.alloc, try join(self.alloc, tree, model.declaration_path), model.seed);
+        try atomicWrite(self.alloc, try join(self.alloc, tree, model.execution_path), try json(self.alloc, model.Execution{}));
+        try atomicWrite(self.alloc, try join(self.alloc, tree, manifest_path), try json(self.alloc, manifest));
+        _ = try self.commit(tree, "Add governed workspace model; retain legacy task contracts");
+        return self.alloc.print("Activated omos.workspace/v1 for future tasks. Verified backup: {s}. Existing tasks retain their original contract and legacy adapter.", .{backup});
+    }
+
+    pub fn definitionSnapshot(self: Manager, task: ?Task) !std.json.Value {
+        const basis = if (task) |selected_task| selected_task.model_basis else try self.modelBasis(try self.revision("trunk"));
+        if (basis) |pinned| return .{ .object = blk: {
+            var object: std.json.ObjectMap = .empty;
+            try object.put(self.alloc, "basis", (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, pinned), .{})).value);
+            try object.put(self.alloc, "declaration", (try self.loadDeclaration(pinned.revision)).value);
+            break :blk object;
+        } };
+        return .null;
+    }
+
+    pub fn proposeDefinition(self: Manager, task: ?Task, bytes: []const u8, execution_bytes: ?[]const u8) ![]const u8 {
+        const proposed = try model.parse(self.alloc, bytes);
+        const lease = try Lease.acquire(self.alloc, self.root);
+        defer lease.release();
+        const base = try self.revision("trunk");
+        const old = try self.loadDeclaration(base);
+        const execution = if (execution_bytes) |raw| try model.parseExecution(self.alloc, raw) else try model.parseExecution(self.alloc, try self.contentAt(model.execution_path, base));
+        const compatible = try model.compatible(self.alloc, old, proposed);
+        const proposal_id = try hash(self.alloc, try json(self.alloc, .{ .base = base, .definition = proposed.hash, .execution = execution }));
+        const branch = try self.alloc.print("definition/{s}", .{proposal_id});
+        const existing = self.revision(branch) catch |err| switch (err) {
+            error.FossilCommandFailed => null,
+            else => return err,
+        };
+        if (existing == null) _ = try self.run(null, &.{ "branch", "new", branch, base, "--nosign", "-R", self.repository });
+        const tree = try self.checkout(branch);
+        const proposal = .{ .id = proposal_id, .task = if (task) |selected_task| @as(?[]const u8, selected_task.id) else null, .hash = proposed.hash, .base = base, .state = if (compatible) "activated" else "inactive", .reason = if (compatible) "Host verified additive compatibility; future tasks only." else "Existing identities, fields or contracts changed; activation refused.", .declaration = proposed.value, .execution = execution };
+        try atomicWrite(self.alloc, try join(self.alloc, tree, try self.alloc.print("proposals/{s}.json", .{proposal_id})), try json(self.alloc, proposal));
+        if (compatible) {
+            try atomicWrite(self.alloc, try join(self.alloc, tree, model.declaration_path), try model.canonical(self.alloc, proposed.value));
+            try atomicWrite(self.alloc, try join(self.alloc, tree, model.execution_path), try json(self.alloc, execution));
+        }
+        const source = try self.commit(tree, "Retain host-validated definition proposal");
+        {
+            // Commit without --allow-fork is the cross-process publication fence.
+            const target = try self.checkout("trunk");
+            if (!std.mem.eql(u8, base, try self.revision("trunk"))) return error.WorkspaceRevisionChanged;
+            _ = try self.run(target, &.{ "merge", "--nosync", source });
+            if (compatible) try atomicWrite(self.alloc, try join(self.alloc, target, try self.alloc.print("activations/{s}.json", .{proposal_id})), try json(self.alloc, .{ .proposal = proposal_id, .source = source, .hash = proposed.hash, .verified_by = "omos-compatible-definition-v1" }));
+            _ = try self.commit(target, "Activate compatible definition for future tasks");
+        }
+        return json(self.alloc, proposal);
+    }
+
+    pub fn setPlan(self: Manager, previous: Task, capability: []const u8, summary: []const u8, obligations: []const contract.Obligation, checks: []const []const u8) !Task {
+        const lease = try Lease.acquire(self.alloc, self.root);
+        defer lease.release();
+        var current = try self.loadTask(previous.id);
+        if (current.definition.version != previous.definition.version or current.state != .active) return error.StaleWorkContract;
+        if (current.model_basis == null) return error.WorkspaceMigrationRequired;
+        if (current.model_basis.?.capability != null) return current;
+        const declaration_value = try self.loadDeclaration(current.model_basis.?.revision);
+        var found = false;
+        for (model.items(model.spec(declaration_value.value), "capabilities")) |item| found = found or std.mem.eql(u8, model.text(item, "id"), capability);
+        if (!found) return error.UnknownCapability;
+        if (!model.nativeCapability(declaration_value, capability)) return error.UnboundCapability;
+        if (obligations.len > 32 or summary.len > 4096 or checks.len > 32) return error.InvalidTaskPlan;
+        var all: std.ArrayList(contract.Obligation) = .empty;
+        try all.appendSlice(self.alloc, current.definition.obligations);
+        for (obligations) |obligation| {
+            if (std.mem.startsWith(u8, obligation.id, "request_")) return error.InvalidTaskPlan;
+            try all.append(self.alloc, obligation);
+        }
+        if (std.mem.eql(u8, capability, "coding_task")) {
+            try all.append(self.alloc, .{ .id = "coding_validation", .description = "Run the applicable repository checks against the final changed source. Cite successful validation evidence and disclose any unavailable check or remaining failure." });
+            try all.append(self.alloc, .{ .id = "coding_summary", .description = "Provide a final answer stating the requested behavior, files changed, checks actually run and material limitations, supported by host evidence." });
+        }
+        if (all.items.len > current.definition.obligations.len) current.definition.version += 1;
+        current.definition.obligations = all.items;
+        const encoded = try json(self.alloc, current.definition);
+        _ = try contract.parse(self.alloc, encoded);
+        current.model_basis.?.capability = capability;
+        const tree = try self.checkout(current.branch);
+        try atomicWrite(self.alloc, try join(self.alloc, tree, try self.taskPath(current.id)), try json(self.alloc, current));
+        const plan = try json(self.alloc, .{ .kind = "task_plan", .task = current.id, .contract_version = current.definition.version, .value = .{ .task = current.id, .summary = summary, .obligations = current.definition.obligations, .checks = checks, .basis = current.model_basis } });
+        try atomicWrite(self.alloc, try join(self.alloc, tree, try self.alloc.print("history/{s}/{s}.json", .{ current.id, try hash(self.alloc, plan) })), plan);
+        _ = try self.commit(tree, "Pin task plan and preserve original acceptance criteria");
+        try self.saveTask(current);
+        return current;
+    }
+
+    pub fn writeRecord(self: Manager, task: Task, entity: []const u8, bytes: []const u8) ![]const u8 {
+        const basis = task.model_basis orelse return error.WorkspaceMigrationRequired;
+        const declaration_value = try self.loadDeclaration(basis.revision);
+        const value = (try std.json.parseFromSlice(std.json.Value, self.alloc, bytes, .{})).value;
+        try model.validateRecord(declaration_value.semantic, entity, value, true);
+        if (std.mem.startsWith(u8, entity, "omos_")) {
+            if (!std.mem.eql(u8, entity, "omos_plan")) return error.HostOwnedEntity;
+            if (!std.mem.eql(u8, model.text(value, "task"), task.id)) return error.InvalidTaskPlan;
+            try self.record(task, "plan_refinement", .{ .entity = entity, .data = value, .authority = "proposal_only" });
+            return "Plan refinement retained. The host contract and obligations are unchanged.";
+        }
+        const id = try model.digest(self.alloc, value);
+        try self.writeContentInternal(task, try self.alloc.print("records/{s}/{s}.json", .{ entity, id }), try json(self.alloc, .{ .entity = entity, .id = id, .task = task.id, .data = value }));
+        return id;
+    }
+
+    pub fn queryRecords(self: Manager, task: ?Task, entity: ?[]const u8, offset: usize) ![]const u8 {
+        const revision_id = if (task) |selected_task| try self.revision(selected_task.branch) else try self.revision("trunk");
+        var rows: std.ArrayList(std.json.Value) = .empty;
+        const matches = struct {
+            fn check(filter: ?[]const u8, kind: []const u8) bool {
+                return filter == null or std.mem.eql(u8, filter.?, kind);
+            }
+        }.check;
+        if (matches(entity, "omos_task")) for (try self.tasks()) |item| try rows.append(self.alloc, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = "omos_task", .id = item.id, .data = .{ .objective = item.definition.objective, .state = @tagName(item.state), .contract = item.definition, .basis = item.model_basis } }), .{})).value);
+        if (matches(entity, "omos_capability")) {
+            if (try self.modelBasis(revision_id)) |basis| for (model.items(model.spec((try self.loadDeclaration(basis.revision)).value), "capabilities")) |item| try rows.append(self.alloc, item);
+        }
+        const histories = if (task) |selected_task| try self.taskHistory(selected_task, revision_id) else &.{};
+        for (histories) |bytes| {
+            const row = (try std.json.parseFromSlice(std.json.Value, self.alloc, bytes, .{})).value;
+            const kind = model.text(row, "kind");
+            const logical = if (std.mem.eql(u8, kind, "task_plan") or std.mem.eql(u8, kind, "plan_refinement")) "omos_plan" else if (std.mem.eql(u8, kind, "action_intent")) "omos_action" else if (std.mem.eql(u8, kind, "tool_evidence")) "omos_evidence" else if (std.mem.startsWith(u8, kind, "review_") or std.mem.eql(u8, kind, "progress_assessment")) "omos_assessment" else "omos_event";
+            if (matches(entity, logical)) try rows.append(self.alloc, .{ .object = blk: {
+                var object: std.json.ObjectMap = .empty;
+                try object.put(self.alloc, "entity", .{ .string = logical });
+                try object.put(self.alloc, "source", row);
+                break :blk object;
+            } });
+        }
+        for (try self.inventory(revision_id)) |path| {
+            const logical = if (std.mem.startsWith(u8, path, "proposals/")) "omos_definition_proposal" else if (std.mem.startsWith(u8, path, "acceptances/")) "omos_result" else if (std.mem.startsWith(u8, path, "memory/")) "omos_memory" else if (std.mem.startsWith(u8, path, "skills/")) "omos_skill" else if (std.mem.startsWith(u8, path, "artifacts/")) "omos_artifact" else "";
+            if (std.mem.startsWith(u8, path, "records/")) {
+                const row = (try std.json.parseFromSlice(std.json.Value, self.alloc, try self.contentAt(path, revision_id), .{})).value;
+                if (matches(entity, model.text(row, "entity"))) try rows.append(self.alloc, row);
+            } else if (logical.len > 0 and matches(entity, logical)) try rows.append(self.alloc, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = logical, .path = path }), .{})).value);
+        }
+        const row_start = @min(offset, rows.items.len);
+        const end = @min(row_start +| 32, rows.items.len);
+        return json(self.alloc, .{ .revision = revision_id, .records = rows.items[row_start..end], .next_offset = if (end < rows.items.len) @as(?usize, end) else null, .total = rows.items.len });
+    }
+
     pub fn exportRepository(self: Manager, destination: []const u8) !void {
         const lease = try Lease.acquire(self.alloc, self.root);
         defer lease.release();
@@ -1474,7 +1664,7 @@ fn allowedPath(path: []const u8) bool {
     while (parts.next()) |part| {
         if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..") or part[0] == '.') return false;
     }
-    for ([_][]const u8{ "memory/", "skills/", "artifacts/", "history/", "tasks/", "imports/", "acceptances/" }) |prefix| {
+    for ([_][]const u8{ "memory/", "skills/", "artifacts/", "history/", "tasks/", "imports/", "acceptances/", "omniform/", "execution/", "records/", "proposals/", "activations/" }) |prefix| {
         if (std.mem.startsWith(u8, path, prefix)) return true;
     }
     return std.mem.eql(u8, path, manifest_path);

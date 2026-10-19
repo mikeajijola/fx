@@ -34,6 +34,8 @@ Native interactive and `ask` turns started with `omos` or `omo` use the absolute
 
 Use `fossil_workspace` for memory, skills, artifacts, and workspace inspection. The host creates branches, checkpoints evidence, verifies contracts, and publishes the exact reviewed revision. Do not ask the model to declare its own contract fulfilled or run manual merges to bypass publication. Completion requires a verified Fossil receipt. Preserve conflicted and pending branches; `omos fossil recover` retries durable publication without repeating model actions. `--no-save` turns have read-only workspace access.
 
+New tasks pin the OmniForm declaration and execution policy in Fossil. Read them through `fossil_workspace` with action `definition`; use `query` for typed records. Propose model changes through `propose_definition`. The host activates additive compatible proposals for future tasks and preserves active task contracts. Use `record` for custom records or a plan refinement; host evidence and assessments cannot be overwritten. Existing workspaces can use `omos fossil migrate`, which makes a verified backup before adding the model. See `src/core/workspace/README.md` for the profile and execution limits.
+
 These runtime checks apply to turns hosted by omos. External coding agents should follow this guidance, but this file cannot enforce their behavior. Changes to this subsystem belong in `src/core/workspace/`; model tool schemas remain in `src/builtins/tools.zig`.
 
 ## Language and Toolchain

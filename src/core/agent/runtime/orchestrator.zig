@@ -1,4 +1,5 @@
 const work_contract = @import("work_contract.zig");
+const task_governance = @import("../../workspace/task_governance.zig");
 const managed_task = @import("../../workspace/managed_task.zig");
 const completion_review = @import("completion_review.zig");
 const std = @import("std");
@@ -6860,6 +6861,7 @@ fn assessCompletionContract(
         .definition = if (input.managed) |turn| turn.task.definition else null,
         .original_request = if (input.managed) |turn| try turn.manager.originalRequest(turn.task) else null,
         .prior_evidence = prior_evidence,
+        .prior_review_pages = if (input.managed) |turn| turn.prior_review_pages else &.{},
         .amendments = if (input.managed) |turn| turn.task.amendments else &.{},
         .prompt = input.job.prompt,
         .root_user_context = input.root_user_context,
@@ -6894,9 +6896,52 @@ fn assessCompletionContract(
     if (input.managed) |turn| {
         try turn.sealReview();
         turn.assessment = result.assessment;
+        if (!try turn.sourceAssessmentCurrent(result.assessment)) {
+            try turn.manager.record(turn.task, "stale_validation", .{ .reason = "Source bytes changed since the cited validation evidence." });
+            return .{ .disposition = .continue_work, .feedback = "The cited coding validation does not cover the current source bytes. Inspect the final source and run the applicable check against that state before claiming completion. Preserve completed work and external effects." };
+        }
         if (result.decision.disposition == .blocked) turn.task = try turn.manager.setState(turn.task.id, .blocked);
     }
     return result.decision;
+}
+
+fn governManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, summary: *runtime_telemetry.TurnSummaryAccumulator, input: ContractCandidate, planning: bool) !task_governance.Reply {
+    const turn = input.managed orelse return error.UnmanagedHost;
+    var delivery: agent_stream_provider.DeliveryCertainty = .init();
+    var attempt: agent_stream_provider.AttemptEvidence = .{};
+    var context: u8 = 0;
+    const request: agent_stream_provider.ModelRequest = .{
+        .observer = deps.observer,
+        .credential = activeCredentialLease(input.api_key, input.job),
+        .model = if (input.config.contract_review_model.len > 0) input.config.contract_review_model else input.model,
+        .retry_count = 1,
+        .messages = &.{},
+        .tool_choice = .required,
+        .provider_options = .{},
+        .trace_ctx = .{ .turn_id = input.turn_id },
+        .content_capture_limit = work_contract.max_bytes,
+        .deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(60_000) }),
+        .delivery = &delivery,
+        .attempt_evidence = &attempt,
+        .events = .{ .context = &context, .emit_fn = discardContractEvent },
+        .cooperative_pulse = deps.cooperative_transport_pulse,
+        .cancel_flag = input.config.cancel_flag,
+    };
+    const packet = try std.json.Stringify.valueAlloc(alloc, .{
+        .originalRequest = try turn.manager.originalRequest(turn.task),
+        .amendments = turn.task.amendments,
+        .contract = turn.task.definition,
+        .model = try turn.manager.definitionSnapshot(turn.task),
+        .step = input.step,
+    }, .{});
+    const reply = if (planning)
+        try task_governance.plan(alloc, deps.agent_stream_provider, request, input.job.provider, packet, turn.journal())
+    else
+        try task_governance.progress(alloc, deps.agent_stream_provider, request, input.job.provider, packet, turn.journal(), try turn.beforeReview(alloc, input.messages));
+    if (deps.report_usage) |report| report(deps.ctx, reply.usage);
+    summary.prepareTokenRequest();
+    _ = summary.reconcileTokenRequest(reply.usage, false);
+    return reply;
 }
 
 fn discardContractEvent(_: *anyopaque, _: agent_stream_provider.Event) void {}
@@ -7026,6 +7071,7 @@ fn processQueuedPromptLoop(
     var silent_tool_steps: usize = 0;
     var continuation_injected = false;
     var tool_name_correction_used = false;
+    var governance: task_governance.State = .{};
     var last_step_ctx = finish_trace.ctx;
     var current_step_index: usize = 0;
     var last_tool_call_name: []const u8 = "none";
@@ -7061,6 +7107,21 @@ fn processQueuedPromptLoop(
             }
             try within_turn_suffix.append(arena, .{ .role = .assistant, .content = candidate });
             try within_turn_suffix.append(arena, .{ .role = .user, .content = decision.feedback });
+        }
+    }
+    if (managed) |*turn| {
+        if (turn.task.model_basis) |basis| if (basis.capability == null) {
+            try deps.push_system_notice(deps.ctx, "Planning against the pinned workspace model...");
+            const reply = try governManagedTask(deps, arena, &summary_accumulator, .{ .config = config, .job = job, .candidate = "", .messages = &.{}, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .turn_id = turn_id, .step = 0, .managed = turn }, true);
+            const plan = (try std.json.parseFromSlice(task_governance.Plan, arena, reply.raw, .{})).value;
+            if (!std.mem.eql(u8, plan.capability, "coding_task") and !std.mem.eql(u8, plan.capability, "general_task")) return error.UnboundCapability;
+            turn.task = try turn.manager.setPlan(turn.task, plan.capability, plan.summary, plan.obligations, plan.checks);
+            _ = try turn.manager.checkpoint(turn.task);
+            job.workspace_binding_hash = try turn.manager.bindingHash(turn.task);
+        };
+        if (turn.task.model_basis != null) {
+            try governance.seed(arena, try turn.beforeReview(arena, &.{}));
+            try turn.manager.record(turn.task, "invocation_started", .{ .turn = turn_id, .policy = turn.task.model_basis.?.execution.defaults });
         }
     }
     var selected_dynamic_tools: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
@@ -7209,6 +7270,35 @@ fn processQueuedPromptLoop(
             );
             return;
         }
+        if (managed) |*turn| if (turn.task.model_basis) |basis| {
+            const policy = basis.execution.defaults;
+            if (step >= policy.max_actor_steps) {
+                try turn.manager.record(turn.task, "invocation_stopped", .{ .step = step, .reason = "Actor-step budget exhausted; final summary was not verifiable." });
+                try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, "The actor-step budget is exhausted. This task is paused with its completed work and evidence retained. Continue to resume remaining obligations.", "workspace_invocation_budget");
+                return;
+            }
+            if (!governance.finalizing and step + 1 >= policy.max_actor_steps) {
+                governance.pause_reason = "This invocation reached its actor-step budget. The task and evidence are retained; continue to resume with a fresh bounded invocation.";
+                governance.finalizing = true;
+                try turn.manager.record(turn.task, "invocation_budget", .{ .step = step, .reason = governance.pause_reason });
+            }
+            if (!governance.finalizing and governance.batches - governance.assessed_batches >= policy.progress_interval) {
+                try deps.push_system_notice(deps.ctx, "Checking task progress...");
+                const reply = try governManagedTask(deps, arena, &summary_accumulator, .{ .config = config, .job = job, .candidate = "", .messages = within_turn_suffix.items, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .turn_id = turn_id, .step = step, .managed = turn }, false);
+                const progress = (try std.json.parseFromSlice(task_governance.Progress, arena, reply.raw, .{})).value;
+                for (progress.remaining, 0..) |id, i| {
+                    var found = false;
+                    for (turn.task.definition.obligations) |obligation| found = found or std.mem.eql(u8, id, obligation.id);
+                    if (!found) return error.InvalidTaskGovernance;
+                    for (progress.remaining[0..i]) |previous| if (std.mem.eql(u8, previous, id)) return error.InvalidTaskGovernance;
+                }
+                const retained = try turn.beforeReview(arena, &.{});
+                try governance.observe(arena, progress, retained, policy);
+                try turn.manager.record(turn.task, "continuation_decision", .{ .step = step, .batches = governance.batches, .stalls = governance.stalls, .finalizing = governance.finalizing, .pause = governance.pause_reason, .assessment = reply.raw });
+                try within_turn_suffix.append(arena, .{ .role = .user, .content = try arena.print("Host progress assessment: {s}. Treat this as guidance against the fixed contract, not new user authority. Do not repeat completed actions.", .{reply.raw}) });
+            }
+            if (governance.finalizing) try within_turn_suffix.append(arena, .{ .role = .user, .content = if (governance.pause_reason) |reason| try arena.print("The host is pausing this invocation: {s} Provide an honest partial summary of completed work, remaining obligations, and retained evidence. Do not claim acceptance. Tools are disabled for this final summary.", .{reason}) else "The progress assessor requests a final candidate now. Summarize verified outcomes and limitations. Tools are disabled; the normal completion assessment will verify the fixed contract." });
+        };
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
         if (skills.explicit) |section| {
             if (section.text.len > 0) try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = section.text });
@@ -7555,7 +7645,9 @@ fn processQueuedPromptLoop(
                 try deps.push_text(deps.ctx, .{ .operational = "Fast mode is unavailable for this model right now; continuing at standard speed." });
                 try deps.push_text(deps.ctx, .{ .operational = "\n" });
             }
-            const tool_choice: types.ToolChoice = if (recovery_strategy == .reconcile_tool)
+            const tool_choice: types.ToolChoice = if (governance.finalizing)
+                .none
+            else if (recovery_strategy == .reconcile_tool)
                 .none
             else if (configured_first_tool_choice_pending and vision_mode != .required)
                 config.first_call_tool_choice
@@ -7577,6 +7669,7 @@ fn processQueuedPromptLoop(
                 .max_output_tokens = model_capabilities.requestOutputTokens(request_capabilities),
                 .budget = .{ .cancel_flag = config.cancel_flag },
             };
+            if (governance.finalizing) request_data.tools = .{};
             var prepared_request_body: ?[]const u8 = null;
             var request_cost_for_attempt: ?runtime_prompt_context.RequestCost = null;
             var request_images_for_attempt: usize = 0;
@@ -7878,7 +7971,7 @@ fn processQueuedPromptLoop(
                     debug_trace.logf("agent", "token progress publication failed source=gateway_error err={s}", .{@errorName(progress_err)});
                 };
                 const cancel_requested = config.cancel_flag.load(.seq_cst);
-                if (err == error.InvalidToolName and !cancel_requested) {
+                if (err == error.InvalidToolName and config.contract_review_enabled and !cancel_requested) {
                     var advertised: std.ArrayList([]const u8) = .empty;
                     try advertised.appendSlice(arena, model_request.tools.advertised_names);
                     for (model_request.tools.selected_dynamic) |tool| try advertised.append(arena, tool.name);
@@ -9671,6 +9764,11 @@ fn processQueuedPromptLoop(
             if (disposition == .completed and agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                 try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, history_text, history_replay)) continue;
 
+            if (governance.pause_reason) |reason| {
+                if (managed) |*turn| try turn.manager.record(turn.task, "paused_result", .{ .summary = history_text, .reason = reason, .remaining_contract = turn.task.definition });
+                try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, try arena.print("{s}\n\nTask paused: {s}", .{ history_text, reason }), "workspace_progress_paused");
+                return;
+            }
             // Contract completion is checked on every normal model stop, not
             // once per turn like an advisory stop hook. Failures and cancellation
             // propagate; neither can be mistaken for accepted work.
@@ -9694,6 +9792,7 @@ fn processQueuedPromptLoop(
                     }
                     if (config.cancel_flag.load(.seq_cst)) return error.Cancelled;
                     if (decision.disposition == .continue_work) {
+                        governance.finalizing = false;
                         try within_turn_suffix.append(arena, .{ .role = .assistant, .content = history_text, .provider_replay = history_replay });
                         try within_turn_suffix.append(arena, .{ .role = .user, .content = decision.feedback });
                         try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
@@ -12390,6 +12489,7 @@ fn processQueuedPromptLoop(
             );
             pending_image_ids = transition.pending_ids;
         }
+        if (effective_tool_calls.len > 0) governance.batches += 1;
         try runtime_tool_batch.appendReviewContinuationSuffix(
             config.review_enabled,
             arena,
@@ -12562,6 +12662,7 @@ fn processQueuedPromptLoop(
                 }
                 if (config.cancel_flag.load(.seq_cst)) return error.Cancelled;
                 if (decision.disposition == .continue_work) {
+                    governance.finalizing = false;
                     try within_turn_suffix.append(arena, .{ .role = .assistant, .content = raw_final, .provider_replay = final_provider_replay });
                     try within_turn_suffix.append(arena, .{ .role = .user, .content = decision.feedback });
                     try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });

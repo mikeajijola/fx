@@ -302,7 +302,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .fossil,
         .token = "fossil",
-        .usage = "fossil [init|use|status|tasks|diff|history|verify|recover|export] [PATH] [--json]",
+        .usage = "fossil [init|use|status|tasks|diff|history|verify|recover|export|migrate|query|definition show|validate|propose] [PATH] [--execution PATH] [--json]",
         .summary = "Manage the portable agent workspace",
         .options = &.{json_option},
         .details = &.{ "init defaults to omos.fossil and archives existing history.", "use remembers an absolute repository binding in your profile.", "export writes a verified clone and refuses to overwrite files." },

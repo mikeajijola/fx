@@ -50,10 +50,10 @@ TRAINING_E2E_TESTS = (
     "tui-terminal-tool.test.ts",
     "tui-native-clear-recovery.test.ts",
     "tui-gateway-stream-lifecycle.test.ts",
+    "fossil-workspace.test.ts",
 )
 
 VERIFICATION_E2E_TESTS = (
-    "fossil-workspace.test.ts",
     "slack-install.test.ts",
     "auto-mode-reliability.test.ts",
     "sessions-v2.test.ts",
@@ -374,7 +374,7 @@ class PgsoCorpusTests(unittest.TestCase):
             EXCLUDED_E2E_TESTS,
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
-        self.assertEqual(35, len(corpus.scenarios))
+        self.assertEqual(36, len(corpus.scenarios))
         self.assertEqual(62, len(corpus.candidate_scenarios))
         self.assertEqual(
             {

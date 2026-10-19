@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { cleanupIsolatedTestHome, createIsolatedTestHome, runFx } from "../evals/eval-helpers";
@@ -38,7 +39,7 @@ function fixture() {
   return { home, cwd, env, run, fossil };
 }
 
-function model(f: ReturnType<typeof fixture>, actor: (body: any, count: number) => object, assess?: (packet: any) => string | { name: string; args: object } | Promise<string | { name: string; args: object }>) {
+function model(f: ReturnType<typeof fixture>, actor: (body: any, count: number) => object, assess?: (packet: any) => string | { name: string; args: object } | Promise<string | { name: string; args: object }>, governance: { plan?: object; progress?: (packet: any) => object } = {}) {
   let actors = 0, assessments = 0;
   const packets: any[] = [];
   const server = Bun.serve({
@@ -47,15 +48,22 @@ function model(f: ReturnType<typeof fixture>, actor: (body: any, count: number) 
       if (request.method !== "POST") return Response.json({ data: [] });
       const body = await request.json() as any;
       let delta: any, reason = "stop";
-      if (body.tools?.some((tool: any) => tool.function?.name === "omos_contract_assessment")) {
+      if (body.tools?.some((tool: any) => tool.function?.name === "omos_task_plan" || tool.function?.name === "omos_progress_assessment")) {
+        const planning = body.tools.some((tool: any) => tool.function?.name === "omos_task_plan");
+        const packet = JSON.parse(body.messages.find((message: any) => message.role === "user").content);
+        const decision = planning ? governance.plan ?? { capability: "general_task", summary: "Answer the original request", obligations: [], checks: [] }
+          : governance.progress?.(packet) ?? { outcome: "continue_work", meaningful: false, evidence: [], remaining: packet.context.contract.obligations.map((o: any) => o.id), note: "No further useful progress observed" };
+        delta = { tool_calls: [{ index: 0, id: `governance-${actors}`, type: "function", function: { name: planning ? "omos_task_plan" : "omos_progress_assessment", arguments: JSON.stringify(decision) } }] };
+        reason = "tool_calls";
+      } else if (body.tools?.some((tool: any) => tool.function?.name === "omos_contract_assessment")) {
         assessments++;
         const packet = JSON.parse(body.messages.find((message: any) => message.role === "user").content);
-        packet.inspections = body.messages.filter((message: any) => message.role === "tool").map((message: any) => JSON.parse(message.content));
+        packet.inspections = [...(packet.previousInspections ?? []), ...body.messages.filter((message: any) => message.role === "tool").map((message: any) => JSON.parse(message.content))];
         packets.push(packet);
         const status = await assess?.(packet) ?? "met";
         const evidence = packet.evidence.filter((item: any) => item.complete && (item.kind === "candidate" || item.status === "success")).map((item: any) => item.id);
         delta = { tool_calls: [{ index: 0, id: `assessment-${assessments}`, type: "function", function: {
-          name: typeof status === "string" ? "omos_contract_assessment" : status.name, arguments: JSON.stringify(typeof status === "string" ? { contractId: packet.contract.id, version: packet.contract.version, obligations: [{ id: "request_complete", status, evidence: status === "met" ? evidence : [], note: status === "blocked" ? "Waiting for requested input" : "Checked host evidence" }] } : status.args),
+          name: typeof status === "string" ? "omos_contract_assessment" : status.name, arguments: JSON.stringify(typeof status === "string" ? { contractId: packet.contract.id, version: packet.contract.version, obligations: packet.contract.obligations.map((o: any) => ({ id: o.id, status, evidence: status === "met" ? evidence : [], note: status === "blocked" ? "Waiting for requested input" : "Checked host evidence" })) } : status.args),
         } }] };
         reason = "tool_calls";
       } else {
@@ -82,6 +90,255 @@ function writeMemory(content: string) {
 }
 
 describe("portable Fossil agent workspace", () => {
+  test("shares pinned OmniForm validation with the vendored validator and rejects unsupported profile policy", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const standard = join(import.meta.dir, "../../src/core/workspace/standard");
+    const seed = JSON.parse(readFileSync(join(standard, "omos.json"), "utf8"));
+    const validatorSource = readFileSync(join(standard, "validate.js"), "utf8")
+      .replace(/import schema from .*?;/, `const schema = ${readFileSync(join(standard, "omniform.schema.json"), "utf8")};`)
+      .replace('"ajv/dist/2020.js"', JSON.stringify(pathToFileURL(Bun.resolveSync("ajv/dist/2020.js", import.meta.dir)).href));
+    const validatorPath = join(f.home, "omniform-validator.mjs");
+    writeFileSync(validatorPath, validatorSource);
+    const upstream = await import(pathToFileURL(validatorPath).href);
+    const semanticSource = new Bun.Transpiler({ loader: "ts" }).transformSync(readFileSync(join(standard, "semantic.ts"), "utf8"))
+      .replace('"zod"', JSON.stringify(pathToFileURL(Bun.resolveSync("zod", import.meta.dir)).href));
+    const semanticPath = join(f.home, "omniform-semantic.mjs");
+    writeFileSync(semanticPath, semanticSource);
+    const sharedSemantic = await import(pathToFileURL(semanticPath).href);
+    const variants: Array<{ change: (v: any) => void; valid: boolean; upstreamValid?: boolean }> = [
+      { change() {}, valid: true },
+      { change(v) { v.apiVersion = "wrong/v1"; }, valid: false },
+      { change(v) { v.spec.unknown = true; }, valid: false },
+      { change(v) { v.metadata.id = "9_invalid"; }, valid: false },
+      { change(v) { v.spec.capabilities.push(v.spec.capabilities[0]); }, valid: false },
+      { change(v) { v.spec.realisations[0].participants[0].resource = "missing"; }, valid: false },
+      { change(v) { v.spec.operations[0].input.format = "executable"; }, valid: false, upstreamValid: true },
+      { change(v) { v.spec.operations[0].approval = "required"; }, valid: false, upstreamValid: true },
+      { change(v) { delete v.spec.semantic.version; }, valid: false },
+      { change(v) { v.spec.semantic.search = { version: 1, ranking: { relevance: 1, precedent: 1, evidence: 1, recency: 1 } }; }, valid: false },
+      { change(v) { v.spec.semantic.relationships = [{ id: "self", from: "omos_task", to: "omos_task", kind: "containment" }]; }, valid: false },
+    ];
+    for (const [index, variant] of variants.entries()) {
+      const value = structuredClone(seed);
+      variant.change(value);
+      const base = structuredClone(value);
+      delete base.spec.semantic;
+      const structural = upstream.validateStructure(base);
+      const semantic = structural.valid ? upstream.validateSemantics(base) : { valid: false };
+      const semanticValid = sharedSemantic.validateSemantics(value.spec.semantic, value.spec.capabilities.map((c: any) => c.id)).length === 0;
+      expect(structural.valid && semantic.valid && semanticValid, `upstream fixture ${index}`).toBe(variant.upstreamValid ?? variant.valid);
+      const path = join(f.home, `declaration-${index}.json`);
+      writeFileSync(path, JSON.stringify(value));
+      const result = await f.run(["fossil", "definition", "validate", path, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout).model_data.valid, `native fixture ${index}`).toBe(variant.valid);
+    }
+  }, 90000);
+
+  test("activates additive proposals for future tasks and retains incompatible proposals inactive", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    model(f, () => ({ content: "Retained task" }), () => "blocked");
+    expect((await f.run(["ask", "Keep this task open", "--json"])).code).toBe(1);
+    const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    const before = JSON.parse((await f.run(["fossil", "definition", "show", "--json"])).stdout).model_data;
+    const value = structuredClone(before.declaration);
+    value.spec.semantic.entityTypes.push({ id: "company_note", fields: { text: "string" }, required: ["text"] });
+    const path = join(f.home, "proposal.json");
+    writeFileSync(path, JSON.stringify(value));
+    const added = await f.run(["fossil", "definition", "propose", path, "--json"]);
+    expect(added.code, added.stderr).toBe(0);
+    expect(JSON.parse(added.stdout).model_data.state).toBe("activated");
+    const pinned = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    expect(pinned.model_basis).toEqual(task.model_basis);
+    const after = JSON.parse((await f.run(["fossil", "definition", "show", "--json"])).stdout).model_data;
+    expect(after.basis.definition_hash).not.toBe(before.basis.definition_hash);
+    value.spec.semantic.entityTypes[0].fields.objective = "boolean";
+    writeFileSync(path, JSON.stringify(value));
+    const incompatible = await f.run(["fossil", "definition", "propose", path, "--json"]);
+    expect(incompatible.code, incompatible.stderr).toBe(0);
+    expect(JSON.parse(incompatible.stdout).model_data.state).toBe("inactive");
+    expect(JSON.parse((await f.run(["fossil", "definition", "show", "--json"])).stdout).model_data.basis.definition_hash).toBe(after.basis.definition_hash);
+    expect(f.fossil("ls", "-r", "trunk").split("\n").filter(path => path.startsWith("proposals/"))).toHaveLength(2);
+    expect((await f.run(["fossil", "migrate"])).code).toBe(0);
+  }, 120000);
+
+  test("stops a repeated successful search after three stalled progress checks", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const m = model(f, (body, count) => body.tool_choice === "none" ? { content: "The search is unfinished. The repeated results are retained." } : {
+      tool_calls: [{ index: 0, id: `search-${count}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "read", path: "workspace.json" }) } }],
+    });
+    const result = await f.run(["ask", "Inspect the workspace repeatedly until useful information is found", "--json"], {}, 180000);
+    expect(result.code, result.stderr).toBe(1);
+    expect(result.stdout).toContain("Task paused");
+    expect(m.counts().actors).toBe(13);
+    expect(m.counts().assessments).toBe(0);
+    const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    expect(task.state).toBe("paused");
+    expect(f.fossil("ls", "-r", "trunk")).not.toContain(`tasks/${task.id}`);
+  }, 180000);
+
+  test("reserves the last actor slot for a summary and resets the invocation budget on continue", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const seed = JSON.parse(readFileSync(join(import.meta.dir, "../../src/core/workspace/standard/omos.json"), "utf8"));
+    const declaration = join(f.home, "same-definition.json");
+    const execution = join(f.home, "execution.json");
+    writeFileSync(declaration, JSON.stringify(seed));
+    writeFileSync(execution, JSON.stringify({ defaults: { max_actor_steps: 3 } }));
+    expect((await f.run(["fossil", "definition", "propose", declaration, "--execution", execution, "--json"])).code).toBe(0);
+    const m = model(f, (body, count) => body.tool_choice === "none" ? { content: "Two workspace inspections completed; further work remains." } : {
+      tool_calls: [{ index: 0, id: `inspect-${count}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "read", path: "workspace.json" }) } }],
+    });
+    const first = await f.run(["ask", "Inspect this workspace until a useful result is found", "--json"], {}, 120000);
+    expect(first.code, first.stderr).toBe(1);
+    expect(first.stdout).toContain("actor-step budget");
+    expect(m.counts().actors).toBe(3);
+    const session = JSON.parse(first.stdout).session_id;
+    const second = await f.run(["ask", "--resume-id", session, "continue", "--json"], {}, 120000);
+    expect(second.code, second.stderr).toBe(1);
+    expect(m.counts().actors).toBe(6);
+    expect(m.counts().assessments).toBe(0);
+  }, 180000);
+
+  test("a progress finalize decision still passes the independent completion gate", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const m = model(f, (body, count) => body.tool_choice === "none" ? { content: "This is an omos agent workspace." } : {
+      tool_calls: [{ index: 0, id: `inspect-${count}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "read", path: "workspace.json" }) } }],
+    }, undefined, { progress: () => ({ outcome: "finalize", meaningful: false, evidence: [], remaining: ["request_complete"], note: "The actor has enough information to answer" }) });
+    const result = await f.run(["ask", "Identify the workspace kind", "--json"], {}, 120000);
+    expect(result.code, result.stderr).toBe(0);
+    expect(m.counts()).toEqual({ actors: 5, assessments: 1 });
+    expect(JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0].state).toBe("accepted");
+  }, 120000);
+
+  test("pins a coding plan and validates the final source before publication", async () => {
+    const f = fixture();
+    writeFileSync(join(f.cwd, ".gitignore"), "omos.fossil\n");
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const commands = ["printf 'verified\\n' > answer.txt", "test \"$(cat answer.txt)\" = verified"];
+    const m = model(f, (_body, count) => count <= 2 ? {
+      tool_calls: [{ index: 0, id: `coding-${count}`, type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", command: commands[count - 1], timeout_ms: 10000 } }) } }],
+    } : { content: "Created answer.txt with verified and ran the content check successfully." }, undefined, { plan: { capability: "coding_task", summary: "Create and check answer.txt", obligations: [], checks: [commands[1]] } });
+    const result = await f.run(["ask", "Implement answer.txt containing verified and test its contents", "--json"], {}, 120000);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(readFileSync(join(f.cwd, "answer.txt"), "utf8")).toBe("verified\n");
+    expect(m.counts()).toEqual({ actors: 3, assessments: 1 });
+    const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    expect(task.model_basis.capability).toBe("coding_task");
+    expect(task.definition.obligations.map((o: any) => o.id)).toEqual(["request_complete", "coding_validation", "coding_summary"]);
+    expect(task.state).toBe("accepted");
+  }, 120000);
+
+  test("migrates a legacy workspace with a backup while retaining its task contract", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const tree = join(f.home, "legacy-checkout");
+    mkdirSync(tree);
+    const fossil = (...args: string[]) => {
+      const result = spawnSync("fossil", args, { cwd: tree, env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, USER: "omos", LC_ALL: "C" }, encoding: "utf8" });
+      expect(result.status, result.stderr).toBe(0);
+    };
+    fossil("open", "--nosync", join(f.cwd, "omos.fossil"), "trunk");
+    const manifest = JSON.parse(readFileSync(join(tree, "workspace.json"), "utf8"));
+    manifest.format = 1;
+    writeFileSync(join(tree, "workspace.json"), JSON.stringify(manifest));
+    fossil("rm", "omniform/company.json", "execution/omos.json");
+    fossil("commit", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", "Construct legacy fixture");
+    model(f, () => ({ content: "Retain the original task" }), () => "blocked");
+    expect((await f.run(["ask", "Retain the original task", "--json"])).code).toBe(1);
+    const old = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    expect(old.model_basis).toBeNull();
+    const migrated = await f.run(["fossil", "migrate", "--json"], {}, 120000);
+    expect(migrated.code, migrated.stderr).toBe(0);
+    expect(readdirSync(f.cwd).filter(path => path.includes(".pre-omniform-") && path.endsWith(".fossil"))).toHaveLength(1);
+    const saved = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    expect(saved.definition).toEqual(old.definition);
+    expect(saved.model_basis).toBeNull();
+    expect((await f.run(["fossil", "migrate"])).code).toBe(0);
+    expect(readdirSync(f.cwd).filter(path => path.includes(".pre-omniform-") && path.endsWith(".fossil"))).toHaveLength(1);
+    expect((await f.run(["ask", "Start another task", "--json"])).code).toBe(1);
+    const tasks = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks;
+    expect(tasks.find((t: any) => t.id !== old.id).model_basis.definition_hash).toHaveLength(64);
+  }, 150000);
+
+  test("rejects coding validation after source changes during review and requires a current check", async () => {
+    const f = fixture();
+    writeFileSync(join(f.cwd, ".gitignore"), "omos.fossil\n");
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let changed = false;
+    const m = model(f, (_body, count) => count === 1 || count === 2 || count === 4 ? {
+      tool_calls: [{ index: 0, id: `code-${count}`, type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", command: count === 1 ? "touch answer.txt" : "test -f answer.txt", timeout_ms: 10000 } }) } }],
+    } : { content: "Created answer.txt and checked that it exists." }, () => {
+      if (!changed) { writeFileSync(join(f.cwd, "answer.txt"), "A concurrent source edit"); changed = true; }
+      return "met";
+    }, { plan: { capability: "coding_task", summary: "Create and test a file", obligations: [], checks: ["test -f answer.txt"] } });
+    const result = await f.run(["ask", "Implement answer.txt and test that it exists", "--json"], {}, 150000);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(m.counts()).toEqual({ actors: 5, assessments: 2 });
+  }, 150000);
+
+  test("does not execute a repeated invalid tool proposal", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const m = model(f, (_body, count) => ({ tool_calls: [{ index: 0, id: `invalid-${count}`, type: "function", function: { name: "mcp_nonexistent_tool", arguments: "{}" } }] }));
+    const result = await f.run(["ask", "Use the configured tools", "--json"]);
+    expect(result.code).toBe(1);
+    expect(m.counts().actors).toBe(2);
+    expect(m.counts().assessments).toBe(0);
+  }, 60000);
+
+  test("verifies file manifests and rejects a byte mismatch", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const manifest = JSON.stringify({ files: [{ path: "memory/preference.md", bytes: 5, sha256: createHash("sha256").update("hello").digest("hex") }] });
+    const m = model(f, (_body, count) => count === 1 ? writeMemory("hello") : count === 2 ? {
+      tool_calls: [{ index: 0, id: "save-manifest", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", path: "memory/manifest.json", content: manifest }) } }],
+    } : count === 3 ? { tool_calls: [{ index: 0, id: "verify-files", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "verify_manifest", path: "memory/manifest.json" }) } }] }
+      : { content: "The file matches the manifest." });
+    const result = await f.run(["ask", "Save hello and verify it against the file manifest", "--json"], {}, 120000);
+    expect(result.code, result.stderr).toBe(0);
+    expect(m.packets.at(-1).evidence.find((e: any) => e.tool === "fossil_workspace" && e.arguments?.includes("verify_manifest")).content).toContain("verified");
+    const bad = model(f, (_body, count) => count === 1 ? writeMemory("other") : count === 2 ? {
+      tool_calls: [{ index: 0, id: "verify-mismatch", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "verify_manifest", path: "memory/manifest.json" }) } }],
+    } : { content: "The changed bytes do not match." }, () => "blocked");
+    expect((await f.run(["ask", "Replace hello with other and check the old manifest", "--json"])).code).toBe(1);
+    expect(bad.packets.at(-1).evidence.find((e: any) => e.arguments?.includes("verify_manifest")).status).toBe("failure");
+  }, 150000);
+
+  test("discovers declared capabilities and validates custom records without granting host authority", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const declaration = JSON.parse(readFileSync(join(import.meta.dir, "../../src/core/workspace/standard/omos.json"), "utf8"));
+    declaration.spec.semantic.entityTypes.push({ id: "company_note", fields: { text: "string" }, required: ["text"] });
+    declaration.spec.capabilities.push({ ...structuredClone(declaration.spec.capabilities[0]), id: "cv_builder", name: "Custom CV builder", realisations: ["cv_builder_native"] });
+    declaration.spec.realisations.push({ ...structuredClone(declaration.spec.realisations[0]), id: "cv_builder_native", capability: "cv_builder" });
+    declaration.spec.operations.push({ ...structuredClone(declaration.spec.operations[0]), id: "build_cv", capability: "cv_builder" });
+    const path = join(f.home, "declaration.json");
+    writeFileSync(path, JSON.stringify(declaration));
+    expect((await f.run(["fossil", "definition", "propose", path, "--json"])).code).toBe(0);
+    const inputs = [
+      { name: "capability_search", args: { query: "cv_builder" } },
+      { name: "fossil_workspace", args: { action: "record", entity: "company_note", content: JSON.stringify({ text: "Retained company fact" }) } },
+      { name: "fossil_workspace", args: { action: "query", entity: "company_note" } },
+      { name: "fossil_workspace", args: { action: "record", entity: "omos_evidence", content: JSON.stringify({ task: "forged", records: [] }) } },
+    ];
+    const m = model(f, (_body, count) => count <= inputs.length ? {
+      tool_calls: [{ index: 0, id: `record-${count}`, type: "function", function: { name: inputs[count - 1].name, arguments: JSON.stringify(inputs[count - 1].args) } }],
+    } : { content: "The typed note was saved; host evidence remains protected." });
+    const result = await f.run(["ask", "Discover the CV capability, save and query a typed note, and check that host evidence cannot be forged", "--json"], {}, 150000);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    const evidence = m.packets.at(-1).evidence;
+    const discovered = JSON.parse(evidence.find((e: any) => e.tool === "capability_search").content);
+    expect(discovered.workspace_capabilities[0].id).toBe("cv_builder");
+    expect(discovered.workspace_capabilities[0].availability).toBe("declared_only");
+    expect(evidence.find((e: any) => e.arguments?.includes('"action":"query"')).content).toContain("Retained company fact");
+    expect(evidence.find((e: any) => e.arguments?.includes("omos_evidence")).status).toBe("failure");
+  }, 150000);
+
   test("reviews retained evidence beyond the former aggregate limit through bounded pages", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
@@ -89,7 +346,7 @@ describe("portable Fossil agent workspace", () => {
     const target = "tool:fixture:0";
     const m = model(f, () => ({ content: "The retained receipt confirms the requested outcome." }), packet => {
       if (!seeded) return "blocked";
-      const previous = packet.inspections.at(-1);
+      const previous = packet.inspections.filter((page: any) => page.id === target).at(-1);
       if (!previous || previous.nextOffset !== null) return {
         name: "omos_review_evidence", args: { action: "read", id: target, offset: previous?.nextOffset ?? 0 },
       };
@@ -114,19 +371,25 @@ describe("portable Fossil agent workspace", () => {
     mkdirSync(history, { recursive: true });
     for (let i = 0; i < 36; i++) {
       const value = JSON.stringify({ kind: "tool_evidence", task: task.id, contract_version: task.definition.version,
-        value: [{ id: `tool:fixture:${i}`, kind: "tool", tool: "fixture_receipt", arguments: "{}", status: "success", content: JSON.stringify({ receipt: "confirmed", padding: "x".repeat(24576) }) }],
+        value: [{ id: `tool:fixture:${i}`, kind: "tool", tool: "fixture_receipt", arguments: "{}", status: "success", content: JSON.stringify({ receipt: "confirmed", padding: "x".repeat(i === 0 ? 184926 : 24576) }) }],
       });
       writeFileSync(join(history, createHash("sha256").update(value).digest("hex") + ".json"), value);
     }
     fossil("addremove");
     fossil("commit", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", "Retain fixture evidence");
     seeded = true;
+    const pending = await f.run(["ask", "--resume-id", session, "continue", "--json"], {}, 120000);
+    expect(pending.code, pending.stderr).toBe(1);
+    expect(pending.stderr).toContain("ContractReviewPending");
+    const actorCount = m.counts().actors;
     const resumed = await f.run(["ask", "--resume-id", session, "continue", "--json"], {}, 120000);
     expect(resumed.code, resumed.stderr).toBe(0);
+    expect(m.counts().actors).toBe(actorCount);
+    expect(m.packets.at(-1).previousInspections.length).toBeGreaterThan(0);
     expect(m.packets.at(-1).inspections.at(-1).fullyInspected).toBe(true);
     expect(m.packets.every(packet => JSON.stringify(packet).length < 524288)).toBe(true);
     expect(m.packets.at(-1).evidence.find((item: any) => item.id === target).complete).toBe(false);
-  }, 120000);
+  }, 240000);
 
   test("corrects one unadvertised tool proposal without executing it", async () => {
     const f = fixture();
