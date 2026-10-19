@@ -1,6 +1,7 @@
 //! Shared OmniForm declarations and the explicitly versioned native host profile.
 const std = @import("std");
 const schema = @import("declaration_schema.zig");
+const record_json = @import("../shared/record_json.zig");
 const Value = std.json.Value;
 const Allocator = std.mem.Allocator;
 
@@ -142,7 +143,7 @@ pub fn parse(alloc: Allocator, bytes: []const u8) !Declaration {
 }
 
 pub fn parseExecution(alloc: Allocator, bytes: []const u8) !Execution {
-    const execution = (try std.json.parseFromSlice(Execution, alloc, bytes, .{})).value;
+    const execution = try record_json.decode(Execution, alloc, bytes, .{});
     const p = execution.defaults;
     if (!std.mem.eql(u8, execution.version, "omos.execution/v1") or p.progress_interval == 0 or p.progress_interval > 100 or p.stalled_checks == 0 or p.stalled_checks > 20 or p.max_actor_steps < 2 or p.max_actor_steps > 10000) return error.InvalidExecutionPolicy;
     return execution;

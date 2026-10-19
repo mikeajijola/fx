@@ -6,6 +6,13 @@ pub fn decode(comptime T: type, alloc: std.mem.Allocator, bytes: []const u8, opt
     return std.json.parseFromValueLeaky(T, alloc, try tokens(alloc, bytes, options), options);
 }
 
+/// Preserve the standard Parsed(T) ownership interface for public contracts.
+pub fn parse(comptime T: type, alloc: std.mem.Allocator, bytes: []const u8, options: std.json.ParseOptions) !std.json.Parsed(T) {
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    return std.json.parseFromValue(T, alloc, try tokens(scratch.allocator(), bytes, options), options);
+}
+
 // Share the tokenizer rather than generating one for every host record type.
 // Numeric text stays exact until conversion to the declared integer width.
 noinline fn tokens(alloc: std.mem.Allocator, bytes: []const u8, options: std.json.ParseOptions) !std.json.Value {

@@ -10,6 +10,8 @@ const configured_provider = @import("../../config/configured_provider.zig");
 const model_provider = @import("../../config/model_provider.zig");
 const retained_evidence = @import("review_evidence.zig");
 const checkpoints = @import("review_checkpoints.zig");
+const review_budget = @import("review_budget.zig");
+const record_json = @import("../../shared/record_json.zig");
 
 // Installed once by the CLI composition root, before starting workers.
 var named_invocation = false;
@@ -212,7 +214,7 @@ fn collectSteering(alloc: std.mem.Allocator, input: Input) ![]const []const u8 {
 }
 
 fn verifyReferences(alloc: std.mem.Allocator, raw: []const u8, evidence: []const Evidence) !void {
-    const assessment = try std.json.parseFromSlice(work_contract.Assessment, alloc, raw, .{});
+    const assessment = try record_json.parse(work_contract.Assessment, alloc, raw, .{});
     defer assessment.deinit();
     for (assessment.value.obligations) |report| {
         for (report.evidence) |id| {
@@ -301,7 +303,7 @@ pub fn assess(alloc: std.mem.Allocator, provider: streams.Provider, input: Input
     var usage: types.Usage = .{};
     for (0..8) |_| {
         if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-        if ((try std.json.Stringify.valueAlloc(alloc, messages.items, .{})).len > 512 * 1024) return error.ContractReviewPending;
+        if (try review_budget.serializedBytes(alloc, messages.items) > 512 * 1024) return error.ContractReviewPending;
         request.messages = messages.items;
         var result = try gateway_step.streamModelCompletion(provider, alloc, request);
         defer result.deinit(alloc);
@@ -332,7 +334,7 @@ pub fn assess(alloc: std.mem.Allocator, provider: streams.Provider, input: Input
         var decision = try work_contract.assess(alloc, definition, call.arguments_json);
         errdefer alloc.free(decision.feedback);
         try verifyReferences(alloc, call.arguments_json, evidence);
-        const assessment = try std.json.parseFromSlice(work_contract.Assessment, alloc, call.arguments_json, .{});
+        const assessment = try record_json.parse(work_contract.Assessment, alloc, call.arguments_json, .{});
         defer assessment.deinit();
         var unread: std.ArrayList([]const u8) = .empty;
         if (decision.disposition == .fulfilled) for (evidence) |record| {

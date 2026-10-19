@@ -10,6 +10,8 @@ const review = @import("../agent/runtime/completion_review.zig");
 const evidence_mod = @import("../agent/runtime/review_evidence.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model = @import("definition.zig");
+const review_budget = @import("../agent/runtime/review_budget.zig");
+const record_json = @import("../shared/record_json.zig");
 
 pub const Plan = struct { capability: []const u8, summary: []const u8, obligations: []const contract.Obligation = &.{}, checks: []const []const u8 = &.{} };
 pub const Progress = struct { outcome: enum { continue_work, finalize, pause }, meaningful: bool, evidence: []const []const u8 = &.{}, remaining: []const []const u8, note: []const u8 };
@@ -21,7 +23,7 @@ pub const State = struct {
     finalizing: bool = false,
     pause_reason: ?[]const u8 = null,
 
-    pub fn observe(self: *State, alloc: std.mem.Allocator, result: Progress, records: []const review.Evidence, policy: model.Policy) !void {
+    pub noinline fn observe(self: *State, alloc: std.mem.Allocator, result: Progress, records: []const review.Evidence, policy: model.Policy) !void {
         var novel = false;
         for (result.evidence) |id| for (records) |record| {
             if (!std.mem.eql(u8, id, record.id)) continue;
@@ -35,14 +37,18 @@ pub const State = struct {
         if (self.stalls >= policy.stalled_checks) self.pause_reason = "Progress checks found no further useful progress. The task and evidence are retained; continue after changing the approach or providing missing information.";
         self.finalizing = result.outcome == .finalize or self.pause_reason != null;
     }
-    pub fn seed(self: *State, alloc: std.mem.Allocator, records: []const review.Evidence) !void {
+    pub noinline fn seed(self: *State, alloc: std.mem.Allocator, records: []const review.Evidence) !void {
         for (records) |record| if (try recordKey(alloc, record)) |identity| try self.seen.put(alloc, identity, {});
     }
-    fn recordKey(alloc: std.mem.Allocator, record: review.Evidence) !?[]const u8 {
+    noinline fn recordKey(alloc: std.mem.Allocator, record: review.Evidence) !?[]const u8 {
         if (record.kind == .tool and record.status != .success) return null;
         if (record.kind != .tool and !std.mem.startsWith(u8, record.id, "workspace-file:") and !std.mem.startsWith(u8, record.id, "source-state:")) return null;
-        const value = (try std.json.parseFromSlice(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, .{ .tool = record.tool, .arguments = record.arguments, .content = record.content }, .{}), .{})).value;
-        return try model.digest(alloc, value);
+        // This fixed string/null object is already in canonical key order.
+        const bytes = try std.json.Stringify.valueAlloc(alloc, .{ .arguments = record.arguments, .content = record.content, .tool = record.tool }, .{});
+        defer alloc.free(bytes);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        return try alloc.dupe(u8, &std.fmt.bytesToHex(&digest, .lower));
     }
 };
 
@@ -109,7 +115,7 @@ fn invoke(alloc: std.mem.Allocator, provider: streams.Provider, base: streams.Mo
     var usage: types.Usage = .{};
     for (0..8) |_| {
         if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-        if ((try std.json.Stringify.valueAlloc(alloc, messages.items, .{})).len > 512 * 1024) return error.TaskGovernancePending;
+        if (try review_budget.serializedBytes(alloc, messages.items) > 512 * 1024) return error.TaskGovernancePending;
         request.messages = messages.items;
         var result = try gateway.streamModelCompletion(provider, alloc, request);
         defer result.deinit(alloc);
@@ -124,7 +130,7 @@ fn invoke(alloc: std.mem.Allocator, provider: streams.Provider, base: streams.Mo
         try journal.record(if (std.mem.eql(u8, call.name, page_schema.name)) "governance_evidence_access" else if (std.mem.eql(u8, function.name, plan_schema.name)) "planning_assessment" else "progress_assessment", call.arguments_json);
         if (std.mem.eql(u8, call.name, function.name)) {
             if (std.mem.eql(u8, function.name, progress_schema.name)) {
-                const decision = (try std.json.parseFromSlice(Progress, alloc, call.arguments_json, .{})).value;
+                const decision = try record_json.decode(Progress, alloc, call.arguments_json, .{});
                 if (decision.note.len == 0 or decision.note.len > 4096 or decision.evidence.len > 100 or decision.remaining.len > 100) return error.InvalidTaskGovernance;
                 if (decision.meaningful and decision.evidence.len == 0) return error.InvalidTaskGovernance;
                 for (decision.evidence) |id| {
@@ -143,6 +149,21 @@ fn invoke(alloc: std.mem.Allocator, provider: streams.Provider, base: streams.Mo
         try messages.append(alloc, .{ .role = .tool, .tool_call_id = try alloc.dupe(u8, call.id), .tool_name = try alloc.dupe(u8, call.name), .tool_result_status = .success, .content = page });
     }
     return error.TaskGovernancePending;
+}
+
+test "workspace progress identities preserve canonical evidence hashes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const records = [_]review.Evidence{
+        .{ .id = "first", .tool = "read_file", .status = .success, .content = "quoted \"\n\x00 UTF-8 \xc3\xa9", .arguments = "{\"path\":\"file\"}" },
+        .{ .id = "second", .status = .success, .content = "", .arguments = null },
+        .{ .id = "source-state:fixture", .kind = .verification, .content = "current source bytes" },
+    };
+    for (records) |record| {
+        const original = (try std.json.parseFromSlice(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, .{ .tool = record.tool, .arguments = record.arguments, .content = record.content }, .{}), .{})).value;
+        try std.testing.expectEqualStrings(try model.digest(alloc, original), (try State.recordKey(alloc, record)).?);
+    }
 }
 
 test "workspace progress does not treat new call IDs or repeated results as progress" {

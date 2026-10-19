@@ -1,5 +1,6 @@
 const work_contract = @import("work_contract.zig");
 const task_governance = @import("../../workspace/task_governance.zig");
+const record_json = @import("../../shared/record_json.zig");
 const managed_task = @import("../../workspace/managed_task.zig");
 const completion_review = @import("completion_review.zig");
 const std = @import("std");
@@ -6827,9 +6828,10 @@ test "compaction activity transaction settles only after publication and preserv
     }
 }
 
+// Auxiliary calls synchronously borrow the turn configuration and job.
 const ContractCandidate = struct {
-    config: Config,
-    job: worker_runtime.QueuedPrompt,
+    config: *const Config,
+    job: *const worker_runtime.QueuedPrompt,
     candidate: []const u8,
     messages: []const ChatMessage,
     api_key: []const u8,
@@ -6871,7 +6873,7 @@ noinline fn assessCompletionContract(
         .messages = input.messages,
         .request = .{
             .observer = deps.observer,
-            .credential = activeCredentialLease(input.api_key, input.job),
+            .credential = activeCredentialLease(input.api_key, input.job.*),
             .model = if (input.config.contract_review_model.len > 0) input.config.contract_review_model else input.model,
             .retry_count = 1,
             .messages = &.{},
@@ -6914,7 +6916,7 @@ noinline fn governManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, s
     var context: u8 = 0;
     const request: agent_stream_provider.ModelRequest = .{
         .observer = deps.observer,
-        .credential = activeCredentialLease(input.api_key, input.job),
+        .credential = activeCredentialLease(input.api_key, input.job.*),
         .model = if (input.config.contract_review_model.len > 0) input.config.contract_review_model else input.model,
         .retry_count = 1,
         .messages = &.{},
@@ -7083,8 +7085,8 @@ fn processQueuedPromptLoop(
         if (turn.review_only_candidate) |candidate| {
             try deps.push_system_notice(deps.ctx, "Resuming verification of the retained answer; completed actions will not be repeated.");
             const decision = try assessCompletionContract(deps, arena, &summary_accumulator, .{
-                .config = config,
-                .job = job,
+                .config = &config,
+                .job = &job,
                 .candidate = candidate,
                 .messages = &.{},
                 .api_key = active_api_key,
@@ -7114,8 +7116,8 @@ fn processQueuedPromptLoop(
     if (managed) |*turn| {
         if (turn.task.model_basis) |basis| if (basis.capability == null) {
             try deps.push_system_notice(deps.ctx, "Planning against the pinned workspace model...");
-            const reply = try governManagedTask(deps, arena, &summary_accumulator, .{ .config = config, .job = job, .candidate = "", .messages = &.{}, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .turn_id = turn_id, .step = 0, .managed = turn }, true);
-            const plan = (try std.json.parseFromSlice(task_governance.Plan, arena, reply.raw, .{})).value;
+            const reply = try governManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = &.{}, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .turn_id = turn_id, .step = 0, .managed = turn }, true);
+            const plan = try record_json.decode(task_governance.Plan, arena, reply.raw, .{});
             if (!std.mem.eql(u8, plan.capability, "coding_task") and !std.mem.eql(u8, plan.capability, "general_task")) return error.UnboundCapability;
             turn.task = try turn.manager.setPlan(turn.task, plan.capability, plan.summary, plan.obligations, plan.checks);
             _ = try turn.manager.checkpoint(turn.task);
@@ -7286,8 +7288,8 @@ fn processQueuedPromptLoop(
             }
             if (!governance.finalizing and governance.batches - governance.assessed_batches >= policy.progress_interval) {
                 try deps.push_system_notice(deps.ctx, "Checking task progress...");
-                const reply = try governManagedTask(deps, arena, &summary_accumulator, .{ .config = config, .job = job, .candidate = "", .messages = within_turn_suffix.items, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .turn_id = turn_id, .step = step, .managed = turn }, false);
-                const progress = (try std.json.parseFromSlice(task_governance.Progress, arena, reply.raw, .{})).value;
+                const reply = try governManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = within_turn_suffix.items, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .turn_id = turn_id, .step = step, .managed = turn }, false);
+                const progress = try record_json.decode(task_governance.Progress, arena, reply.raw, .{});
                 for (progress.remaining, 0..) |id, i| {
                     var found = false;
                     for (turn.task.definition.obligations) |obligation| found = found or std.mem.eql(u8, id, obligation.id);
@@ -9814,8 +9816,8 @@ fn processQueuedPromptLoop(
             if (disposition == .completed) {
                 if (contract_enabled) {
                     const decision = try assessCompletionContract(deps, arena, &summary_accumulator, .{
-                        .config = config,
-                        .job = job,
+                        .config = &config,
+                        .job = &job,
                         .candidate = history_text,
                         .managed = if (managed) |*turn| turn else null,
                         .messages = within_turn_suffix.items,
@@ -12684,8 +12686,8 @@ fn processQueuedPromptLoop(
             // results. It must pass the same gate as a text-only completion.
             if (contract_enabled) {
                 const decision = try assessCompletionContract(deps, arena, &summary_accumulator, .{
-                    .config = config,
-                    .job = job,
+                    .config = &config,
+                    .job = &job,
                     .candidate = raw_final,
                     .managed = if (managed) |*turn| turn else null,
                     .messages = within_turn_suffix.items,

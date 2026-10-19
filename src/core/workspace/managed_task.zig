@@ -3,6 +3,7 @@ const std = @import("std");
 const workspace = @import("fossil_workspace.zig");
 const types = @import("../shared/types.zig");
 const review = @import("../agent/runtime/completion_review.zig");
+const record_json = @import("../shared/record_json.zig");
 
 pub const Turn = struct {
     manager: workspace.Manager,
@@ -139,7 +140,7 @@ pub const Turn = struct {
         const basis = self.task.model_basis orelse return true;
         if (basis.capability == null or !std.mem.eql(u8, basis.capability.?, "coding_task")) return true;
         const current = try @import("source_state.zig").fingerprint(self.manager.alloc, self.task.project_root, self.manager.repository);
-        const assessment = (try std.json.parseFromSlice(@import("../agent/runtime/work_contract.zig").Assessment, self.manager.alloc, bytes, .{})).value;
+        const assessment = try record_json.decode(@import("../agent/runtime/work_contract.zig").Assessment, self.manager.alloc, bytes, .{});
         for (assessment.obligations) |obligation| {
             if (!std.mem.eql(u8, obligation.id, "coding_validation") or obligation.status != .met) continue;
             var supported = false;
