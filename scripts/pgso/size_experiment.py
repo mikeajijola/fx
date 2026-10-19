@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import shutil
+import sys
 
 from scripts.pgso import pipeline as p
 from scripts.pgso.model import sha256_file
@@ -16,16 +17,16 @@ def main():
     for name in ["seed", "retained", "output"]:
         parser.add_argument("--" + name, type=pathlib.Path, required=True)
     parser.add_argument("--llvm-bin", required=True)
-    parser.add_argument("--mode", choices=["rounds", "helpers", "backend", "os", "oz"], required=True)
+    parser.add_argument("--mode", choices=["rounds", "helpers", "backend", "os", "oz", "baseline", "generic", "namespace"], required=True)
     parser.add_argument("--prepared", type=pathlib.Path)
     args = parser.parse_args()
     seed = json.loads((args.seed / "manifest.json").read_text())
     identity = seed["evidence"]["identity"]
-    assert identity["source_sha"] == "213024a309ccac3dc502386c97581914b7f7c481"
+    assert identity["source_sha"] == "b6d78488dd1939475f91b3d31e4b8c9b61d98f21"
     bitcode = args.seed / "ir/pgso/fx.bc"
     profile = args.retained / "profiles/merged.profdata"
     assert sha256_file(bitcode) == identity["bitcode_sha256"]
-    assert sha256_file(profile) == "120076f72686ca3884e2eb7867a246862939a0db8e4f69dfab0adb52d06a8530"
+    assert sha256_file(profile) == "aa9986e895cb9c8c988586067b6ce3c2b746d9a7e002551f76d044418dd650e3"
     toolchain = Toolchain.discover("zig", args.llvm_bin, identity["target"])
     assert toolchain.llvm_version == identity["llvm_version"]
     paths = p.PipelinePaths.create(args.output)
@@ -61,6 +62,17 @@ def main():
         report["results"].append(item)
         (paths.root / "comparison.json").write_text(json.dumps(report, indent=2))
         print(json.dumps(item), flush=True)
+
+    if args.mode in ("baseline", "generic", "namespace"):
+        if args.mode != "baseline":
+            script = pathlib.Path(__file__).with_name("partition_experiment.py")
+            mapping = paths.root / "routing.json"
+            p.split_ir_argv = lambda tc, ps: (sys.executable, str(script), "split", str(tc.libllvm), str(tc.llvm_split), str(ps.profile_use_base_bitcode), str(ps.outline_split_prefix), str(mapping), args.mode)
+            p.cleanup_outlined_ir_argv = lambda tc, ps: (sys.executable, str(script), "cleanup", str(tc.libllvm), str(tc.opt), str(ps.linked_outlined_bitcode), str(ps.profile_use_bitcode), str(mapping), args.mode)
+        p.apply_profile(toolchain, paths, identity["bitcode_sha256"])
+        shutil.copy2(paths.profile_use_bitcode, paths.root / "first-pass.bc")
+        measure(args.mode)
+        return
 
     if args.mode in ("os", "oz"):
         level = "Os" if args.mode == "os" else "Oz"

@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: [os, oz]
+        mode: [baseline, generic, namespace]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Setup pinned tools
@@ -28,24 +28,17 @@ jobs:
       - name: Download retained seed
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: pgso-seed-213024a309ccac3dc502386c97581914b7f7c481-attempt-1
-          run-id: 39241275744
+          name: pgso-seed-b6d78488dd1939475f91b3d31e4b8c9b61d98f21-attempt-1
+          run-id: 39257938998
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/seed
       - name: Download retained production profile
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: pgso-candidate-213024a309ccac3dc502386c97581914b7f7c481-attempt-1
-          run-id: 39241275744
+          name: pgso-candidate-b6d78488dd1939475f91b3d31e4b8c9b61d98f21-attempt-1
+          run-id: 39257938998
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/retained
-      - name: Download retained optimized IR
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: pgso-size-comparison-rounds
-          run-id: 39255725083
-          github-token: ${{ github.token }}
-          path: ${{ runner.temp }}/prepared
       - name: Compare immutable inputs without release eligibility
         run: >-
           python3 -m scripts.pgso.size_experiment
@@ -54,7 +47,6 @@ jobs:
           --output "$RUNNER_TEMP/comparison"
           --llvm-bin "${{ steps.setup.outputs.llvm-bin }}"
           --mode "${{ matrix.mode }}"
-          --prepared "$RUNNER_TEMP/prepared"
       - name: Upload comparison only
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -62,6 +54,7 @@ jobs:
           name: pgso-size-comparison-${{ matrix.mode }}
           path: |
             ${{ runner.temp }}/comparison/comparison.json
+            ${{ runner.temp }}/comparison/routing.json
             ${{ runner.temp }}/comparison/logs
             ${{ runner.temp }}/comparison/*-fx
             ${{ runner.temp }}/comparison/first-pass.bc
