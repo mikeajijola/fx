@@ -17,6 +17,11 @@ The driver requires:
 - Hyperfine `1.20.0`
 - the selected source commit, update channel, bitcode hash, corpus hash, and profile-generation flags
 
+The distributed workflow uses the standard `macos-26` ARM64 runner image.
+The separate macOS compatibility workflow continues to test on `macos-15`.
+Both images use the standard M1 runner class. The pinned toolchain and
+`aarch64-macos` target preserve the minimum deployment version of macOS 15.
+
 The pipeline does not use the host CPU as the release target. The final candidate must match the control's architecture, minimum macOS version, SDK compatibility stamp, main-stack request, and dynamic-library dependency versions. It must contain a valid code signature, contain no profile sections or profile-runtime dependency, and produce no profile output when executed.
 
 Training records execution counts and first-use function timestamps in the same
