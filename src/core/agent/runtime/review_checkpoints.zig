@@ -3,6 +3,7 @@
 const std = @import("std");
 const evidence = @import("review_evidence.zig");
 const contract = @import("work_contract.zig");
+const record_json = @import("../../shared/record_json.zig");
 
 pub const Finding = struct {
     id: []const u8,
@@ -94,7 +95,7 @@ pub const Ledger = struct {
     }
 
     pub fn submit(self: *Ledger, alloc: std.mem.Allocator, view: evidence.View, raw: []const u8) ![]const u8 {
-        const segment = (try std.json.parseFromSlice(Submission, alloc, raw, .{ .allocate = .alloc_always })).value;
+        const segment = try record_json.decode(Submission, alloc, raw, .{});
         const i = try self.ordinal(segment.id);
         try self.validate(segment, view.payloads[i], self.records[i].assessed_bytes);
         // Only raw bytes delivered in this attempt may establish a new decision.
@@ -113,8 +114,8 @@ pub const Ledger = struct {
     pub fn restore(self: *Ledger, alloc: std.mem.Allocator, view: *evidence.View, saved: []const []const u8) !void {
         var receipts: std.ArrayList(Receipt) = .empty;
         for (saved) |raw| {
-            const receipt = std.json.parseFromSlice(Receipt, alloc, raw, .{}) catch continue;
-            try receipts.append(alloc, receipt.value);
+            const receipt = record_json.decode(Receipt, alloc, raw, .{}) catch continue;
+            try receipts.append(alloc, receipt);
         }
         std.mem.sort(Receipt, receipts.items, {}, struct {
             fn less(_: void, a: Receipt, b: Receipt) bool {
@@ -150,7 +151,7 @@ pub const Ledger = struct {
 
     pub fn page(self: Ledger, alloc: std.mem.Allocator, view: *evidence.View, raw: []const u8) ![]const u8 {
         const Command = struct { action: []const u8, id: ?[]const u8 = null, offset: usize = 0, limit: usize = 32 };
-        const command = (try std.json.parseFromSlice(Command, alloc, raw, .{})).value;
+        const command = try record_json.decode(Command, alloc, raw, .{});
         if (std.mem.eql(u8, command.action, "assessments")) {
             const i = try self.ordinal(command.id orelse return error.InvalidContractEvidence);
             return std.json.Stringify.valueAlloc(alloc, .{ .previousAssessments = try self.index(alloc, i, 1) }, .{});

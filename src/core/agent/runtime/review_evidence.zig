@@ -1,6 +1,7 @@
 //! Bounded views of retained evidence. A preview is never proof of unseen bytes.
 const std = @import("std");
 const types = @import("../../shared/types.zig");
+const record_json = @import("../../shared/record_json.zig");
 
 pub const Evidence = struct {
     id: []const u8,
@@ -87,9 +88,7 @@ pub const View = struct {
 
     pub fn page(self: *View, alloc: std.mem.Allocator, raw: []const u8) ![]const u8 {
         const Command = struct { action: enum { list, read }, id: ?[]const u8 = null, offset: usize = 0, limit: usize = 16384 };
-        const parsed = try std.json.parseFromSlice(Command, alloc, raw, .{});
-        defer parsed.deinit();
-        const command = parsed.value;
+        const command = try record_json.decode(Command, alloc, raw, .{});
         if (command.limit == 0) return error.InvalidEvidenceOffset;
         if (command.action == .list) {
             const entries = try self.index(alloc, command.offset, @min(command.limit, 32));
@@ -128,8 +127,7 @@ pub const View = struct {
         var pages: std.ArrayList(Saved) = .empty;
         for (saved) |raw| {
             // List replies are journaled too, but contain no record bytes.
-            const parsed = std.json.parseFromSlice(Saved, alloc, raw, .{ .ignore_unknown_fields = true }) catch continue;
-            const page_value = parsed.value;
+            const page_value = record_json.decode(Saved, alloc, raw, .{ .ignore_unknown_fields = true }) catch continue;
             try pages.append(alloc, page_value);
         }
         std.mem.sort(Saved, pages.items, {}, struct {

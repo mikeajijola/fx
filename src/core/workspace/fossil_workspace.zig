@@ -7,6 +7,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const contract = @import("../agent/runtime/work_contract.zig");
 const model = @import("definition.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const record_json = @import("../shared/record_json.zig");
 
 const Allocator = std.mem.Allocator;
 const max_bytes = 8 * 1024 * 1024;
@@ -141,7 +142,8 @@ fn writePortableValue(alloc: Allocator, writer: *std.Io.Writer, value: std.json.
 
 fn parse(alloc: Allocator, comptime T: type, data: []const u8) !T {
     // Manager memory belongs to its caller's operation/turn arena.
-    return (try std.json.parseFromSlice(T, alloc, data, .{ .allocate = .alloc_always })).value;
+    if (T == std.json.Value) return (try std.json.parseFromSlice(T, alloc, data, .{ .allocate = .alloc_always })).value;
+    return record_json.decode(T, alloc, data, .{});
 }
 
 fn mkdir(path: []const u8) !void {
@@ -355,7 +357,7 @@ pub const Manager = struct {
         _ = try self.run(null, &.{ "settings", "autosync", "off", "-R", absolute });
         const tree = try self.checkout("trunk");
         try atomicWrite(alloc, try join(alloc, tree, manifest_path), try json(alloc, self.manifest));
-        try atomicWrite(alloc, try join(alloc, tree, model.declaration_path), model.seed);
+        try atomicWrite(alloc, try join(alloc, tree, model.declaration_path), model.initial_declaration);
         try atomicWrite(alloc, try join(alloc, tree, model.execution_path), try json(alloc, model.Execution{}));
         _ = try self.commit(tree, "Initialize omos agent workspace");
         return self;
@@ -1476,7 +1478,7 @@ pub const Manager = struct {
         const tree = try self.checkout("trunk");
         var manifest = self.manifest;
         manifest.format = 2;
-        try atomicWrite(self.alloc, try join(self.alloc, tree, model.declaration_path), model.seed);
+        try atomicWrite(self.alloc, try join(self.alloc, tree, model.declaration_path), model.initial_declaration);
         try atomicWrite(self.alloc, try join(self.alloc, tree, model.execution_path), try json(self.alloc, model.Execution{}));
         try atomicWrite(self.alloc, try join(self.alloc, tree, manifest_path), try json(self.alloc, manifest));
         _ = try self.commit(tree, "Add governed workspace model; retain legacy task contracts");
@@ -1664,6 +1666,36 @@ fn temporaryRecordFile(name: []const u8) bool {
     if (!std.mem.startsWith(u8, name[base_len..], suffix)) return false;
     for (name[base_len + suffix.len ..]) |ch| if (!std.ascii.isHex(ch)) return false;
     return true;
+}
+
+test "workspace paths typed records preserve exact integers and parser rejection" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const Record = struct { signed: i64, unsigned: u64, name: []const u8 = "legacy", state: enum { active, paused } = .active };
+    for ([_][]const u8{
+        "{\"signed\":-9223372036854775808,\"unsigned\":18446744073709551615}",
+        "{\"signed\":9007199254740993,\"unsigned\":9007199254740993,\"name\":\"retained \\u0066act\",\"state\":\"paused\"}",
+        "{\"signed\":1e3,\"unsigned\":\"42\"}",
+    }) |bytes| {
+        const previous = (try std.json.parseFromSlice(Record, alloc, bytes, .{ .allocate = .alloc_always })).value;
+        const restored = try parse(alloc, Record, bytes);
+        try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(alloc, previous, .{}), try std.json.Stringify.valueAlloc(alloc, restored, .{}));
+    }
+    for ([_][]const u8{
+        "{\"signed\":0,\"unsigned\":-1}",
+        "{\"signed\":9223372036854775808,\"unsigned\":0}",
+        "{\"signed\":0,\"unsigned\":18446744073709551616}",
+        "{\"signed\":1.5,\"unsigned\":0}",
+        "{\"signed\":0,\"signed\":1,\"unsigned\":0}",
+        "{\"signed\":0,\"unsigned\":0,\"extra\":true}",
+        "{\"signed\":0,\"unsigned\":0,\"state\":\"accepted\"}",
+        "{\"signed\":0}",
+        "{\"signed\":0,\"unsigned\":0} trailing",
+    }) |bytes| {
+        if (std.json.parseFromSlice(Record, alloc, bytes, .{ .allocate = .alloc_always })) |_| return error.TestUnexpectedResult else |_| {}
+        if (parse(alloc, Record, bytes)) |_| return error.TestUnexpectedResult else |_| {}
+    }
 }
 
 test "workspace paths omit only valid atomic record temporaries" {

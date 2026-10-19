@@ -9,6 +9,33 @@ pub const standard_version = "1.0.0-alpha.7";
 pub const declaration_path = "omniform/company.json";
 pub const execution_path = "execution/omos.json";
 pub const seed = @embedFile("standard/omos.json");
+pub const initial_declaration = compactJson(seed);
+const standard_schema = compactJson(@embedFile("standard/omniform.schema.json"));
+
+// Keep the pinned source files readable while embedding only JSON token bytes.
+fn compactJson(comptime source: []const u8) []const u8 {
+    const compact = comptime blk: {
+        @setEvalBranchQuota(200000);
+        var bytes: [source.len]u8 = undefined;
+        var length: usize = 0;
+        var quoted = false;
+        var escaped = false;
+        for (source) |byte| {
+            if (!quoted and (byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n')) continue;
+            bytes[length] = byte;
+            length += 1;
+            if (escaped) {
+                escaped = false;
+            } else if (quoted and byte == '\\') {
+                escaped = true;
+            } else if (byte == '"') {
+                quoted = !quoted;
+            }
+        }
+        break :blk bytes[0..length].*;
+    };
+    return &compact;
+}
 
 pub const Policy = struct {
     progress_interval: usize = 4,
@@ -77,7 +104,7 @@ pub fn parse(alloc: Allocator, bytes: []const u8) !Declaration {
     var count: usize = 0;
     try schema.boundary(value, 0, &count);
     try publicData(value);
-    const upstream_schema = (try std.json.parseFromSlice(Value, alloc, @embedFile("standard/omniform.schema.json"), .{})).value;
+    const upstream_schema = (try std.json.parseFromSlice(Value, alloc, standard_schema, .{})).value;
     var source: std.json.ObjectMap = .empty;
     var declaration_spec: std.json.ObjectMap = .empty;
     if (value != .object or spec(value) != .object) return error.InvalidWorkspaceDefinition;
@@ -371,6 +398,22 @@ test "workspace declaration execution policy has bounded independent defaults" {
     try std.testing.expectEqual(@as(usize, 3), execution.defaults.stalled_checks);
     try std.testing.expectEqual(@as(usize, 100), execution.defaults.max_actor_steps);
     try std.testing.expectError(error.InvalidExecutionPolicy, parseExecution(arena.allocator(), "{\"defaults\":{\"max_actor_steps\":0}}"));
+}
+
+test "workspace declaration compact embeds preserve pinned JSON values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    for ([_][2][]const u8{
+        .{ seed, initial_declaration },
+        .{ @embedFile("standard/omniform.schema.json"), standard_schema },
+    }) |pair| {
+        const original = (try std.json.parseFromSlice(Value, alloc, pair[0], .{})).value;
+        const compact = (try std.json.parseFromSlice(Value, alloc, pair[1], .{})).value;
+        try std.testing.expectEqualStrings(try canonical(alloc, original), try canonical(alloc, compact));
+        try std.testing.expect(pair[1].len < pair[0].len);
+    }
+    try std.testing.expectEqualStrings("{\"text\":\"a \\\" b \\\\ c\"}", compactJson(" { \"text\" : \"a \\\" b \\\\ c\" } \n"));
 }
 
 test "workspace declaration seed shares the pinned OmniForm model and validates its references" {
