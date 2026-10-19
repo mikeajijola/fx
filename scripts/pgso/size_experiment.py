@@ -17,7 +17,7 @@ def main():
     for name in ["seed", "retained", "output"]:
         parser.add_argument("--" + name, type=pathlib.Path, required=True)
     parser.add_argument("--llvm-bin", required=True)
-    parser.add_argument("--mode", choices=["rounds", "helpers", "backend", "os", "oz", "baseline", "generic", "namespace"], required=True)
+    parser.add_argument("--mode", choices=["rounds", "helpers", "backend", "os", "oz", "baseline", "generic", "namespace", "cleanup", "promote"], required=True)
     parser.add_argument("--prepared", type=pathlib.Path)
     args = parser.parse_args()
     seed = json.loads((args.seed / "manifest.json").read_text())
@@ -62,6 +62,27 @@ def main():
         report["results"].append(item)
         (paths.root / "comparison.json").write_text(json.dumps(report, indent=2))
         print(json.dumps(item), flush=True)
+
+    if args.mode in ("cleanup", "promote"):
+        prepared = json.loads((args.prepared / "comparison.json").read_text())
+        assert prepared["baseline_source"] == identity["source_sha"]
+        assert prepared["input_bitcode_sha256"] == identity["bitcode_sha256"]
+        assert prepared["profile_sha256"] == report["profile_sha256"]
+        first = args.prepared / "first-pass.bc"
+        assert sha256_file(first) == "6cd1d7f8741ccef7fb9ea217ab7a77647a0b178f5bd579e5e17014b06955d8ba"
+        report["prepared_ir_sha256"] = sha256_file(first)
+        before = p._defined_external_symbols(toolchain, first, paths.logs / "cleanup-symbols-before.json")
+        passes = "ipsccp,deadargelim,globalopt,function(sroa,early-cse,instcombine,simplifycfg,memcpyopt,dse,adce),globaldce,mergefunc,verify"
+        if args.mode == "promote":
+            passes = "cgscc(argpromotion)," + passes
+        report["cleanup_passes"] = passes
+        command([toolchain.opt, "-passes=" + passes, first, "-o", paths.profile_use_bitcode], "extra-cleanup")
+        p.rewrite_sparse_constants(toolchain, paths)
+        after = p._defined_external_symbols(toolchain, paths.profile_use_bitcode, paths.logs / "cleanup-symbols-after.json")
+        assert before == after, "Comparison changed public symbols"
+        shutil.copy2(paths.profile_use_bitcode, paths.root / "first-pass.bc")
+        measure(args.mode)
+        return
 
     if args.mode in ("baseline", "generic", "namespace"):
         if args.mode != "baseline":
