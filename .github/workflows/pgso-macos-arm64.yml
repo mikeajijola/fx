@@ -17,7 +17,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: [cleanup, promote]
+        include:
+          - mode: promote-baseline
+            prepared: baseline
+            run: 39287446863
+          - mode: promote-twice
+            prepared: promote
+            run: 39289941428
+          - mode: promote-round
+            prepared: promote
+            run: 39289941428
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Setup pinned tools
@@ -39,11 +48,11 @@ jobs:
           run-id: 39257938998
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/retained
-      - name: Download retained namespace IR
+      - name: Download pinned retained IR
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: pgso-size-comparison-namespace
-          run-id: 39287446863
+          name: pgso-size-comparison-${{ matrix.prepared }}
+          run-id: ${{ matrix.run }}
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/prepared
       - name: Compare immutable inputs without release eligibility
