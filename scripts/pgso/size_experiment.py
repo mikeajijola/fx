@@ -16,7 +16,7 @@ def main():
     for name in ["seed", "retained", "output"]:
         parser.add_argument("--" + name, type=pathlib.Path, required=True)
     parser.add_argument("--llvm-bin", required=True)
-    parser.add_argument("--mode", choices=["rounds", "helpers", "backend"], required=True)
+    parser.add_argument("--mode", choices=["rounds", "helpers", "backend", "os", "oz"], required=True)
     parser.add_argument("--prepared", type=pathlib.Path)
     args = parser.parse_args()
     seed = json.loads((args.seed / "manifest.json").read_text())
@@ -61,6 +61,16 @@ def main():
         report["results"].append(item)
         (paths.root / "comparison.json").write_text(json.dumps(report, indent=2))
         print(json.dumps(item), flush=True)
+
+    if args.mode in ("os", "oz"):
+        level = "Os" if args.mode == "os" else "Oz"
+        p.USE_FLAGS = tuple(flag.replace("default<O2>", "default<" + level + ">") for flag in p.USE_FLAGS)
+        report["profile_use_flags"] = list(p.USE_FLAGS)
+        # Keep normal profile mismatch, IR verification, and public-symbol
+        # validation. A comparison must fail if these profiles cannot apply.
+        p.apply_profile(toolchain, paths, identity["bitcode_sha256"])
+        measure(args.mode)
+        return
 
     if args.mode == "backend":
         prepared = json.loads((args.prepared / "comparison.json").read_text())
