@@ -16,7 +16,8 @@ def main():
     for name in ["seed", "retained", "output"]:
         parser.add_argument("--" + name, type=pathlib.Path, required=True)
     parser.add_argument("--llvm-bin", required=True)
-    parser.add_argument("--mode", choices=["rounds", "helpers"], required=True)
+    parser.add_argument("--mode", choices=["rounds", "helpers", "backend"], required=True)
+    parser.add_argument("--prepared", type=pathlib.Path)
     args = parser.parse_args()
     seed = json.loads((args.seed / "manifest.json").read_text())
     identity = seed["evidence"]["identity"]
@@ -55,10 +56,32 @@ def main():
         destination = paths.root / (name + "-fx")
         shutil.copy2(paths.candidate_binary, destination)
         shutil.copy2(paths.logs / "candidate-link.map", paths.logs / (name + "-link.map"))
-        item = dict(name=name, bytes=destination.stat().st_size, sha256=sha256_file(destination))
+        item = dict(name=name, bytes=destination.stat().st_size, sha256=sha256_file(destination),
+                    backend_flags=list(p.FX_MACHINE_OUTLINER_FLAGS))
         report["results"].append(item)
         (paths.root / "comparison.json").write_text(json.dumps(report, indent=2))
         print(json.dumps(item), flush=True)
+
+    if args.mode == "backend":
+        prepared = json.loads((args.prepared / "comparison.json").read_text())
+        assert prepared["baseline_source"] == identity["source_sha"]
+        assert prepared["input_bitcode_sha256"] == identity["bitcode_sha256"]
+        assert prepared["profile_sha256"] == report["profile_sha256"]
+        first = args.prepared / "first-pass.bc"
+        report["prepared_ir_sha256"] = sha256_file(first)
+        shutil.copy2(first, paths.profile_use_bitcode)
+        base = ("-machine-outliner-reruns=1", "-verify-machineinstrs")
+        for name, flags in [
+            ("backend-baseline", ()),
+            ("tail-merge", ("-enable-tail-merge",)),
+            ("tail-wide", ("-enable-tail-merge", "-tail-merge-threshold=1000")),
+            ("tail-short", ("-enable-tail-merge", "-tail-merge-threshold=1000", "-tail-merge-size=2")),
+            ("compact-tails", ("-enable-tail-merge", "-tail-merge-threshold=1000", "-tail-merge-size=2", "-disable-early-taildup", "-disable-tail-duplicate", "-tail-dup-placement=false")),
+            ("all-profitable", ("-enable-tail-merge", "-tail-merge-threshold=1000", "-enable-machine-outliner=always")),
+        ]:
+            p.FX_MACHINE_OUTLINER_FLAGS = base + flags
+            measure(name)
+        return
 
     if args.mode == "helpers":
         from scripts.pgso import ir_size
