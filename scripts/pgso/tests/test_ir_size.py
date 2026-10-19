@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 
-from scripts.pgso.pipeline import _require_bitcode_header
+from scripts.pgso.pipeline import ARGUMENT_CLEANUP_FLAGS, ARGUMENT_CLEANUP_ROUNDS, _require_bitcode_header
 from scripts.pgso.toolchain import IR_SIZE_SCRIPT
 
 LLVM_BIN = pathlib.Path(os.environ.get("FX_PGSO_LLVM_BIN", "/opt/homebrew/opt/llvm@22/bin"))
@@ -181,6 +181,82 @@ class IrSizeTests(unittest.TestCase):
         self.assertEqual(1, result.returncode)
         self.assertIn("no out-of-line helper matched", result.stderr)
         self.assertFalse(output.exists())
+
+
+    def test_argument_cleanup_preserves_checked_math_nullable_reads_and_writes(self) -> None:
+        source = self.assemble("argument_cleanup", """
+            declare { i32, i1 } @llvm.sadd.with.overflow.i32(i32, i32)
+            define internal i32 @checked_pair(ptr %pair) noinline {
+              %first = load i32, ptr %pair
+              %secondp = getelementptr i32, ptr %pair, i64 1
+              %second = load i32, ptr %secondp
+              %checked = call { i32, i1 } @llvm.sadd.with.overflow.i32(i32 %first, i32 %second)
+              %result = extractvalue { i32, i1 } %checked, 0
+              %overflow = extractvalue { i32, i1 } %checked, 1
+              %value = select i1 %overflow, i32 -1, i32 %result
+              ret i32 %value
+            }
+            define i32 @main(i32 %argc, ptr %argv) {
+              %pair = alloca [2 x i32], align 4
+              store i32 %argc, ptr %pair
+              %secondp = getelementptr i32, ptr %pair, i64 1
+              store i32 2, ptr %secondp
+              %result = call i32 @checked_pair(ptr %pair)
+              ret i32 %result
+            }
+            define internal i32 @conditional_read(ptr %p, i1 %enabled) noinline {
+            entry:
+              br i1 %enabled, label %read, label %done
+            read:
+              %value = load i32, ptr %p
+              br label %done
+            done:
+              %result = phi i32 [ %value, %read ], [ 0, %entry ]
+              ret i32 %result
+            }
+            define i32 @use_nullable(ptr %p, i1 %enabled) {
+              %value = call i32 @conditional_read(ptr %p, i1 %enabled)
+              ret i32 %value
+            }
+            define internal void @write_output(ptr %p, i32 %value) noinline {
+              store i32 %value, ptr %p
+              ret void
+            }
+            define void @write_public(ptr %p, i32 %value) {
+              call void @write_output(ptr %p, i32 %value)
+              ret void
+            }
+            """)
+        current = source
+        for index in range(ARGUMENT_CLEANUP_ROUNDS):
+            output = self.root / f"argument-cleanup-{index}.bc"
+            result = subprocess.run(
+                [str(LLVM_BIN / "opt"), *ARGUMENT_CLEANUP_FLAGS, str(current), "-o", str(output)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("", result.stderr)
+            current = output
+        ir = subprocess.run(
+            [str(LLVM_BIN / "llvm-dis"), str(current), "-o", "-"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        self.assertIn("@checked_pair(i32 ", ir)
+        self.assertNotIn("@checked_pair(ptr ", ir)
+        self.assertNotIn("alloca", ir)
+        self.assertIn("call { i32, i1 } @llvm.sadd.with.overflow.i32", ir)
+        self.assertIn("select i1 %overflow, i32 -1, i32 %result", ir)
+        self.assertIn("@conditional_read(ptr ", ir)
+        self.assertIn("br i1 %enabled", ir)
+        self.assertIn("@write_output(ptr ", ir)
+        self.assertIn("store i32 %value, ptr %p", ir)
+        def exports(path: pathlib.Path) -> list[str]:
+            result = subprocess.run(
+                [str(LLVM_BIN / "llvm-nm"), "--extern-only", "--defined-only", "--format=posix", str(path)],
+                check=True, capture_output=True, text=True,
+            )
+            return sorted(" ".join(line.split()[:2]) for line in result.stdout.splitlines() if line.strip())
+        self.assertEqual(exports(source), exports(current))
 
 
 if __name__ == "__main__":

@@ -60,6 +60,16 @@ OUTLINE_CLEANUP_FLAGS = (
     "-internalize-public-api-list=main,_mh_execute_header",
 )
 
+# Outlining introduces pointer arguments and temporary storage after O2.
+# Promote safe reads, then simplify their callers. A second bounded pass
+# handles opportunities exposed by the first caller cleanup.
+ARGUMENT_CLEANUP_ROUNDS = 2
+ARGUMENT_CLEANUP_FLAGS = (
+    "-passes=cgscc(argpromotion),ipsccp,deadargelim,globalopt,"
+    "function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,"
+    "memcpyopt,dse,adce),globaldce,mergefunc,verify",
+)
+
 # Zig writes raw bitcode. LLVM's own writer, which the IR size passes use,
 # wraps Darwin bitcode in the 0x0B17C0DE wrapper header.
 BITCODE_MAGICS = (b"BC\xc0\xde", b"\xde\xc0\x17\x0b")
@@ -909,7 +919,9 @@ def _require_bitcode_header(path: pathlib.Path) -> None:
             raise PgsoError(f"invalid LLVM bitcode header: {path}")
 
 
-def rewrite_sparse_constants(toolchain: Toolchain, paths: PipelinePaths) -> None:
+def rewrite_sparse_constants(
+    toolchain: Toolchain, paths: PipelinePaths, *, log_prefix: str = "sparse",
+) -> None:
     """Replace copies of mostly undefined constants with their defined stores."""
     rewritten = paths.profile_use_bitcode.with_name(
         paths.profile_use_bitcode.name + ".sparse"
@@ -924,7 +936,7 @@ def rewrite_sparse_constants(toolchain: Toolchain, paths: PipelinePaths) -> None
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=300,
-        log_path=paths.logs / "sparse-constants.json",
+        log_path=paths.logs / f"{log_prefix}-constants.json",
         require_empty_stderr=True,
     )
     _require_nonempty_file(rewritten, "sparse-constant bitcode")
@@ -939,11 +951,44 @@ def rewrite_sparse_constants(toolchain: Toolchain, paths: PipelinePaths) -> None
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=300,
-        log_path=paths.logs / "sparse-cleanup.json",
+        log_path=paths.logs / f"{log_prefix}-cleanup.json",
         require_empty_stderr=True,
     )
     _require_nonempty_file(paths.profile_use_bitcode, "profile-use bitcode")
     rewritten.unlink()
+
+
+def cleanup_outlined_arguments(toolchain: Toolchain, paths: PipelinePaths) -> None:
+    """Simplify outlined helpers without changing the public symbol surface."""
+    original = _defined_external_symbols(
+        toolchain, paths.profile_use_bitcode,
+        paths.logs / "argument-public-symbols-before.json",
+    )
+    temporary = paths.profile_use_bitcode.with_name(
+        paths.profile_use_bitcode.name + ".arguments"
+    )
+    for index in range(ARGUMENT_CLEANUP_ROUNDS):
+        run_checked(
+            (str(toolchain.opt), *ARGUMENT_CLEANUP_FLAGS,
+             str(paths.profile_use_bitcode), "-o", str(temporary)),
+            cwd=paths.root,
+            env=os.environ.copy(),
+            timeout_s=300,
+            log_path=paths.logs / f"argument-cleanup-{index}.json",
+            require_empty_stderr=True,
+        )
+        _require_nonempty_file(temporary, "argument-cleanup bitcode")
+        _require_bitcode_header(temporary)
+        os.replace(temporary, paths.profile_use_bitcode)
+        rewrite_sparse_constants(
+            toolchain, paths, log_prefix=f"argument-{index}-sparse",
+        )
+    final = _defined_external_symbols(
+        toolchain, paths.profile_use_bitcode,
+        paths.logs / "argument-public-symbols-after.json",
+    )
+    if original != final:
+        raise PgsoError("argument cleanup changed the public symbol surface")
 
 
 def validate_bitcode_hash(path: pathlib.Path, expected_sha256: str) -> None:
@@ -1303,6 +1348,7 @@ def apply_profile(
     if paths.selector != "fx":
         _require_nonempty_file(paths.profile_use_bitcode, "profile-use bitcode")
         rewrite_sparse_constants(toolchain, paths)
+        cleanup_outlined_arguments(toolchain, paths)
         return paths.profile_use_bitcode
 
     _require_nonempty_file(
@@ -1355,6 +1401,7 @@ def apply_profile(
     )
     _require_nonempty_file(paths.profile_use_bitcode, "profile-use bitcode")
     rewrite_sparse_constants(toolchain, paths)
+    cleanup_outlined_arguments(toolchain, paths)
     outlined_symbols = _defined_external_symbols(
         toolchain,
         paths.profile_use_bitcode,

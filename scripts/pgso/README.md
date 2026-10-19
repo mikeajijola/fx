@@ -71,10 +71,11 @@ immutable control and candidate on the same machine.
 
 The fx candidate applies the accepted whole-program profile-use pipeline, then
 uses LLVM's deterministic name-hash split to divide the optimized IR into two
-balanced modules. Each module is outlined sequentially before the modules are
+modules. Each module is outlined sequentially before the modules are
 relinked and their original private linkage is restored. This keeps the IR
 outliner's suffix-tree memory below the standard runner limit without changing
-the training corpus, benchmark candidates, or performance measurement hardware.
+the training corpus or performance measurement hardware. Benchmark artifacts
+keep their single-module outlining pass.
 Generated IR helpers are kept in one dense linker cluster ordered by their
 hottest profiled caller so outlining does not scatter startup code across cold
 pages.
@@ -100,6 +101,15 @@ including zeros, are still stored. Benchmark artifacts receive both passes so
 their candidates keep the production code shape. The candidate link passes
 `-no_compact_unwind`: fx builds without unwind tables, and newer Apple linkers
 otherwise emit about 160 KB of compact unwind data.
+
+After the sparse rewrite, CLI and benchmark artifacts receive two bounded
+argument-cleanup rounds. LLVM promotes safe pointer reads to value arguments,
+then simplifies the helpers and their callers. The second round handles
+opportunities exposed by the first caller cleanup. Conditional pointer reads,
+writes, and checked arithmetic retain their semantics. Each round verifies IR
+and rejects warnings or an invalid bitcode header before atomically replacing
+the previous output. Sparse rewriting runs again after each round, with
+separate audit logs. A changed public symbol surface rejects the candidate.
 
 `python3 -m scripts.pgso.distributed plan` emits deterministic, non-empty
 GitHub Actions matrices. The remaining distributed subcommands are workflow

@@ -9,6 +9,8 @@ import unittest
 
 from scripts.pgso.model import PgsoError, sha256_file
 from scripts.pgso.pipeline import (
+    ARGUMENT_CLEANUP_FLAGS,
+    ARGUMENT_CLEANUP_ROUNDS,
     BENCHMARK_USE_FLAGS,
     FX_MACHINE_OUTLINER_FLAGS,
     GENERATION_FLAGS,
@@ -25,6 +27,7 @@ from scripts.pgso.pipeline import (
     apply_profile,
     apple_ld_system_stub,
     cleanup_outlined_ir_argv,
+    cleanup_outlined_arguments,
     candidate_object_argv,
     candidate_link_argv,
     candidate_runtime_probe_argv,
@@ -367,13 +370,16 @@ prefix = pathlib.Path(sys.argv[sys.argv.index('--prefix') + 1])
             f"""import pathlib,sys
 with pathlib.Path({str(actions)!r}).open('a') as stream:
     stream.write('opt ' + ' '.join(sys.argv[1:]) + '\\n')
-pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'bitcode')""",
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'BC\\xc0\\xdebitcode')""",
         )
         paths = PipelinePaths.create(self.root / "run-bench", selector="ui_activity")
         toolchain = dataclasses.replace(
             self.toolchain,
             opt=opt,
             ir_size=self.write_ir_size(actions),
+            llvm_nm=self.write_executable(
+                "benchmark-nm", "print('_main T ---------------- 0')",
+            ),
         )
         paths.bitcode.write_bytes(b"same bitcode")
         paths.merged_profile.write_bytes(b"profile")
@@ -382,10 +388,15 @@ pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'bitcode')""",
 
         self.assertEqual(paths.profile_use_bitcode, result)
         lines = actions.read_text().splitlines()
-        self.assertEqual(3, len(lines))
+        self.assertEqual(9, len(lines))
         self.assertIn(f"-passes={PROFILE_PREPARATION_PASSES},default<O2>,mergefunc,iroutliner", lines[0])
         self.assertIn(f"sparse-constants {paths.profile_use_bitcode} ", lines[1])
         self.assertIn("-passes=globaldce,verify", lines[2])
+        for index in range(ARGUMENT_CLEANUP_ROUNDS):
+            self.assertIn(ARGUMENT_CLEANUP_FLAGS[0], lines[3 + 3 * index])
+            self.assertTrue((paths.logs / f"argument-cleanup-{index}.json").is_file())
+            self.assertTrue((paths.logs / f"argument-{index}-sparse-constants.json").is_file())
+        self.assertTrue((paths.logs / "argument-public-symbols-after.json").is_file())
 
     def test_profile_pipelines_use_the_exact_accepted_flags(self) -> None:
         self.assertEqual(
@@ -891,7 +902,7 @@ output.write_bytes(b'merged profile')""",
             f"""import pathlib,sys
 with pathlib.Path({str(actions)!r}).open('a') as stream:
     stream.write('opt ' + ' '.join(sys.argv[1:]) + '\\n')
-pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'bitcode')""",
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'BC\\xc0\\xdebitcode')""",
         )
         split = self.write_executable(
             "llvm-split",
@@ -935,9 +946,9 @@ print('_main T ---------------- 0')""",
         )
 
         self.assertEqual(self.paths.profile_use_bitcode, result)
-        self.assertEqual(b"bitcode", result.read_bytes())
+        self.assertEqual(b"BC\xc0\xdebitcode", result.read_bytes())
         lines = actions.read_text().splitlines()
-        self.assertEqual(10, len(lines))
+        self.assertEqual(18, len(lines))
         self.assertIn("-passes=function(sroa,instcombine<no-verify-fixpoint>,loop-unroll-full,instcombine<no-verify-fixpoint>,simplifycfg),default<O2>,mergefunc", lines[0])
         self.assertNotIn("iroutliner", lines[0])
         self.assertEqual("nm", lines[1])
@@ -953,6 +964,9 @@ print('_main T ---------------- 0')""",
         self.assertIn("-passes=globaldce,verify", lines[8])
         self.assertTrue(lines[8].endswith(f"-o {self.paths.profile_use_bitcode}"))
         self.assertEqual("nm", lines[9])
+        for index in range(ARGUMENT_CLEANUP_ROUNDS):
+            self.assertIn(ARGUMENT_CLEANUP_FLAGS[0], lines[10 + 3 * index])
+        self.assertEqual(["nm", "nm"], lines[-2:])
         self.assertFalse(
             self.paths.profile_use_bitcode.with_name(
                 self.paths.profile_use_bitcode.name + ".sparse"
@@ -960,6 +974,26 @@ print('_main T ---------------- 0')""",
         )
         self.assertTrue((self.paths.logs / "public-symbols-before.json").is_file())
         self.assertTrue((self.paths.logs / "public-symbols-after.json").is_file())
+
+    def test_argument_cleanup_rejects_invalid_output_before_replacing_input(self) -> None:
+        original = b"BC\xc0\xdeoriginal"
+        for output, warning, message in (
+            (b"not bitcode", "", "invalid LLVM bitcode header"),
+            (b"BC\xc0\xdechanged", "warning", "wrote unexpected stderr"),
+        ):
+            with self.subTest(message=message):
+                self.paths.profile_use_bitcode.write_bytes(original)
+                opt = self.write_executable(
+                    "invalid-argument-opt",
+                    f"import pathlib,sys\npathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes({output!r})\nsys.stderr.write({warning!r})",
+                )
+                toolchain = dataclasses.replace(
+                    self.toolchain, opt=opt,
+                    llvm_nm=self.write_executable("argument-nm", "print('_main T ---------------- 0')"),
+                )
+                with self.assertRaisesRegex(PgsoError, message):
+                    cleanup_outlined_arguments(toolchain, self.paths)
+                self.assertEqual(original, self.paths.profile_use_bitcode.read_bytes())
 
     def test_profile_use_rejects_optimizer_warnings(self) -> None:
         opt = self.write_executable(
