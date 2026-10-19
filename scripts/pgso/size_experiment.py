@@ -17,7 +17,7 @@ def main():
     for name in ["seed", "retained", "output"]:
         parser.add_argument("--" + name, type=pathlib.Path, required=True)
     parser.add_argument("--llvm-bin", required=True)
-    parser.add_argument("--mode", choices=["rounds", "helpers", "backend", "os", "oz", "baseline", "generic", "namespace", "cleanup", "promote", "promote-baseline", "promote-twice", "promote-round", "attrs", "promote-tail", "promote-three", "promote-four", "finish"], required=True)
+    parser.add_argument("--mode", choices=["rounds", "helpers", "backend", "os", "oz", "baseline", "generic", "namespace", "cleanup", "promote", "promote-baseline", "promote-twice", "promote-round", "attrs", "promote-tail", "promote-three", "promote-four", "finish", "globals"], required=True)
     parser.add_argument("--prepared", type=pathlib.Path)
     args = parser.parse_args()
     seed = json.loads((args.seed / "manifest.json").read_text())
@@ -62,6 +62,28 @@ def main():
         report["results"].append(item)
         (paths.root / "comparison.json").write_text(json.dumps(report, indent=2))
         print(json.dumps(item), flush=True)
+
+    if args.mode == "globals":
+        prepared = json.loads((args.prepared / "comparison.json").read_text())
+        assert prepared["baseline_source"] == identity["source_sha"]
+        assert prepared["input_bitcode_sha256"] == identity["bitcode_sha256"]
+        assert prepared["profile_sha256"] == report["profile_sha256"]
+        first = args.prepared / "two-cleanups-tail-pass.bc"
+        assert sha256_file(first) == "7352efc2a542d6fa3a63fe726dfb5929084f15b1cc160b2046fdc0f374306c9c"
+        report["prepared_ir_sha256"] = sha256_file(first)
+        shutil.copy2(first, paths.profile_use_bitcode)
+        base = ("-machine-outliner-reruns=1", "-enable-tail-merge", "-tail-merge-threshold=1000")
+        # Keep Mach-O external merging disabled. LLVM's default avoids unsafe
+        # merging across subsection boundaries; none of these flags changes it.
+        for name, flags in [
+            ("const-cold", ("-global-merge-on-const",)),
+            ("globals-all-functions", ("-aarch64-enable-global-merge",)),
+            ("const-all-functions", ("-aarch64-enable-global-merge", "-global-merge-on-const")),
+            ("const-all-constants", ("-aarch64-enable-global-merge", "-global-merge-on-const", "-global-merge-all-const")),
+        ]:
+            p.FX_MACHINE_OUTLINER_FLAGS = base + flags
+            measure(name)
+        return
 
     if args.mode == "finish":
         prepared = json.loads((args.prepared / "comparison.json").read_text())
