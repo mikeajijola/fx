@@ -16,7 +16,7 @@ def main():
     for name in ["seed", "retained", "output"]:
         parser.add_argument("--" + name, type=pathlib.Path, required=True)
     parser.add_argument("--llvm-bin", required=True)
-    parser.add_argument("--mode", choices=["rounds", "helpers", "backend", "os", "oz"], required=True)
+    parser.add_argument("--mode", choices=["rounds", "helpers", "backend", "os", "oz", "dedup"], required=True)
     parser.add_argument("--prepared", type=pathlib.Path)
     args = parser.parse_args()
     seed = json.loads((args.seed / "manifest.json").read_text())
@@ -70,6 +70,22 @@ def main():
         # validation. A comparison must fail if these profiles cannot apply.
         p.apply_profile(toolchain, paths, identity["bitcode_sha256"])
         measure(args.mode)
+        return
+
+    if args.mode == "dedup":
+        prepared = json.loads((args.prepared / "comparison.json").read_text())
+        assert prepared["baseline_source"] == identity["source_sha"]
+        assert prepared["input_bitcode_sha256"] == identity["bitcode_sha256"]
+        assert prepared["profile_sha256"] == report["profile_sha256"]
+        first = args.prepared / "first-pass.bc"
+        report["prepared_ir_sha256"] = sha256_file(first)
+        shutil.copy2(first, paths.profile_use_bitcode)
+        original_link = p.temporal_candidate_link_argv
+        def deduplicating_link(*values, **options):
+            return tuple(arg for arg in original_link(*values, **options) if arg != "-no_deduplicate")
+        p.temporal_candidate_link_argv = deduplicating_link
+        report["linker_deduplication"] = "Apple ld default; original strict temporal map validation retained"
+        measure("dedup")
         return
 
     if args.mode == "backend":
