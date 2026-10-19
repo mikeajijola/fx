@@ -72,7 +72,7 @@ def main():
         assert sha256_file(first) == "6cd1d7f8741ccef7fb9ea217ab7a77647a0b178f5bd579e5e17014b06955d8ba"
         report["prepared_ir_sha256"] = sha256_file(first)
         before = p._defined_external_symbols(toolchain, first, paths.logs / "cleanup-symbols-before.json")
-        passes = "ipsccp,deadargelim,globalopt,function(sroa,early-cse,instcombine,simplifycfg,memcpyopt,dse,adce),globaldce,mergefunc,verify"
+        passes = "ipsccp,deadargelim,globalopt,function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,memcpyopt,dse,adce),globaldce,mergefunc,verify"
         if args.mode == "promote":
             passes = "cgscc(argpromotion)," + passes
         report["cleanup_passes"] = passes
