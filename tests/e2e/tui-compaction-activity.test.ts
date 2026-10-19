@@ -31,9 +31,22 @@ function shellQuote(value: string): string {
 }
 
 function checkpoints(bytes: Buffer): number {
-  return bytes.toString().trim().split("\n").filter(Boolean)
+  const text = bytes.toString();
+  // A live snapshot may end midway through the next append.
+  const complete = text.slice(0, text.lastIndexOf("\n") + 1);
+  return complete.split("\n").filter(Boolean)
     .map((line) => JSON.parse(line)).filter((frame) => frame.event?.context_checkpoint).length;
 }
+
+test("checkpoint snapshots wait for complete records and reject malformed sealed records", () => {
+  const first = '{"event":{"context_checkpoint":{"id":"first"}}}\n';
+  const next = '{"event":{"context_checkpoint":{"id":"next"}}}';
+  expect(checkpoints(Buffer.from(next.slice(0, -2)))).toBe(0);
+  expect(checkpoints(Buffer.from(first + next.slice(0, -2)))).toBe(1);
+  expect(checkpoints(Buffer.from(first + next))).toBe(1);
+  expect(checkpoints(Buffer.from(first + next + "\n"))).toBe(2);
+  expect(() => checkpoints(Buffer.from(first + '{"event":\n'))).toThrow();
+});
 
 async function until(predicate: () => boolean, label: string, timeout = 20_000) {
   const deadline = Date.now() + timeout;
