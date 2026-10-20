@@ -71,6 +71,30 @@ describe("portable Fossil workspace recovery", () => {
     expect(data.relationships.some((edge: any) => edge.relationship === "omos_assessment_result" && edge.authority === "host_observed")).toBe(true);
   }, 90000);
 
+  test("rejects a failed compact receipt as success evidence for a general task", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const m = model(f, (_body, count) => count === 1 ? {
+      tool_calls: [{ index: 0, id: "failed-check", type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", command: "test -f missing.txt", timeout_ms: 10000 } }) } }],
+    } : { content: "The file exists." }, packet => {
+      const receipt = packet.evidence.find((record: any) => record.id.startsWith("command-receipt:") && record.status === "failure");
+      expect(receipt).toBeDefined();
+      if (!receipt.complete && !packet.currentInspections.some((page: any) => page.id === receipt.id)) {
+        return { name: "omos_review_evidence", args: { action: "read", id: receipt.id } };
+      }
+      return { name: "omos_contract_assessment", args: {
+        contractId: packet.contract.id, version: packet.contract.version,
+        obligations: packet.contract.obligations.map((obligation: any) => ({ id: obligation.id, status: "met", evidence: [receipt.id], note: "This failed receipt must not establish success." })),
+      } };
+    });
+    const result = await f.run(["ask", "Confirm missing.txt exists", "--json"]);
+    expect(result.code, result.stderr).toBe(1);
+    expect(m.counts().actors).toBe(2);
+    const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    expect(task.state).not.toBe("accepted");
+    expect(f.fossil("ls", "-r", "trunk")).not.toContain(`acceptances/${task.id}/`);
+  }, 60000);
+
   test("bounds typed query payloads and retrieves complete original evidence at a pinned revision", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);

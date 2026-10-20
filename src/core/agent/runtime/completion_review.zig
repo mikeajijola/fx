@@ -256,7 +256,7 @@ fn verifyReferences(alloc: std.mem.Allocator, raw: []const u8, evidence: []const
             const record = for (evidence) |record| {
                 if (std.mem.eql(u8, record.id, id)) break record;
             } else return error.InvalidContractEvidence;
-            if (report.status == .met and record.kind == .tool and record.status != .success) return error.InvalidContractEvidence;
+            if (report.status == .met and (record.status == .failure or (record.kind == .tool and record.status != .success))) return error.InvalidContractEvidence;
         }
     }
 }
@@ -442,11 +442,21 @@ pub fn assess(alloc: std.mem.Allocator, provider: streams.Provider, input: Input
 
 test "completion review rejects invented and failed evidence references" {
     const alloc = std.testing.allocator;
-    const records = [_]Evidence{.{ .id = "tool:1", .tool = "shell", .status = .failure, .content = "command failed" }};
+    const records = [_]Evidence{
+        .{ .id = "tool:1", .tool = "shell", .status = .failure, .content = "command failed" },
+        .{ .id = "receipt:failed", .kind = .verification, .status = .failure, .content = "failed command receipt" },
+        .{ .id = "receipt:success", .kind = .verification, .content = "successful host receipt" },
+    };
     try std.testing.expectError(error.InvalidContractEvidence, verifyReferences(alloc,
         \\{"contractId":"x","version":1,"obligations":[{"id":"a","status":"met","note":"claimed","evidence":["invented"]}]}
     , &records));
     try std.testing.expectError(error.InvalidContractEvidence, verifyReferences(alloc,
         \\{"contractId":"x","version":1,"obligations":[{"id":"a","status":"met","note":"claimed","evidence":["tool:1"]}]}
     , &records));
+    try std.testing.expectError(error.InvalidContractEvidence, verifyReferences(alloc,
+        \\{"contractId":"x","version":1,"obligations":[{"id":"a","status":"met","note":"claimed","evidence":["receipt:failed"]}]}
+    , &records));
+    try verifyReferences(alloc,
+        \\{"contractId":"x","version":1,"obligations":[{"id":"a","status":"met","note":"checked","evidence":["receipt:success"]}]}
+    , &records);
 }
