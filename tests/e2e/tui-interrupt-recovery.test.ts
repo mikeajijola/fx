@@ -869,16 +869,14 @@ while :; do sleep 1; done
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(corpus, { recursive: true });
       writeFileSync(join(home, ".fx", "settings.json"), "{}");
-      // The search must still be running when the second Escape lands, about
-      // half a second after it starts. Linux searches 30,000 files in about a
-      // third of a second, so it needs a larger corpus than macOS.
-      const corpusFiles = process.platform === "darwin" ? 30_000 : 120_000;
-      for (let index = 0; index < corpusFiles; index += 1) {
-        writeFileSync(
-          join(corpus, `candidate-${String(index).padStart(6, "0")}.txt`),
-          "ordinary corpus text\n",
-        );
-      }
+      const target = join(corpus, "candidate.txt");
+      writeFileSync(target, "ordinary corpus text\n");
+      const entered = join(root, "read-entered"), release = join(root, "read-release");
+      const library = join(root, process.platform === "darwin" ? "read-gate.dylib" : "read-gate.so");
+      const compiled = Bun.spawnSync(["cc", ...(process.platform === "darwin" ? ["-dynamiclib"] : ["-shared", "-fPIC"]),
+        "-O2", "-Wall", "-Wextra", join(import.meta.dirname, "fixtures", "file-read-gate.c"), "-o", library,
+        ...(process.platform === "darwin" ? [] : ["-ldl"])]);
+      expect(compiled.exitCode).toBe(0);
 
       gateway = startFakeGateway([
         fakeGatewayToolCall(callId, "grep_files", {
@@ -903,12 +901,17 @@ while :; do sleep 1; done
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: `${TRACE_SCOPES},tool,ui_activity`,
           FX_TRACE_LOG: tracePath,
+          [process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD"]: library,
+          FX_TEST_READ_TARGET: target,
+          FX_TEST_READ_ENTERED: entered,
+          FX_TEST_READ_RELEASE: release,
         },
       });
       await session.waitForComposer(TIMEOUT);
 
       await session.sendText("Search the prepared corpus.");
       await session.waitForText(`Searching ${pattern}`, TIMEOUT);
+      await waitForCondition(() => existsSync(entered), "held grep read");
       expect(readTrace(tracePath)).not.toContain(
         `event=after_tool_execution call_id=${callId}`,
       );
@@ -920,6 +923,8 @@ while :; do sleep 1; done
       await session.sendKeys("Escape");
       await session.waitForText("What can fx do differently?", TIMEOUT);
       expect(Date.now() - cancelStartedAt).toBeLessThan(500);
+      expect(readTrace(tracePath)).not.toContain(`event=after_tool_execution call_id=${callId}`);
+      writeFileSync(release, "release");
       await waitForTrace(tracePath, `event=after_tool_execution`, TIMEOUT);
       await waitForTrace(tracePath, "finish processing queued=0", TIMEOUT);
 
