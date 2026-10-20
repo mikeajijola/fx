@@ -58,6 +58,8 @@ The company declaration uses the same pinned OmniForm schema and semantic
 extension as the SaaS model. The native profile is `omos.workspace/v1`.
 The files under `standard/` record the upstream version, license and provenance.
 The binary validates declarations itself; JavaScript and Ajv are test tools.
+The [contract authority reference](CONTRACTS.md) describes record schemas,
+review policy, derived relationships, auditing and the workspace service.
 
 Inspect or validate the model with either CLI name:
 

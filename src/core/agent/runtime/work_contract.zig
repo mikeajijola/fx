@@ -25,7 +25,7 @@ pub const Assessment = struct {
     obligations: []const Report,
 };
 pub const Disposition = enum { fulfilled, continue_work, blocked };
-pub const Decision = struct { disposition: Disposition, feedback: []const u8 };
+pub const Decision = struct { disposition: Disposition, feedback: []const u8, verification_pending: bool = false };
 
 fn bounded(value: []const u8, limit: usize) bool {
     return value.len <= limit and std.mem.trim(u8, value, " \t\r\n").len > 0 and std.unicode.utf8ValidateSlice(value);

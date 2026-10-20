@@ -44,9 +44,31 @@ pub const Policy = struct {
     stalled_checks: usize = 3,
     max_actor_steps: usize = 100,
 };
+pub const ReviewPolicy = struct {
+    pub const legacy: ReviewPolicy = .{ .reserved_calls = 1, .response_timeout_ms = 60_000, .attempt_timeout_ms = 60_000, .max_attempts = 1, .total_timeout_ms = 60_000 };
+    max_calls: usize = 8,
+    reserved_calls: usize = 2,
+    response_timeout_ms: u32 = 120_000,
+    attempt_timeout_ms: u32 = 300_000,
+    max_attempts: usize = 3,
+    total_timeout_ms: u32 = 900_000,
+    max_context_bytes: usize = 512 * 1024,
+    max_read_bytes: usize = 16 * 1024,
+    max_tokens: ?u64 = null,
+
+    pub fn validate(self: ReviewPolicy) !void {
+        if (self.max_tokens) |limit| if (limit == 0 or limit > 4_000_000) return error.InvalidExecutionPolicy;
+        if (self.max_calls < 3 or self.max_calls > 64 or self.reserved_calls == 0 or self.reserved_calls >= self.max_calls or
+            self.response_timeout_ms < 1000 or self.response_timeout_ms > self.attempt_timeout_ms or
+            self.attempt_timeout_ms > self.total_timeout_ms or self.total_timeout_ms > 3_600_000 or
+            self.max_attempts == 0 or self.max_attempts > 20 or self.max_context_bytes < 16 * 1024 or self.max_context_bytes > 512 * 1024 or
+            self.max_read_bytes < 256 or self.max_read_bytes > 16 * 1024) return error.InvalidExecutionPolicy;
+    }
+};
 pub const Execution = struct {
     version: []const u8 = "omos.execution/v1",
     defaults: Policy = .{},
+    review: ReviewPolicy = ReviewPolicy.legacy,
 };
 pub const Entity = struct { id: []const u8, fields: Value = .null, required: []const []const u8 = &.{}, indexed: []const []const u8 = &.{} };
 const Relationship = struct { id: []const u8, from: []const u8, to: []const u8, kind: enum { containment, dependency, applicability, provenance }, inheritScope: bool = false };
@@ -73,6 +95,7 @@ pub const Basis = struct {
     definition_hash: []const u8,
     revision: []const u8,
     execution: Execution,
+    execution_hash: ?[]const u8 = null,
     capability: ?[]const u8 = null,
 };
 pub const Declaration = struct { value: Value, hash: []const u8, semantic: Semantic };
@@ -147,7 +170,122 @@ pub fn parseExecution(alloc: Allocator, bytes: []const u8) !Execution {
     const execution = try record_json.decode(Execution, alloc, bytes, .{});
     const p = execution.defaults;
     if (!std.mem.eql(u8, execution.version, "omos.execution/v1") or p.progress_interval == 0 or p.progress_interval > 100 or p.stalled_checks == 0 or p.stalled_checks > 20 or p.max_actor_steps < 2 or p.max_actor_steps > 10000) return error.InvalidExecutionPolicy;
+    try execution.review.validate();
     return execution;
+}
+
+/// Automatic activation may tighten execution allowances, never enlarge them.
+pub fn compatibleExecution(old: Execution, next: Execution) bool {
+    const a = old.defaults;
+    const b = next.defaults;
+    const x = old.review;
+    const y = next.review;
+    return b.max_actor_steps <= a.max_actor_steps and b.progress_interval <= a.progress_interval and b.stalled_checks <= a.stalled_checks and
+        y.max_calls <= x.max_calls and y.reserved_calls >= x.reserved_calls and y.response_timeout_ms <= x.response_timeout_ms and
+        y.attempt_timeout_ms <= x.attempt_timeout_ms and y.max_attempts <= x.max_attempts and y.total_timeout_ms <= x.total_timeout_ms and
+        y.max_context_bytes <= x.max_context_bytes and y.max_read_bytes <= x.max_read_bytes and
+        (if (x.max_tokens) |limit| if (y.max_tokens) |next_limit| next_limit <= limit else false else true);
+}
+
+test "workspace declaration review policy bounds deadlines and reserves decision capacity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const policy = try parseExecution(alloc, "{\"review\":{\"max_calls\":12,\"reserved_calls\":2}}");
+    try std.testing.expectEqual(@as(usize, 12), policy.review.max_calls);
+    for ([_][]const u8{
+        "{\"review\":{\"max_calls\":2}}",
+        "{\"review\":{\"reserved_calls\":8}}",
+        "{\"review\":{\"response_timeout_ms\":300001}}",
+        "{\"review\":{\"max_read_bytes\":16385}}",
+        "{\"review\":{\"unknown\":1}}",
+    }) |raw| {
+        if (parseExecution(alloc, raw)) |_| return error.ExpectedInvalidPolicy else |_| {}
+    }
+}
+
+test "workspace declaration execution compatibility preserves legacy limits and rejects allowance escalation" {
+    const old: Execution = .{ .review = .{} };
+    var next = old;
+    next.review.max_calls += 1;
+    try std.testing.expect(!compatibleExecution(old, next));
+    next = old;
+    next.defaults.max_actor_steps = 3;
+    try std.testing.expect(compatibleExecution(old, next));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const legacy_execution = try parseExecution(arena.allocator(), "{}");
+    try std.testing.expectEqual(@as(u32, 60_000), legacy_execution.review.attempt_timeout_ms);
+    try std.testing.expectEqual(@as(usize, 1), legacy_execution.review.max_attempts);
+}
+
+test "workspace declaration validates action subcontracts against pinned operation schemas" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const declaration = try parse(alloc, seed);
+    const valid = (try std.json.parseFromSlice(Value, alloc, "{\"calls\":[{\"id\":\"call-1\",\"name\":\"shell\",\"arguments\":\"{}\"}]}", .{})).value;
+    try validateOperation(alloc, declaration, "omos_record_action", valid, .input);
+    const invalid = (try std.json.parseFromSlice(Value, alloc, "{\"calls\":[{\"name\":\"shell\"}]}", .{})).value;
+    try std.testing.expectError(error.InvalidOperationRecord, validateOperation(alloc, declaration, "omos_record_action", invalid, .input));
+    try std.testing.expectError(error.UnknownOperation, validateOperation(alloc, declaration, "unadvertised", valid, .input));
+}
+
+test "workspace declaration contract upgrades are additive and repeatable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const current = try parse(alloc, seed);
+    const first = try upgrade(alloc, current);
+    const second = try upgrade(alloc, first);
+    try std.testing.expectEqualStrings(current.hash, first.hash);
+    try std.testing.expectEqualStrings(first.hash, second.hash);
+    try std.testing.expect(try compatible(alloc, current, second));
+}
+
+/// Schemas belong to the pinned declaration; older tasks retain their legacy adapter.
+pub fn validateOperation(alloc: Allocator, declaration: Declaration, id: []const u8, value: Value, direction: enum { input, output }) !void {
+    const operation = named(items(spec(declaration.value), "operations"), id) orelse return error.UnknownOperation;
+    const shape = field(operation, @tagName(direction)) orelse return error.InvalidOperationContract;
+    if (!(try schema.validate(alloc, shape, value)).valid) return error.InvalidOperationRecord;
+}
+
+pub fn hasOperation(declaration: Declaration, id: []const u8) bool {
+    return named(items(spec(declaration.value), "operations"), id) != null;
+}
+
+/// Merge native additive contracts without overwriting a company's existing
+/// fields, operations or relationships. Active task bases are never rewritten.
+pub fn upgrade(alloc: Allocator, previous: Declaration) !Declaration {
+    var value = (try std.json.parseFromSlice(Value, alloc, try canonical(alloc, previous.value), .{})).value;
+    const native = try parse(alloc, seed);
+    const root = value.object.getPtr("spec").?;
+    const operations = root.object.getPtr("operations").?;
+    for (items(spec(native.value), "operations")) |operation| {
+        if (named(operations.array.items, text(operation, "id")) == null) try operations.array.append(operation);
+    }
+    if (root.object.get("semantic") == null) try root.object.put(alloc, "semantic", .{ .object = .empty });
+    const semantic = root.object.getPtr("semantic").?;
+    if (semantic.object.get("version") == null) try semantic.object.put(alloc, "version", .{ .string = "omniseedos.semantic/v1" });
+    for ([_][]const u8{ "entityTypes", "relationships" }) |key| {
+        if (semantic.object.get(key) == null) try semantic.object.put(alloc, key, .{ .array = .init(alloc) });
+        const rows = semantic.object.getPtr(key).?;
+        for (items(field(spec(native.value), "semantic").?, key)) |addition| {
+            const existing = for (rows.array.items) |*row| {
+                if (std.mem.eql(u8, text(row.*, "id"), text(addition, "id"))) break row;
+            } else null;
+            if (existing) |row| {
+                if (!std.mem.eql(u8, key, "entityTypes")) continue;
+                if (row.object.get("fields") == null) try row.object.put(alloc, "fields", .{ .object = .empty });
+                const fields = row.object.getPtr("fields").?;
+                var it = field(addition, "fields").?.object.iterator();
+                while (it.next()) |entry| if (!fields.object.contains(entry.key_ptr.*)) try fields.object.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
+            } else try rows.array.append(addition);
+        }
+    }
+    const result = try parse(alloc, try canonical(alloc, value));
+    if (!try compatible(alloc, previous, result)) return error.IncompatibleContractMigration;
+    return result;
 }
 
 fn publicData(value: Value) anyerror!void {
@@ -423,7 +561,7 @@ test "workspace declaration seed shares the pinned OmniForm model and validates 
     defer arena.deinit();
     const declaration = try parse(arena.allocator(), seed);
     try std.testing.expectEqual(@as(usize, 2), items(spec(declaration.value), "capabilities").len);
-    try std.testing.expectEqual(@as(usize, 11), declaration.semantic.entityTypes.len);
+    try std.testing.expectEqual(@as(usize, 14), declaration.semantic.entityTypes.len);
     try std.testing.expectEqual(@as(usize, 64), declaration.hash.len);
 }
 

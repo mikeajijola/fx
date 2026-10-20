@@ -302,10 +302,10 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .fossil,
         .token = "fossil",
-        .usage = "fossil [init|use|status|tasks|diff|history|verify|recover|export|migrate|query|definition show|validate|propose] [PATH] [--execution PATH] [--offset N] [--json]",
+        .usage = "fossil [init|use|status|tasks|diff|history|verify|recover|export|migrate|query|audit|serve|remote|definition show|validate|propose] [PATH] [--execution PATH] [--offset N] [--write] [--contracts] [--json]",
         .summary = "Manage the portable agent workspace",
         .options = &.{json_option},
-        .details = &.{ "init defaults to omos.fossil and archives existing history.", "use remembers an absolute repository binding in your profile.", "export writes a verified clone and refuses to overwrite files." },
+        .details = &.{ "init defaults to omos.fossil and archives existing history.", "use remembers an absolute repository binding in your profile.", "export writes a verified clone and refuses to overwrite files.", "audit validates canonical records against their pinned contracts.", "serve [PORT] binds loopback and requires OMOS_WORKSPACE_TOKEN; --write permits typed records and definition proposals.", "remote URL [REQUEST.json] uses the workspace API without a local repository." },
     },
     command_specs.slack_install_spec,
 };

@@ -17,13 +17,19 @@ pub const Turn = struct {
     prior_review_pages: []const []const u8 = &.{},
     prior_review_checkpoints: []const []const u8 = &.{},
     recorded_evidence: std.ArrayList([]const u8) = .empty,
+    invocation_id: ?[]const u8 = null,
+    assessment_record: ?[]const u8 = null,
 
     pub fn begin(alloc: std.mem.Allocator, session: []const u8, parent_session: ?[]const u8, project: []const u8, prompt: []const u8) !?Turn {
         const manager = (try workspace.Manager.bound(alloc)) orelse return null;
         const parent = if (parent_session) |id| try manager.active(id) else null;
         var task = if (try manager.active(session)) |active| active else try manager.start(session, project, prompt, parent);
         if (!std.mem.eql(u8, project, task.project_root)) return error.TaskProjectMismatch;
+        try manager.validateTaskBasis(task);
         var turn: Turn = .{ .manager = manager, .task = task };
+        var invocation: [16]u8 = undefined;
+        @import("../shared/io.zig").getIo().random(&invocation);
+        turn.invocation_id = try workspace.hash(alloc, &invocation);
         if (task.state == .publication_pending or (task.state == .accepted and try manager.publicationPending(task))) {
             const steering = parent_session == null and !std.ascii.eqlIgnoreCase(std.mem.trim(u8, prompt, " \t\r\n"), "continue") and !std.mem.eql(u8, prompt, task.definition.objective);
             if (steering) {
@@ -58,12 +64,19 @@ pub const Turn = struct {
         const evidence = try review.collectToolEvidence(alloc, messages);
         const coding = if (self.task.model_basis) |basis| if (basis.capability) |id| std.mem.eql(u8, id, "coding_task") else false else false;
         const source = if (coding) try @import("source_state.zig").fingerprint(alloc, self.task.project_root, self.manager.repository) else null;
-        for (evidence) |record| {
+        for (evidence) |original_record| {
+            var record = original_record;
+            if (self.invocation_id) |invocation| if (record.assistant_index) |index| if (record.raw_call_id) |id| {
+                record.action_id = try actionIdentity(alloc, invocation, index, id);
+                record.id = try alloc.print("execution:{s}:{s}", .{ record.action_id.?, record.id });
+            };
+            record.source = source;
             const observed = for (self.recorded_evidence.items) |id| {
                 if (std.mem.eql(u8, id, record.id)) break true;
             } else false;
             if (observed) continue;
             try self.manager.record(self.task, "tool_evidence", &[_]review.Evidence{record});
+            if (try @import("evidence_receipt.zig").derive(alloc, record)) |receipt| try self.manager.record(self.task, "command_receipt", receipt);
             if (source) |current| if (self.source_basis) |previous| {
                 if (record.status == .success and record.tool != null and (std.mem.eql(u8, record.tool.?, "shell") or std.mem.eql(u8, record.tool.?, "shell_input")) and std.mem.eql(u8, current, previous)) {
                     try self.manager.record(self.task, "source_validation", .{ .evidence = record.id, .source = current });
@@ -88,7 +101,18 @@ pub const Turn = struct {
         var checkpoints: std.ArrayList([]const u8) = .empty;
         for (try self.manager.taskHistory(self.task, self.reviewed_revision.?)) |bytes| {
             const Entry = struct { kind: []const u8, task: []const u8, contract_version: u32, value: std.json.Value };
-            const entry = (try std.json.parseFromSlice(Entry, alloc, bytes, .{})).value;
+            const entry = (try std.json.parseFromSlice(Entry, alloc, bytes, .{ .ignore_unknown_fields = true })).value;
+            if (std.mem.eql(u8, entry.kind, "command_receipt")) {
+                const content = try std.json.Stringify.valueAlloc(alloc, entry.value, .{});
+                try evidence.append(alloc, .{
+                    .id = try alloc.print("command-receipt:{s}", .{try workspace.hash(alloc, content)}),
+                    .kind = .verification,
+                    .content = content,
+                    .status = if (std.mem.eql(u8, @import("definition.zig").text(entry.value, "outcome"), "failed")) .failure else null,
+                    .action_id = @import("definition.zig").text(entry.value, "action_id"),
+                    .source = @import("definition.zig").text(entry.value, "source"),
+                });
+            }
             if (std.mem.eql(u8, entry.kind, "review_evidence_page") and entry.contract_version == self.task.definition.version) {
                 if (entry.value == .object) if (entry.value.object.get("data")) |data| if (data == .string) try pages.append(alloc, data.string);
             }
@@ -120,9 +144,36 @@ pub const Turn = struct {
         return .{ .context = self, .record_fn = recordReview };
     }
 
+    pub fn actionIdentity(alloc: std.mem.Allocator, invocation: []const u8, assistant_index: usize, call: []const u8) ![]const u8 {
+        return alloc.print("{s}:{d}:{s}", .{ invocation, assistant_index, try workspace.hash(alloc, call) });
+    }
+
+    /// Only distinct inspected bytes or independent segment findings establish
+    /// review progress. Repeated queries and failed verdicts cannot renew budgets.
+    pub fn reviewProgress(self: *Turn) ![]const u8 {
+        const revision = try self.manager.checkpoint(self.task);
+        var identities: std.StringHashMapUnmanaged(void) = .empty;
+        for (try self.manager.taskHistory(self.task, revision)) |raw| {
+            const model = @import("definition.zig");
+            const row = (try std.json.parseFromSlice(std.json.Value, self.manager.alloc, raw, .{})).value;
+            const kind = model.text(row, "kind");
+            if (!std.mem.eql(u8, kind, "review_evidence_page") and !std.mem.eql(u8, kind, "review_segment_assessment")) continue;
+            const version = model.field(row, "contract_version") orelse continue;
+            if (version != .integer or version.integer != self.task.definition.version) continue;
+            const value = model.field(row, "value") orelse continue;
+            const data = model.text(value, "data");
+            const page = (std.json.parseFromSlice(std.json.Value, self.manager.alloc, data, .{}) catch continue).value;
+            if (std.mem.eql(u8, kind, "review_evidence_page") and model.text(page, "id").len == 0) continue;
+            try identities.put(self.manager.alloc, try workspace.hash(self.manager.alloc, data), {});
+        }
+        // Count distinct immutable pages; repeated identical pages do not advance.
+        return self.manager.alloc.print("{d}", .{identities.count()});
+    }
+
     fn recordReview(raw: *anyopaque, kind: []const u8, bytes: []const u8) !void {
         const self: *Turn = @ptrCast(@alignCast(raw));
-        try self.manager.record(self.task, kind, .{ .at_ms = @import("../shared/io.zig").milliTimestamp(), .data = bytes });
+        const id = try self.manager.recordReceipt(self.task, kind, .{ .at_ms = @import("../shared/io.zig").milliTimestamp(), .data = bytes });
+        if (std.mem.eql(u8, kind, "review_assessment")) self.assessment_record = id;
     }
 
     pub fn sealReview(self: *Turn) !void {
@@ -140,17 +191,32 @@ pub const Turn = struct {
         const basis = self.task.model_basis orelse return true;
         if (basis.capability == null or !std.mem.eql(u8, basis.capability.?, "coding_task")) return true;
         const current = try @import("source_state.zig").fingerprint(self.manager.alloc, self.task.project_root, self.manager.repository);
+        const history = try self.manager.taskHistory(self.task, self.reviewed_revision.?);
         const assessment = try record_json.decode(@import("../agent/runtime/work_contract.zig").Assessment, self.manager.alloc, bytes, .{});
         for (assessment.obligations) |obligation| {
             if (!std.mem.eql(u8, obligation.id, "coding_validation") or obligation.status != .met) continue;
             var supported = false;
-            for (try self.manager.taskHistory(self.task, self.reviewed_revision.?)) |raw| {
+            for (history) |raw| {
                 const record = (try std.json.parseFromSlice(std.json.Value, self.manager.alloc, raw, .{})).value;
                 const model = @import("definition.zig");
                 if (!std.mem.eql(u8, model.text(record, "kind"), "source_validation")) continue;
                 const value = model.field(record, "value") orelse continue;
                 if (!std.mem.eql(u8, model.text(value, "source"), current)) continue;
-                for (obligation.evidence) |id| supported = supported or std.mem.eql(u8, id, model.text(value, "evidence"));
+                for (obligation.evidence) |id| {
+                    if (std.mem.eql(u8, id, model.text(value, "evidence"))) {
+                        supported = true;
+                        continue;
+                    }
+                    for (history) |receipt_raw| {
+                        const receipt_row = (try std.json.parseFromSlice(std.json.Value, self.manager.alloc, receipt_raw, .{})).value;
+                        if (!std.mem.eql(u8, model.text(receipt_row, "kind"), "command_receipt")) continue;
+                        const receipt = model.field(receipt_row, "value") orelse continue;
+                        if (!std.mem.eql(u8, model.text(receipt, "outcome"), "succeeded") or !std.mem.eql(u8, model.text(receipt, "evidence_id"), model.text(value, "evidence"))) continue;
+                        const content = try std.json.Stringify.valueAlloc(self.manager.alloc, receipt, .{});
+                        const reference = try self.manager.alloc.print("command-receipt:{s}", .{try workspace.hash(self.manager.alloc, content)});
+                        if (std.mem.eql(u8, id, reference)) supported = true;
+                    }
+                }
             }
             if (!supported) return false;
         }
@@ -166,6 +232,7 @@ pub const Turn = struct {
             .candidate = candidate,
             .assessment = self.assessment,
             .workspace_snapshot = self.review_snapshot,
+            .assessment_record = self.assessment_record,
         });
         self.task = try self.manager.loadTask(self.task.id);
     }

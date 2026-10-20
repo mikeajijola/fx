@@ -21,6 +21,12 @@ pinned in the E2E development dependencies.
 The execution policy is a separate `omos.execution/v1` document. Its bounded
 fields are `progress_interval` (1–100), `stalled_checks` (1–20) and
 `max_actor_steps` (2–10000). Defaults are 4, 3 and 100 respectively.
+The optional `review` section bounds model calls, reserved decision calls,
+response and attempt deadlines, automatic attempts, total time, serialized
+context, individual reads and reported token usage. New workspaces save these
+settings explicitly. Missing review settings retain the legacy eight-call,
+60-second, single-attempt policy. Automatic proposals may tighten allowances;
+increases remain inactive. See [contract authority](../CONTRACTS.md).
 
 `semantic.ts` is an unchanged reference copy of the SaaS extension from commit
 `e3d1d5f1ed7d5918f9d6997949a942c7fcdcb2f1`. Parity tests use it with the SaaS's

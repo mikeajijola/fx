@@ -6849,6 +6849,44 @@ noinline fn assessCompletionContract(
     summary: *runtime_telemetry.TurnSummaryAccumulator,
     input: ContractCandidate,
 ) !work_contract.Decision {
+    const policy = if (input.managed) |turn| if (turn.task.model_basis) |basis| basis.execution.review else @import("../../workspace/definition.zig").ReviewPolicy{} else @import("../../workspace/definition.zig").ReviewPolicy{};
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(policy.total_timeout_ms) });
+    var previous_progress: ?[]const u8 = null;
+    var token_spent: u64 = 0;
+    for (0..policy.max_attempts) |attempt| {
+        const result = assessCompletionAttempt(deps, arena, summary, input, deadline, &token_spent) catch |err| switch (err) {
+            error.ContractReviewPending, error.Timeout => {
+                if (input.managed) |turn| {
+                    const progress = try turn.reviewProgress();
+                    const changed = if (previous_progress) |previous| !std.mem.eql(u8, previous, progress) else true;
+                    previous_progress = progress;
+                    if (changed and attempt + 1 < policy.max_attempts and std.Io.Clock.Timestamp.compare(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake), .lt, deadline)) {
+                        try deps.push_system_notice(deps.ctx, "Continuing verification from retained evidence; completed actions will not be repeated.");
+                        continue;
+                    }
+                    try turn.manager.record(turn.task, "review_pending", .{ .attempts = attempt + 1, .reason = @errorName(err), .started = started, .candidate_retained = true });
+                    try turn.manager.record(turn.task, "paused_result", .{ .status = "verification_pending", .summary = "Verification is pending. The candidate answer and inspection progress are retained; no completion has been accepted.", .remaining_contract = turn.task.definition, .candidate_retained = true });
+                    turn.task = try turn.manager.setState(turn.task.id, .paused);
+                    _ = try turn.manager.checkpoint(turn.task);
+                } else return err;
+                return .{ .disposition = .continue_work, .verification_pending = true, .feedback = "Verification is pending after reaching its review allowance. The answer, changes and inspection progress are saved. Continue resumes verification without repeating completed actions." };
+            },
+            else => return err,
+        };
+        return result;
+    }
+    unreachable;
+}
+
+noinline fn assessCompletionAttempt(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    summary: *runtime_telemetry.TurnSummaryAccumulator,
+    input: ContractCandidate,
+    total_deadline: std.Io.Clock.Timestamp,
+    token_spent: *u64,
+) !work_contract.Decision {
     if (deps.assess_contract) |assess_contract| {
         return assess_contract(deps.ctx, arena, input.candidate, input.turn_id, input.step);
     }
@@ -6858,7 +6896,19 @@ noinline fn assessCompletionContract(
     var event_context: u8 = 0;
     if (input.managed) |turn| try turn.manager.record(turn.task, "review_candidate", .{ .at_ms = io_mod.milliTimestamp(), .text = input.candidate });
     const prior_evidence = if (input.managed) |turn| try turn.beforeReview(arena, input.messages) else &.{};
+    const policy = if (input.managed) |turn| if (turn.task.model_basis) |basis| basis.execution.review else @import("../../workspace/definition.zig").ReviewPolicy{} else @import("../../workspace/definition.zig").ReviewPolicy{};
+    const attempt_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(policy.attempt_timeout_ms) });
+    var attempt_usage: types.Usage = .{};
+    defer if (attempt_usage.input_tokens != null or attempt_usage.output_tokens != null) {
+        if (deps.report_usage) |report| report(deps.ctx, attempt_usage);
+        summary.prepareTokenRequest();
+        _ = summary.reconcileTokenRequest(attempt_usage, false);
+    };
     const result = completion_review.assess(arena, deps.agent_stream_provider, .{
+        .policy = policy,
+        .token_spent = token_spent,
+        .managed_evidence = input.managed != null,
+        .usage_out = &attempt_usage,
         .journal = if (input.managed) |turn| turn.journal() else null,
         .provider = input.job.provider,
         .definition = if (input.managed) |turn| turn.task.definition else null,
@@ -6881,7 +6931,7 @@ noinline fn assessCompletionContract(
             .provider_options = .{},
             .trace_ctx = .{ .turn_id = input.turn_id },
             .content_capture_limit = work_contract.max_bytes,
-            .deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(60_000) }),
+            .deadline = if (std.Io.Clock.Timestamp.compare(total_deadline, .lt, attempt_deadline)) total_deadline else attempt_deadline,
             .delivery = &delivery,
             .attempt_evidence = &evidence,
             .events = .{ .context = &event_context, .emit_fn = discardContractEvent },
@@ -6890,12 +6940,9 @@ noinline fn assessCompletionContract(
         },
     }) catch |err| {
         if (input.managed) |turn| try turn.manager.record(turn.task, "review_failure", .{ .at_ms = io_mod.milliTimestamp(), .reason = @errorName(err), .candidate_retained = true });
-        if (err != error.Cancelled) try deps.push_system_notice(deps.ctx, if (err == error.ContractReviewPending) "Verification reached its evidence budget. The answer and review progress are retained; continue retries verification without repeating actions." else "Completion could not be verified; the answer and evidence remain retained for verification.");
+        if (err != error.Cancelled and err != error.ContractReviewPending and err != error.Timeout) try deps.push_system_notice(deps.ctx, "Completion could not be verified; the answer and evidence remain retained for verification.");
         return err;
     };
-    if (deps.report_usage) |report| report(deps.ctx, result.usage);
-    summary.prepareTokenRequest();
-    _ = summary.reconcileTokenRequest(result.usage, false);
     debug_trace.eventf("agent", "contract_assessment", .{ .turn_id = input.turn_id }, "disposition={s} step={d}", .{ @tagName(result.decision.disposition), input.step });
     if (input.managed) |turn| {
         try turn.sealReview();
@@ -7096,6 +7143,10 @@ fn processQueuedPromptLoop(
                 .step = 0,
                 .managed = turn,
             });
+            if (decision.verification_pending) {
+                try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, decision.feedback, "verification_pending");
+                return;
+            }
             if (decision.disposition == .fulfilled) {
                 try turn.publish(candidate);
                 try deps.push_text(deps.ctx, .assistant_started);
@@ -9827,6 +9878,10 @@ fn processQueuedPromptLoop(
                         .turn_id = turn_id,
                         .step = current_step_index,
                     });
+                    if (decision.verification_pending) {
+                        try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, decision.feedback, "verification_pending");
+                        return;
+                    }
                     if (deps.assess_contract == null and decision.disposition == .blocked) {
                         try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, decision.feedback, "contract_blocked");
                         return;
@@ -10348,9 +10403,9 @@ fn processQueuedPromptLoop(
                 provider_replay,
         );
         if (managed) |*turn| {
-            const Intent = struct { id: []const u8, name: []const u8, arguments: []const u8 };
+            const Intent = struct { id: []const u8, name: []const u8, arguments: []const u8, execution_id: ?[]const u8 };
             const intents = try arena.alloc(Intent, effective_tool_calls.len);
-            for (effective_tool_calls, intents) |call, *intent| intent.* = .{ .id = call.id, .name = call.name, .arguments = call.arguments_json };
+            for (effective_tool_calls, intents) |call, *intent| intent.* = .{ .id = call.id, .name = call.name, .arguments = call.arguments_json, .execution_id = if (turn.invocation_id) |invocation| try managed_task.Turn.actionIdentity(arena, invocation, within_turn_suffix.items.len - 1, call.id) else null };
             try turn.manager.record(turn.task, "action_intent", .{ .calls = intents });
         }
         try appendRunningToolCalls(deps, finalization, job, within_turn_suffix.items, effective_tool_calls);
@@ -12697,6 +12752,10 @@ fn processQueuedPromptLoop(
                     .turn_id = turn_id,
                     .step = current_step_index,
                 });
+                if (decision.verification_pending) {
+                    try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, decision.feedback, "verification_pending");
+                    return;
+                }
                 if (deps.assess_contract == null and decision.disposition == .blocked) {
                     try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, decision.feedback, "contract_blocked");
                     return;

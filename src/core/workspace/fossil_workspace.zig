@@ -33,6 +33,7 @@ pub const Task = struct {
     amendments: []const []const u8 = &.{},
     dependencies: []const ReadDependency = &.{},
     model_basis: ?model.Basis = null,
+    review_job: ?[]const u8 = null,
     state: enum { active, paused, blocked, conflict, publication_pending, accepted } = .active,
 };
 pub const Review = struct {
@@ -43,6 +44,7 @@ pub const Review = struct {
     candidate: []const u8,
     assessment: []const u8 = "",
     workspace_snapshot: []const u8 = "",
+    assessment_record: ?[]const u8 = null,
 };
 pub const ReviewFile = struct { path: []const u8, content: []const u8, hash: []const u8 };
 pub const ReviewInputs = struct { snapshot: []const u8, files: []const ReviewFile };
@@ -52,7 +54,36 @@ const Publication = struct {
     target: []const u8,
     task: Task,
     review: Review,
+    review_fence: ?@import("review_job.zig").Fence = null,
 };
+
+fn publicationEqual(alloc: Allocator, bytes: []const u8, expected: Publication) !bool {
+    // Compare decoded contracts so newly added optional fields do not invalidate
+    // a historical receipt that omitted their legacy defaults. Original bytes
+    // remain retained and all known identities and values must still agree.
+    const retained = try record_json.decode(Publication, alloc, bytes, .{});
+    return std.mem.eql(u8, try json(alloc, retained), try json(alloc, expected));
+}
+
+test "workspace paths historical publication receipts preserve omitted optional defaults" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const publication: Publication = .{
+        .operation = "operation",
+        .source = "revision",
+        .target = "trunk",
+        .task = .{ .id = "task", .workspace_id = "workspace", .session = "session", .branch = "task/task", .base_revision = "base", .project_root = "/repo", .definition = .{ .id = "task", .version = 1, .objective = "Answer", .obligations = &.{.{ .id = "request_complete", .description = "Answer" }} } },
+        .review = .{ .task_id = "task", .revision = "revision", .contract_version = 1, .disposition = "fulfilled", .candidate = "Answer" },
+    };
+    var legacy = (try std.json.parseFromSlice(std.json.Value, alloc, try json(alloc, publication), .{})).value;
+    _ = legacy.object.swapRemove("review_fence");
+    _ = legacy.object.getPtr("task").?.object.swapRemove("review_job");
+    _ = legacy.object.getPtr("review").?.object.swapRemove("assessment_record");
+    try std.testing.expect(try publicationEqual(alloc, try json(alloc, legacy), publication));
+    try legacy.object.getPtr("review").?.object.put(alloc, "candidate", .{ .string = "Changed" });
+    try std.testing.expect(!try publicationEqual(alloc, try json(alloc, legacy), publication));
+}
 const PortableRegistry = struct {
     format: u32 = 1,
     tasks: []const Task,
@@ -94,6 +125,25 @@ fn readBounded(alloc: Allocator, path: []const u8, limit: usize) ![]const u8 {
 
 fn json(alloc: Allocator, value: anytype) ![]const u8 {
     return portableJson(alloc, try std.json.Stringify.valueAlloc(alloc, value, .{}));
+}
+
+fn omitNulls(alloc: Allocator, value: std.json.Value) anyerror!std.json.Value {
+    switch (value) {
+        .object => |object| {
+            var result: std.json.ObjectMap = .empty;
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.* != .null) try result.put(alloc, entry.key_ptr.*, try omitNulls(alloc, entry.value_ptr.*));
+            }
+            return .{ .object = result };
+        },
+        .array => |array| {
+            var result: std.array_list.Managed(std.json.Value) = .init(alloc);
+            for (array.items) |item| try result.append(try omitNulls(alloc, item));
+            return .{ .array = result };
+        },
+        else => return value,
+    }
 }
 
 // Keep parsing and redaction shared across all serialized record types.
@@ -252,10 +302,181 @@ pub fn configured(alloc: Allocator) !?Binding {
 /// Slices returned by this manager belong to its allocator, which must be an
 /// operation-scoped arena. The manager keeps no process-global workspace state.
 pub const Manager = struct {
+    expected_revision: ?[]const u8 = null,
+    review_fence: ?@import("review_job.zig").Fence = null,
+
     alloc: Allocator,
     repository: []const u8,
     root: []const u8,
     manifest: Manifest,
+
+    fn checkExpectedRevision(self: Manager, branch: []const u8) !void {
+        if (self.expected_revision) |expected| if (!std.mem.eql(u8, expected, try self.revision(branch))) return error.WorkspaceRevisionChanged;
+    }
+
+    fn jobPath(self: Manager, id: []const u8) ![]const u8 {
+        if (!safeId(id)) return error.InvalidReviewJob;
+        return self.alloc.print("jobs/{s}.json", .{id});
+    }
+
+    pub fn loadReviewJob(self: Manager, task: Task, id: []const u8) !@import("review_job.zig").Job {
+        var value = try record_json.decode(@import("review_job.zig").Job, self.alloc, try self.contentAt(try self.jobPath(id), try self.revision(task.branch)), .{});
+        if (task.state == .accepted) {
+            const accepted = self.contentAt(try self.jobPath(id), task.parent) catch null;
+            if (accepted) |raw| value = try record_json.decode(@import("review_job.zig").Job, self.alloc, raw, .{});
+        }
+        if (!std.mem.eql(u8, value.version, "omos.review-job/v1")) return error.UnsupportedReviewJobVersion;
+        if (!std.mem.eql(u8, value.id, id) or !std.mem.eql(u8, value.task, task.id) or value.generation > std.math.maxInt(i64)) return error.InvalidReviewJob;
+        return value;
+    }
+
+    fn saveReviewJob(self: Manager, task: Task, job: @import("review_job.zig").Job) !void {
+        if (job.workspace_definition_revision.len > 0) {
+            const declaration = try self.loadDeclaration(job.workspace_definition_revision);
+            if (!std.mem.eql(u8, declaration.hash, job.workspace_definition_hash)) return error.StaleWorkspaceDefinition;
+            try model.validateOperation(self.alloc, declaration, "omos_record_review_job", (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, job), .{})).value, .input);
+        }
+        const tree = try self.checkout(task.branch);
+        try atomicWrite(self.alloc, try join(self.alloc, tree, try self.taskPath(task.id)), try json(self.alloc, task));
+        try atomicWrite(self.alloc, try join(self.alloc, tree, try self.jobPath(job.id)), try json(self.alloc, job));
+        _ = try self.commit(tree, "Retain durable review job state");
+    }
+
+    pub fn queueReview(self: Manager, previous: Task) !@import("review_job.zig").Job {
+        const lease = try Lease.acquire(self.alloc, self.root);
+        defer lease.release();
+        var task = try self.loadTask(previous.id);
+        try self.checkExpectedRevision(task.branch);
+        if (task.state == .accepted or task.state == .publication_pending or task.state == .conflict) return error.TaskIsReadOnly;
+        const definition_hash = if (task.model_basis) |basis| basis.definition_hash else "legacy-contract";
+        const candidate = (try self.failedReviewCandidate(task)) orelse return error.NoRetainedReviewCandidate;
+        const candidate_hash = try hash(self.alloc, candidate);
+        const workspace_basis = (try self.modelBasis(try self.revision("trunk"))) orelse return error.WorkspaceMigrationRequired;
+        const id = try hash(self.alloc, try json(self.alloc, .{ task.id, task.definition.version, definition_hash, candidate_hash, workspace_basis.definition_hash }));
+        var generation: u64 = 0;
+        if (self.loadReviewJob(task, id)) |existing| {
+            if (existing.state == .queued or existing.state == .running or existing.state == .published) return existing;
+            generation = existing.generation;
+        } else |err| if (err != error.FossilCommandFailed) return err;
+        const job: @import("review_job.zig").Job = .{ .id = id, .task = task.id, .contract_version = task.definition.version, .definition_hash = definition_hash, .candidate_hash = candidate_hash, .generation = generation, .workspace_definition_hash = workspace_basis.definition_hash, .workspace_definition_revision = workspace_basis.revision, .budget_epoch = std.math.add(u64, generation, 1) catch return error.InvalidReviewJob };
+        task.review_job = id;
+        try self.saveReviewJob(task, job);
+        try self.saveTask(task);
+        return job;
+    }
+
+    pub fn claimReview(self: Manager, owner: []const u8) !?@import("review_job.zig").Job {
+        const lease = try Lease.acquire(self.alloc, self.root);
+        defer lease.release();
+        const now = io_mod.milliTimestamp();
+        for (try self.tasks()) |loaded| {
+            var task = loaded;
+            if (task.state == .accepted or task.state == .conflict) continue;
+            try self.drain(task);
+            if (task.state == .publication_pending and try self.publicationCommitted(task)) {
+                _ = try self.finishPublication(try parse(self.alloc, Publication, try read(self.alloc, try self.publicationPath(task.id))));
+                continue;
+            }
+            for (try self.inventory(task.branch)) |path| {
+                if (!std.mem.startsWith(u8, path, "jobs/") or !std.mem.endsWith(u8, path, ".json")) continue;
+                const owned = try record_json.decode(@import("review_job.zig").Job, self.alloc, try self.contentAt(path, task.branch), .{});
+                if (!std.mem.eql(u8, owned.task, task.id)) continue;
+                var job = try self.loadReviewJob(task, path[5 .. path.len - 5]);
+                if (job.state != .queued and !(job.state == .running and job.lease_expires_ms <= now)) continue;
+                if (task.state == .publication_pending) {
+                    // A committed receipt was reconciled above. No effects were
+                    // published, so an expired owner must acquire a fresh lease.
+                    try remove(try self.publicationPath(task.id));
+                    task.state = .paused;
+                    try self.saveTask(task);
+                }
+                const definition_hash = if (task.model_basis) |basis| basis.definition_hash else "legacy-contract";
+                if (job.contract_version != task.definition.version or !std.mem.eql(u8, job.definition_hash, definition_hash)) {
+                    job.state = .changes_required;
+                    job.reason = "The task contract or definition changed before review.";
+                    try self.saveReviewJob(task, job);
+                    continue;
+                }
+                job.state = .running;
+                if (job.generation >= std.math.maxInt(i64)) return error.InvalidReviewJob;
+                job.generation += 1;
+                job.owner = owner;
+                const policy = if (task.model_basis) |basis| basis.execution.review else model.ReviewPolicy.legacy;
+                job.reported_tokens = try self.retainedReviewTokens(task, job);
+                if (job.started_ms == 0) job.started_ms = now;
+                const elapsed = @max(0, now - job.started_ms);
+                if (job.review_attempts >= policy.max_attempts or elapsed >= policy.total_timeout_ms or (if (policy.max_tokens) |limit| job.reported_tokens >= limit else false)) {
+                    job.state = .pending;
+                    job.reason = "The durable review allowance is exhausted. Requeue explicitly to allocate another invocation; retained evidence is preserved.";
+                    task.state = .paused;
+                    try self.saveTask(task);
+                    try self.saveReviewJob(task, job);
+                    continue;
+                }
+                job.lease_expires_ms = now + policy.total_timeout_ms - elapsed + 30_000;
+                job.attempts += 1;
+                try self.saveReviewJob(task, job);
+                return job;
+            }
+        }
+        return null;
+    }
+
+    pub fn finishReviewJob(self: Manager, previous: @import("review_job.zig").Job, state: @FieldType(@import("review_job.zig").Job, "state"), reason: []const u8) !void {
+        const lease = try Lease.acquire(self.alloc, self.root);
+        defer lease.release();
+        const task = try self.loadTask(previous.task);
+        var job = try self.loadReviewJob(task, previous.id);
+        const fence: @import("review_job.zig").Fence = .{ .task = previous.task, .job = previous.id, .owner = previous.owner, .generation = previous.generation };
+        if (!@import("review_job.zig").owns(job, fence, io_mod.milliTimestamp())) return error.StaleReviewLease;
+        job.state = state;
+        job.reason = reason;
+        job.lease_expires_ms = 0;
+        job.reported_tokens = try self.retainedReviewTokens(task, job);
+        try self.saveReviewJob(task, job);
+    }
+
+    pub fn beginReviewAttempt(self: Manager, previous: @import("review_job.zig").Job) !bool {
+        if (self.review_fence == null) return error.StaleReviewLease;
+        const lease = try Lease.acquire(self.alloc, self.root);
+        defer lease.release();
+        var task = try self.loadTask(previous.task);
+        var job = try self.loadReviewJob(task, previous.id);
+        try self.checkReviewFence(task);
+        const policy = if (task.model_basis) |basis| basis.execution.review else model.ReviewPolicy.legacy;
+        if (job.review_attempts >= policy.max_attempts or io_mod.milliTimestamp() - job.started_ms >= policy.total_timeout_ms) {
+            job.state = .pending;
+            job.reason = "The durable review allowance is exhausted; inspection progress is retained.";
+            task.state = .paused;
+            try self.saveTask(task);
+            try self.saveReviewJob(task, job);
+            return false;
+        }
+        job.review_attempts += 1;
+        try self.saveReviewJob(task, job);
+        return true;
+    }
+
+    fn retainedReviewTokens(self: Manager, task: Task, job: @import("review_job.zig").Job) !u64 {
+        var tokens = job.reported_tokens;
+        for (try self.taskHistory(task, try self.revision(task.branch))) |raw| {
+            const row = (try std.json.parseFromSlice(std.json.Value, self.alloc, raw, .{})).value;
+            if (!std.mem.eql(u8, model.text(row, "kind"), "review_usage") or !std.mem.eql(u8, model.text(row, "review_job"), job.id)) continue;
+            const generation = model.field(row, "review_generation") orelse continue;
+            if (generation != .integer or generation.integer < 0 or @as(u64, @intCast(generation.integer)) < job.budget_epoch) continue;
+            const value = model.field(row, "value") orelse continue;
+            const usage = try record_json.decode(struct { reported_tokens: u64 }, self.alloc, model.text(value, "data"), .{ .ignore_unknown_fields = true });
+            tokens = @max(tokens, usage.reported_tokens);
+        }
+        return tokens;
+    }
+
+    fn checkReviewFence(self: Manager, task: Task) !void {
+        if (self.review_fence) |fence| {
+            const job = try self.loadReviewJob(task, fence.job);
+            if (!@import("review_job.zig").owns(job, fence, io_mod.milliTimestamp())) return error.StaleReviewLease;
+        }
+    }
 
     fn run(self: Manager, cwd: ?[]const u8, arguments: []const []const u8) ![]const u8 {
         if (comptime builtin.target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
@@ -359,7 +580,7 @@ pub const Manager = struct {
         const tree = try self.checkout("trunk");
         try atomicWrite(alloc, try join(alloc, tree, manifest_path), try json(alloc, self.manifest));
         try atomicWrite(alloc, try join(alloc, tree, model.declaration_path), model.initial_declaration);
-        try atomicWrite(alloc, try join(alloc, tree, model.execution_path), try json(alloc, model.Execution{}));
+        try atomicWrite(alloc, try join(alloc, tree, model.execution_path), try json(alloc, model.Execution{ .review = .{} }));
         _ = try self.commit(tree, "Initialize omos agent workspace");
         return self;
     }
@@ -478,10 +699,30 @@ pub const Manager = struct {
         if (!std.mem.eql(u8, task.branch, try self.alloc.print("task/{s}", .{task.id}))) return error.InvalidWorkspaceFormat;
         if (!std.mem.eql(u8, task.parent, "trunk") and !(std.mem.startsWith(u8, task.parent, "task/") and safeId(task.parent[5..]))) return error.InvalidWorkspaceFormat;
         if (!std.Io.Dir.path.isAbsolute(task.project_root)) return error.InvalidWorkspaceFormat;
+        const checked_contract = try contract.parse(self.alloc, try json(self.alloc, task.definition));
+        checked_contract.deinit();
+        if (task.model_basis) |basis| {
+            if (!std.mem.eql(u8, basis.profile, model.profile_id) or !safeId(basis.definition_hash)) return error.UnsupportedWorkspaceProfile;
+            _ = try model.parseExecution(self.alloc, try json(self.alloc, basis.execution));
+        }
         if (task.request_artifact) |path| {
             if (path.len != 74 or !std.mem.startsWith(u8, path, "artifacts/") or !safeId(path[10..])) return error.InvalidArtifactIdentity;
         }
         return task;
+    }
+
+    pub fn validateTaskBasis(self: Manager, task: Task) !void {
+        const basis = task.model_basis orelse return;
+        const declaration = try self.loadDeclaration(basis.revision);
+        if (!std.mem.eql(u8, declaration.hash, basis.definition_hash)) return error.StaleWorkspaceDefinition;
+        const execution_bytes = try self.contentAt(model.execution_path, basis.revision);
+        const execution = try model.parseExecution(self.alloc, execution_bytes);
+        if (!std.mem.eql(u8, try json(self.alloc, execution), try json(self.alloc, basis.execution))) return error.StaleExecutionPolicy;
+        if (basis.execution_hash) |expected| {
+            const value = (try std.json.parseFromSlice(std.json.Value, self.alloc, execution_bytes, .{})).value;
+            if (!std.mem.eql(u8, expected, try model.digest(self.alloc, value))) return error.StaleExecutionPolicy;
+        }
+        if (basis.capability) |capability| if (!model.nativeCapability(declaration, capability)) return error.UnboundCapability;
     }
 
     fn sessionPath(self: Manager, session: []const u8) ![]const u8 {
@@ -589,6 +830,7 @@ pub const Manager = struct {
     }
 
     pub fn setState(self: Manager, id: []const u8, state: @FieldType(Task, "state")) !Task {
+        if (state == .accepted or state == .publication_pending or state == .conflict) return error.ProtectedTaskTransition;
         const lease = try Lease.acquire(self.alloc, self.root);
         defer lease.release();
         var task = try self.loadTask(id);
@@ -634,7 +876,13 @@ pub const Manager = struct {
     }
 
     pub fn bindingHash(self: Manager, task: Task) ![]const u8 {
-        return hash(self.alloc, try json(self.alloc, .{ self.manifest.id, task.id, task.branch, task.parent, task.base_revision, task.project_root, task.definition, task.amendments, task.parent_task_id, task.parent_contract_version, task.request_artifact }));
+        if (task.model_basis == null or task.model_basis.?.execution_hash == null) {
+            // Existing local checkpoints predate model-basis hashing. Their
+            // original binding remains valid; validateTaskBasis separately
+            // checks the retained declaration and policy before execution.
+            return hash(self.alloc, try json(self.alloc, .{ self.manifest.id, task.id, task.branch, task.parent, task.base_revision, task.project_root, task.definition, task.amendments, task.parent_task_id, task.parent_contract_version, task.request_artifact }));
+        }
+        return hash(self.alloc, try json(self.alloc, .{ self.manifest.id, task.id, task.branch, task.parent, task.base_revision, task.project_root, task.definition, task.amendments, task.parent_task_id, task.parent_contract_version, task.request_artifact, task.model_basis }));
     }
 
     fn journalDir(self: Manager, task: Task) ![]const u8 {
@@ -645,25 +893,58 @@ pub const Manager = struct {
     /// The caller supplies only public task data, never opaque session state.
     pub fn record(self: Manager, task: Task, kind: []const u8, value: anytype) !void {
         const raw = try std.json.Stringify.valueAlloc(self.alloc, value, .{});
-        try self.recordJson(task, kind, raw);
+        _ = try self.recordJson(task, kind, raw);
+    }
+
+    pub fn recordReceipt(self: Manager, task: Task, kind: []const u8, value: anytype) ![]const u8 {
+        return self.recordJson(task, kind, try std.json.Stringify.valueAlloc(self.alloc, value, .{}));
     }
 
     // The durable journal path is independent of the caller's payload type.
-    noinline fn recordJson(self: Manager, task: Task, kind: []const u8, raw: []const u8) !void {
+    noinline fn recordJson(self: Manager, task: Task, kind: []const u8, raw: []const u8) ![]const u8 {
         const lease = try Lease.acquire(self.alloc, self.root);
         defer lease.release();
+        try self.checkExpectedRevision(task.branch);
         const current = try self.loadTask(task.id);
         if (current.definition.version != task.definition.version) return error.StaleWorkContract;
+        try self.checkReviewFence(current);
+        if (std.mem.eql(u8, kind, "action_intent")) if (current.review_job) |id| {
+            const job = try self.loadReviewJob(current, id);
+            if (job.state == .queued or job.state == .running) return error.TaskReviewInProgress;
+        };
         if (current.state == .accepted or current.state == .publication_pending) return error.TaskIsReadOnly;
-        const value = (try std.json.parseFromSlice(std.json.Value, self.alloc, raw, .{})).value;
+        var value = (try std.json.parseFromSlice(std.json.Value, self.alloc, raw, .{})).value;
+        if (current.model_basis) |basis| {
+            const operation = if (std.mem.eql(u8, kind, "action_intent")) "omos_record_action" else if (std.mem.eql(u8, kind, "tool_evidence")) "omos_record_evidence" else if (std.mem.eql(u8, kind, "review_assessment")) "omos_record_assessment" else "";
+            if (operation.len > 0) {
+                const declaration_value = try self.loadDeclaration(basis.revision);
+                if (model.hasOperation(declaration_value, operation)) {
+                    // Optional metadata serialized as null is absent, not a typed value.
+                    const payload = if (std.mem.eql(u8, kind, "review_assessment")) (try std.json.parseFromSlice(std.json.Value, self.alloc, model.text(value, "data"), .{})).value else value;
+                    const clean = try omitNulls(self.alloc, payload);
+                    try model.validateOperation(self.alloc, declaration_value, operation, clean, .input);
+                    if (!std.mem.eql(u8, kind, "review_assessment")) value = clean;
+                }
+            }
+        }
         var envelope: std.json.ObjectMap = .empty;
         try envelope.put(self.alloc, "kind", .{ .string = kind });
         try envelope.put(self.alloc, "task", .{ .string = task.id });
         try envelope.put(self.alloc, "contract_version", .{ .integer = task.definition.version });
         try envelope.put(self.alloc, "value", value);
+        if (self.review_fence) |fence| {
+            try envelope.put(self.alloc, "review_job", .{ .string = fence.job });
+            try envelope.put(self.alloc, "review_generation", .{ .integer = @intCast(fence.generation) });
+        }
+        if (current.model_basis) |basis| {
+            try envelope.put(self.alloc, "definition_hash", .{ .string = basis.definition_hash });
+            try envelope.put(self.alloc, "definition_revision", .{ .string = basis.revision });
+        }
         const bytes = try portableValue(self.alloc, .{ .object = envelope });
-        try atomicWrite(self.alloc, try join(self.alloc, try self.journalDir(task), try hash(self.alloc, bytes)), bytes);
+        const id = try hash(self.alloc, bytes);
+        try atomicWrite(self.alloc, try join(self.alloc, try self.journalDir(task), id), bytes);
         if (std.mem.eql(u8, kind, "action_intent")) try fault("action-recorded");
+        return id;
     }
 
     fn entries(self: Manager, path: []const u8) ![]const []const u8 {
@@ -728,6 +1009,11 @@ pub const Manager = struct {
         defer lease.release();
         try self.drain(task);
         const latest = try self.loadTask(task.id);
+        try self.checkReviewFence(latest);
+        if (self.review_fence == null) if (latest.review_job) |id| {
+            const job = try self.loadReviewJob(latest, id);
+            if (job.state == .queued or job.state == .running) return error.TaskReviewInProgress;
+        };
         if (latest.state == .paused or latest.state == .blocked or latest.state == .conflict) {
             const tree = try self.checkout(task.branch);
             const path = try join(self.alloc, tree, try self.taskPath(task.id));
@@ -970,6 +1256,7 @@ pub const Manager = struct {
         if (std.mem.startsWith(u8, path, "artifacts/") and !std.mem.eql(u8, path[10..], try hash(self.alloc, bytes))) return error.InvalidArtifactIdentity;
         const lease = try Lease.acquire(self.alloc, self.root);
         defer lease.release();
+        try self.checkExpectedRevision(task.branch);
         const current = try self.loadTask(task.id);
         if (current.state == .accepted or current.state == .publication_pending) return error.TaskIsReadOnly;
         if (current.definition.version != task.definition.version) return error.StaleWorkContract;
@@ -1161,9 +1448,30 @@ pub const Manager = struct {
         const lease = try Lease.acquire(self.alloc, self.root);
         defer lease.release();
         const latest = try self.loadTask(task.id);
+        try self.checkReviewFence(latest);
+        if (self.review_fence == null) if (latest.review_job) |id| {
+            const job = try self.loadReviewJob(latest, id);
+            if (job.state == .queued or job.state == .running) return error.TaskReviewInProgress;
+        };
         if (!std.mem.eql(u8, review.task_id, task.id) or review.contract_version != latest.definition.version or !std.mem.eql(u8, review.disposition, "fulfilled")) return error.StaleWorkContract;
         const decision = try contract.assess(self.alloc, latest.definition, review.assessment);
         defer self.alloc.free(decision.feedback);
+        if (review.assessment_record) |id| {
+            if (!safeId(id)) return error.InvalidContractEvidence;
+            const path = try self.alloc.print("history/{s}/{s}.json", .{ task.id, id });
+            const assessment_row = (try std.json.parseFromSlice(std.json.Value, self.alloc, try self.contentAt(path, review.revision), .{})).value;
+            const value = model.field(assessment_row, "value") orelse return error.InvalidContractEvidence;
+            const version = model.field(assessment_row, "contract_version") orelse return error.InvalidContractEvidence;
+            if (!std.mem.eql(u8, model.text(assessment_row, "kind"), "review_assessment") or !std.mem.eql(u8, model.text(assessment_row, "task"), task.id) or version != .integer or version.integer != review.contract_version or !std.mem.eql(u8, model.text(value, "data"), review.assessment)) return error.InvalidContractEvidence;
+        }
+        if (latest.model_basis) |basis| {
+            const declaration_value = try self.loadDeclaration(basis.revision);
+            const operation = if (basis.capability != null and std.mem.eql(u8, basis.capability.?, "coding_task")) "change_code" else "complete_task";
+            const assessment = try record_json.decode(contract.Assessment, self.alloc, review.assessment, .{});
+            var references: std.ArrayList([]const u8) = .empty;
+            for (assessment.obligations) |obligation| try references.appendSlice(self.alloc, obligation.evidence);
+            try model.validateOperation(self.alloc, declaration_value, operation, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .summary = review.candidate, .evidence = references.items }), .{})).value, .output);
+        }
         if (decision.disposition != .fulfilled) return error.WorkspaceReviewRequired;
         if (latest.state == .accepted) return self.revision(task.parent);
         if (!std.mem.eql(u8, review.revision, try self.revision(task.branch))) return error.WorkspaceRevisionChanged;
@@ -1171,7 +1479,7 @@ pub const Manager = struct {
         try self.ensureMergeable(latest, review.revision, try self.revision(task.parent));
         try self.validateDependencies(latest);
         const operation = try hash(self.alloc, try json(self.alloc, .{ task.id, review.revision, review.contract_version, task.parent }));
-        const publication: Publication = .{ .operation = operation, .source = review.revision, .target = task.parent, .task = latest, .review = review };
+        const publication: Publication = .{ .operation = operation, .source = review.revision, .target = task.parent, .task = latest, .review = review, .review_fence = self.review_fence };
         try atomicWrite(self.alloc, try self.publicationPath(task.id), try json(self.alloc, publication));
         var pending = latest;
         pending.state = .publication_pending;
@@ -1185,9 +1493,13 @@ pub const Manager = struct {
         const already = self.run(null, &.{ "cat", receipt, "-r", publication.target, "-R", self.repository }) catch null;
         var accepted_revision: []const u8 = undefined;
         if (already) |bytes| {
-            if (!std.mem.eql(u8, bytes, try json(self.alloc, publication))) return error.WorkspaceVerificationFailed;
+            if (!try publicationEqual(self.alloc, bytes, publication)) return error.WorkspaceVerificationFailed;
             accepted_revision = try self.revision(publication.target);
         } else {
+            if (publication.review_fence) |fence| {
+                const job = try self.loadReviewJob(publication.task, fence.job);
+                if (!@import("review_job.zig").owns(job, fence, io_mod.milliTimestamp())) return error.StaleReviewLease;
+            }
             if (!std.mem.eql(u8, try self.revision(publication.task.branch), publication.source)) return error.WorkspaceRevisionChanged;
             var nonce: [16]u8 = undefined;
             io_mod.getIo().random(&nonce);
@@ -1201,6 +1513,13 @@ pub const Manager = struct {
             const changes = try self.run(tree, &.{ "changes", "--hash", "--differ" });
             if (std.mem.trim(u8, changes, " \r\n").len != 0) return error.WorkspaceRecoveryRequired;
             try self.merge(tree, publication.source, publication.task);
+            if (publication.review_fence) |fence| {
+                var job = try self.loadReviewJob(publication.task, fence.job);
+                job.state = .published;
+                job.lease_expires_ms = 0;
+                job.reported_tokens = try self.retainedReviewTokens(publication.task, job);
+                try atomicWrite(self.alloc, try join(self.alloc, tree, try self.jobPath(job.id)), try json(self.alloc, job));
+            }
             try atomicWrite(self.alloc, try join(self.alloc, tree, receipt), try json(self.alloc, publication));
             accepted_revision = try self.commit(tree, try self.alloc.print("Accept verified task {s} operation {s}", .{ publication.task.id, publication.operation }));
             const committed = try self.run(null, &.{ "cat", receipt, "-r", accepted_revision, "-R", self.repository });
@@ -1221,7 +1540,7 @@ pub const Manager = struct {
             error.FossilCommandFailed => return false,
             else => return err,
         };
-        if (!std.mem.eql(u8, bytes, try json(self.alloc, publication))) return error.WorkspaceVerificationFailed;
+        if (!try publicationEqual(self.alloc, bytes, publication)) return error.WorkspaceVerificationFailed;
         return true;
     }
 
@@ -1263,6 +1582,13 @@ pub const Manager = struct {
         // No model or project command is executed by recovery.
         if (exists(try join(self.alloc, self.root, "import.pending"))) _ = try self.importHistory();
         for (try self.tasks()) |task| {
+            if (task.review_job) |id| {
+                const job = try self.loadReviewJob(task, id);
+                if (job.state == .queued or job.state == .running) {
+                    if (task.state == .publication_pending and try self.publicationCommitted(task)) _ = try self.retryPublication(task);
+                    continue;
+                }
+            }
             if (task.state == .publication_pending) {
                 _ = try self.retryPublication(task);
             } else if (task.state != .accepted and task.state != .conflict) {
@@ -1465,8 +1791,10 @@ pub const Manager = struct {
             return null;
         }
         const declaration_value = try self.loadDeclaration(revision_id);
-        const execution = try model.parseExecution(self.alloc, try self.contentAt(model.execution_path, revision_id));
-        return .{ .definition_hash = declaration_value.hash, .revision = revision_id, .execution = execution };
+        const execution_bytes = try self.contentAt(model.execution_path, revision_id);
+        const execution = try model.parseExecution(self.alloc, execution_bytes);
+        const execution_value = (try std.json.parseFromSlice(std.json.Value, self.alloc, execution_bytes, .{})).value;
+        return .{ .definition_hash = declaration_value.hash, .revision = revision_id, .execution = execution, .execution_hash = try model.digest(self.alloc, execution_value) };
     }
 
     pub fn migrate(self: Manager) ![]const u8 {
@@ -1480,10 +1808,40 @@ pub const Manager = struct {
         var manifest = self.manifest;
         manifest.format = 2;
         try atomicWrite(self.alloc, try join(self.alloc, tree, model.declaration_path), model.initial_declaration);
-        try atomicWrite(self.alloc, try join(self.alloc, tree, model.execution_path), try json(self.alloc, model.Execution{}));
+        try atomicWrite(self.alloc, try join(self.alloc, tree, model.execution_path), try json(self.alloc, model.Execution{ .review = .{} }));
         try atomicWrite(self.alloc, try join(self.alloc, tree, manifest_path), try json(self.alloc, manifest));
         _ = try self.commit(tree, "Add governed workspace model; retain legacy task contracts");
         return self.alloc.print("Activated omos.workspace/v1 for future tasks. Verified backup: {s}. Existing tasks retain their original contract and legacy adapter.", .{backup});
+    }
+
+    pub fn upgradeContracts(self: Manager) ![]const u8 {
+        const base = try self.revision("trunk");
+        const previous = try self.loadDeclaration(base);
+        const next = try model.upgrade(self.alloc, previous);
+        const old_execution_bytes = try self.contentAt(model.execution_path, base);
+        const old_execution = try model.parseExecution(self.alloc, old_execution_bytes);
+        var execution = old_execution;
+        const execution_document = (try std.json.parseFromSlice(std.json.Value, self.alloc, old_execution_bytes, .{})).value;
+        if (model.field(execution_document, "review") == null) execution.review = .{};
+        if (std.mem.eql(u8, previous.hash, next.hash) and std.mem.eql(u8, try json(self.alloc, old_execution), try json(self.alloc, execution))) return "Workspace contracts are current; active task bases remain pinned.";
+        const backup = try self.alloc.print("{s}.pre-contracts-{d}.fossil", .{ self.repository, io_mod.milliTimestamp() });
+        try self.exportRepository(backup);
+        const backup_manager = try Manager.open(self.alloc, backup);
+        const backed_up_base = try backup_manager.revision("trunk");
+        const lease = try Lease.acquire(self.alloc, self.root);
+        defer lease.release();
+        // Export may commit the portable registry. Fence the actual exported
+        // revision, while requiring the governing definition to remain unchanged.
+        if (!std.mem.eql(u8, backed_up_base, try self.revision("trunk")) or !std.mem.eql(u8, previous.hash, (try self.loadDeclaration(backed_up_base)).hash)) return error.WorkspaceRevisionChanged;
+        const backed_up_execution = try model.parseExecution(self.alloc, try self.contentAt(model.execution_path, backed_up_base));
+        if (!std.mem.eql(u8, try json(self.alloc, old_execution), try json(self.alloc, backed_up_execution))) return error.WorkspaceRevisionChanged;
+        const tree = try self.checkout("trunk");
+        try atomicWrite(self.alloc, try join(self.alloc, tree, model.declaration_path), try json(self.alloc, next.value));
+        try atomicWrite(self.alloc, try join(self.alloc, tree, model.execution_path), try json(self.alloc, execution));
+        const receipt = try json(self.alloc, .{ .version = "omos.contract-migration/v1", .previous = previous.hash, .definition_hash = next.hash, .base = backed_up_base, .backup = std.Io.Dir.path.basename(backup), .active_tasks = "preserved", .verified_by = "omos-native-contract-migration" });
+        try atomicWrite(self.alloc, try join(self.alloc, tree, try self.alloc.print("activations/{s}.json", .{try hash(self.alloc, receipt)})), receipt);
+        _ = try self.commit(tree, "Upgrade compatible workspace contracts for future tasks");
+        return self.alloc.print("Upgraded workspace contracts for future tasks. Active tasks retain their pinned declaration and execution policy. Verified backup: {s}", .{backup});
     }
 
     pub fn definitionSnapshot(self: Manager, task: ?Task) !std.json.Value {
@@ -1501,10 +1859,18 @@ pub const Manager = struct {
         const proposed = try model.parse(self.alloc, bytes);
         const lease = try Lease.acquire(self.alloc, self.root);
         defer lease.release();
+        try self.checkExpectedRevision(if (task) |selected| selected.branch else "trunk");
         const base = try self.revision("trunk");
         const old = try self.loadDeclaration(base);
-        const execution = if (execution_bytes) |raw| try model.parseExecution(self.alloc, raw) else try model.parseExecution(self.alloc, try self.contentAt(model.execution_path, base));
-        const compatible = try model.compatible(self.alloc, old, proposed);
+        const previous_execution = try model.parseExecution(self.alloc, try self.contentAt(model.execution_path, base));
+        var execution = if (execution_bytes) |raw| try model.parseExecution(self.alloc, raw) else previous_execution;
+        if (execution_bytes) |raw| {
+            const supplied = (try std.json.parseFromSlice(std.json.Value, self.alloc, raw, .{})).value;
+            // Older policy proposals predate review settings. Preserve the
+            // active review contract when that section was not supplied.
+            if (model.field(supplied, "review") == null) execution.review = previous_execution.review;
+        }
+        const compatible = try model.compatible(self.alloc, old, proposed) and model.compatibleExecution(previous_execution, execution);
         const proposal_id = try hash(self.alloc, try json(self.alloc, .{ .base = base, .definition = proposed.hash, .execution = execution }));
         const branch = try self.alloc.print("definition/{s}", .{proposal_id});
         const existing = self.revision(branch) catch |err| switch (err) {
@@ -1513,7 +1879,7 @@ pub const Manager = struct {
         };
         if (existing == null) _ = try self.run(null, &.{ "branch", "new", branch, base, "--nosign", "-R", self.repository });
         const tree = try self.checkout(branch);
-        const proposal = .{ .id = proposal_id, .task = if (task) |selected_task| @as(?[]const u8, selected_task.id) else null, .hash = proposed.hash, .base = base, .state = if (compatible) "activated" else "inactive", .reason = if (compatible) "Host verified additive compatibility; future tasks only." else "Existing identities, fields or contracts changed; activation refused.", .declaration = proposed.value, .execution = execution };
+        const proposal = .{ .id = proposal_id, .workspace = self.manifest.id, .task = if (task) |selected_task| @as(?[]const u8, selected_task.id) else null, .hash = proposed.hash, .base = base, .state = if (compatible) "activated" else "inactive", .reason = if (compatible) "Host verified additive compatibility; future tasks only." else "Existing contracts changed or execution allowances increased; activation refused.", .declaration = proposed.value, .execution = execution };
         try atomicWrite(self.alloc, try join(self.alloc, tree, try self.alloc.print("proposals/{s}.json", .{proposal_id})), try json(self.alloc, proposal));
         if (compatible) {
             try atomicWrite(self.alloc, try join(self.alloc, tree, model.declaration_path), try model.canonical(self.alloc, proposed.value));
@@ -1543,6 +1909,8 @@ pub const Manager = struct {
         for (model.items(model.spec(declaration_value.value), "capabilities")) |item| found = found or std.mem.eql(u8, model.text(item, "id"), capability);
         if (!found) return error.UnknownCapability;
         if (!model.nativeCapability(declaration_value, capability)) return error.UnboundCapability;
+        const operation = if (std.mem.eql(u8, capability, "coding_task")) "change_code" else "complete_task";
+        try model.validateOperation(self.alloc, declaration_value, operation, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .request = try self.originalRequest(current) }), .{})).value, .input);
         if (obligations.len > 32 or summary.len > 4096 or checks.len > 32) return error.InvalidTaskPlan;
         var all: std.ArrayList(contract.Obligation) = .empty;
         try all.appendSlice(self.alloc, current.definition.obligations);
@@ -1560,8 +1928,12 @@ pub const Manager = struct {
         _ = try contract.parse(self.alloc, encoded);
         current.model_basis.?.capability = capability;
         const tree = try self.checkout(current.branch);
-        try atomicWrite(self.alloc, try join(self.alloc, tree, try self.taskPath(current.id)), try json(self.alloc, current));
         const plan = try json(self.alloc, .{ .kind = "task_plan", .task = current.id, .contract_version = current.definition.version, .value = .{ .task = current.id, .summary = summary, .obligations = current.definition.obligations, .checks = checks, .basis = current.model_basis } });
+        if (model.hasOperation(declaration_value, "omos_record_plan")) {
+            const row = (try std.json.parseFromSlice(std.json.Value, self.alloc, plan, .{})).value;
+            try model.validateOperation(self.alloc, declaration_value, "omos_record_plan", model.field(row, "value").?, .input);
+        }
+        try atomicWrite(self.alloc, try join(self.alloc, tree, try self.taskPath(current.id)), try json(self.alloc, current));
         try atomicWrite(self.alloc, try join(self.alloc, tree, try self.alloc.print("history/{s}/{s}.json", .{ current.id, try hash(self.alloc, plan) })), plan);
         _ = try self.commit(tree, "Pin task plan and preserve original acceptance criteria");
         try self.saveTask(current);
@@ -1576,6 +1948,14 @@ pub const Manager = struct {
         if (std.mem.startsWith(u8, entity, "omos_")) {
             if (!std.mem.eql(u8, entity, "omos_plan")) return error.HostOwnedEntity;
             if (!std.mem.eql(u8, model.text(value, "task"), task.id)) return error.InvalidTaskPlan;
+            const obligations = model.field(value, "obligations") orelse return error.InvalidTaskPlan;
+            const proposed = (std.json.parseFromValue([]const contract.Obligation, self.alloc, obligations, .{}) catch return error.InvalidTaskPlan).value;
+            for (task.definition.obligations) |required| {
+                const preserved = for (proposed) |candidate| {
+                    if (std.mem.eql(u8, candidate.id, required.id) and std.mem.eql(u8, candidate.description, required.description)) break true;
+                } else false;
+                if (!preserved) return error.WeakenedParentContract;
+            }
             try self.record(task, "plan_refinement", .{ .entity = entity, .data = value, .authority = "proposal_only" });
             return "Plan refinement retained. The host contract and obligations are unchanged.";
         }
@@ -1586,38 +1966,152 @@ pub const Manager = struct {
 
     pub fn queryRecords(self: Manager, task: ?Task, entity: ?[]const u8, offset: usize) ![]const u8 {
         const revision_id = if (task) |selected_task| try self.revision(selected_task.branch) else try self.revision("trunk");
+        const paths = try self.inventory(revision_id);
         var rows: std.ArrayList(std.json.Value) = .empty;
         const matches = struct {
             fn check(filter: ?[]const u8, kind: []const u8) bool {
                 return filter == null or std.mem.eql(u8, filter.?, kind);
             }
         }.check;
-        if (matches(entity, "omos_task")) for (try self.tasks()) |item| try rows.append(self.alloc, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = "omos_task", .id = item.id, .data = .{ .objective = item.definition.objective, .state = @tagName(item.state), .contract = item.definition, .basis = item.model_basis } }), .{})).value);
+        if (matches(entity, "omos_task")) for (try self.tasks()) |item| try rows.append(self.alloc, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = "omos_task", .id = item.id, .revision = try self.currentRevision(item), .data = .{ .objective = item.definition.objective, .state = @tagName(item.state), .contract = item.definition, .basis = item.model_basis } }), .{})).value);
         if (matches(entity, "omos_capability")) {
-            if (try self.modelBasis(revision_id)) |basis| for (model.items(model.spec((try self.loadDeclaration(basis.revision)).value), "capabilities")) |item| try rows.append(self.alloc, item);
+            if (try self.modelBasis(revision_id)) |basis| {
+                const declaration = try self.loadDeclaration(basis.revision);
+                for (model.items(model.spec(declaration.value), "capabilities")) |item| {
+                    var operations: std.ArrayList([]const u8) = .empty;
+                    for (model.items(model.spec(declaration.value), "operations")) |operation| if (std.mem.eql(u8, model.text(operation, "capability"), model.text(item, "id"))) try operations.append(self.alloc, model.text(operation, "id"));
+                    try rows.append(self.alloc, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = "omos_capability", .id = model.text(item, "id"), .data = .{ .name = model.text(item, "name"), .requires = model.field(item, "requires").?, .operations = operations.items }, .source_path = model.declaration_path }), .{})).value);
+                }
+            }
         }
-        const histories = if (task) |selected_task| try self.taskHistory(selected_task, revision_id) else &.{};
-        for (histories) |bytes| {
+        var histories: std.ArrayList([]const u8) = .empty;
+        const history_requested = entity == null or std.mem.eql(u8, entity.?, "omos_plan") or std.mem.eql(u8, entity.?, "omos_action") or std.mem.eql(u8, entity.?, "omos_evidence") or std.mem.eql(u8, entity.?, "omos_assessment") or std.mem.eql(u8, entity.?, "omos_event") or std.mem.eql(u8, entity.?, "omos_result");
+        if (history_requested) {
+            if (task) |selected_task| {
+                try histories.appendSlice(self.alloc, try self.taskHistory(selected_task, revision_id));
+            } else for (paths) |path| {
+                if (std.mem.startsWith(u8, path, "history/")) try histories.append(self.alloc, try self.contentAt(path, revision_id));
+            }
+        }
+        var projection: @import("record_projection.zig").Projection = .{};
+        for (histories.items) |bytes| {
             const row = (try std.json.parseFromSlice(std.json.Value, self.alloc, bytes, .{})).value;
-            const kind = model.text(row, "kind");
-            const logical = if (std.mem.eql(u8, kind, "task_plan") or std.mem.eql(u8, kind, "plan_refinement")) "omos_plan" else if (std.mem.eql(u8, kind, "action_intent")) "omos_action" else if (std.mem.eql(u8, kind, "tool_evidence")) "omos_evidence" else if (std.mem.startsWith(u8, kind, "review_") or std.mem.eql(u8, kind, "progress_assessment")) "omos_assessment" else "omos_event";
-            if (matches(entity, logical)) try rows.append(self.alloc, .{ .object = blk: {
-                var object: std.json.ObjectMap = .empty;
-                try object.put(self.alloc, "entity", .{ .string = logical });
-                try object.put(self.alloc, "source", row);
-                break :blk object;
-            } });
+            try projection.append(self.alloc, row, try hash(self.alloc, bytes));
         }
-        for (try self.inventory(revision_id)) |path| {
-            const logical = if (std.mem.startsWith(u8, path, "proposals/")) "omos_definition_proposal" else if (std.mem.startsWith(u8, path, "acceptances/")) "omos_result" else if (std.mem.startsWith(u8, path, "memory/")) "omos_memory" else if (std.mem.startsWith(u8, path, "skills/")) "omos_skill" else if (std.mem.startsWith(u8, path, "artifacts/")) "omos_artifact" else "";
+        try projection.linkPlans(self.alloc);
+        for (projection.records.items) |row| if (matches(entity, model.text(row, "entity"))) try rows.append(self.alloc, row);
+        for (paths) |path| {
+            const logical = if (std.mem.startsWith(u8, path, "jobs/")) "omos_review_job" else if (std.mem.startsWith(u8, path, "proposals/")) "omos_definition_proposal" else if (std.mem.startsWith(u8, path, "acceptances/")) "omos_result" else if (std.mem.startsWith(u8, path, "memory/")) "omos_memory" else if (std.mem.startsWith(u8, path, "skills/")) "omos_skill" else if (std.mem.startsWith(u8, path, "artifacts/")) "omos_artifact" else "";
+            if (std.mem.eql(u8, logical, "omos_review_job")) {
+                if (matches(entity, logical)) {
+                    const job = try record_json.decode(@import("review_job.zig").Job, self.alloc, try self.contentAt(path, revision_id), .{});
+                    try rows.append(self.alloc, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = logical, .id = job.id, .data = .{ .task = job.task, .state = @tagName(job.state), .generation = job.generation, .contract_version = job.contract_version, .definition_hash = job.definition_hash, .candidate_hash = job.candidate_hash } }), .{})).value);
+                }
+                continue;
+            }
+            if (std.mem.eql(u8, logical, "omos_definition_proposal")) {
+                const proposal = (try std.json.parseFromSlice(std.json.Value, self.alloc, try self.contentAt(path, revision_id), .{})).value;
+                const owner = model.text(proposal, "task");
+                const proposal_entity = if (owner.len > 0) "omos_definition_proposal" else "omos_workspace_definition_proposal";
+                if (matches(entity, proposal_entity)) {
+                    const data = if (owner.len > 0)
+                        try json(self.alloc, .{ .task = owner, .hash = model.text(proposal, "hash"), .state = model.text(proposal, "state"), .reason = model.text(proposal, "reason") })
+                    else
+                        try json(self.alloc, .{ .workspace = self.manifest.id, .hash = model.text(proposal, "hash"), .state = model.text(proposal, "state"), .reason = model.text(proposal, "reason") });
+                    try rows.append(self.alloc, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = proposal_entity, .id = model.text(proposal, "id"), .data = (try std.json.parseFromSlice(std.json.Value, self.alloc, data, .{})).value, .source_path = path }), .{})).value);
+                }
+                continue;
+            }
+            if (std.mem.eql(u8, logical, "omos_result")) {
+                if (matches(entity, logical)) {
+                    const publication = try record_json.decode(Publication, self.alloc, try self.contentAt(path, revision_id), .{});
+                    if (task) |selected_task| if (!std.mem.eql(u8, publication.task.id, selected_task.id)) continue;
+                    try rows.append(self.alloc, try self.resultProjection(publication, path, revision_id, &projection));
+                }
+                continue;
+            }
             if (std.mem.startsWith(u8, path, "records/")) {
-                const row = (try std.json.parseFromSlice(std.json.Value, self.alloc, try self.contentAt(path, revision_id), .{})).value;
+                var row = (try std.json.parseFromSlice(std.json.Value, self.alloc, try self.contentAt(path, revision_id), .{})).value;
+                try row.object.put(self.alloc, "source_path", .{ .string = path });
                 if (matches(entity, model.text(row, "entity"))) try rows.append(self.alloc, row);
-            } else if (logical.len > 0 and matches(entity, logical)) try rows.append(self.alloc, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = logical, .path = path }), .{})).value);
+            } else if (logical.len > 0 and matches(entity, logical)) try rows.append(self.alloc, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = logical, .id = path, .path = path, .data = .{ .path = path } }), .{})).value);
         }
+        if (task) |selected_task| if (selected_task.state == .accepted and matches(entity, "omos_result")) {
+            const parent_revision = try self.revision(selected_task.parent);
+            for (try self.inventory(parent_revision)) |path| {
+                if (!std.mem.startsWith(u8, path, "acceptances/")) continue;
+                const publication = try record_json.decode(Publication, self.alloc, try self.contentAt(path, parent_revision), .{});
+                if (!std.mem.eql(u8, publication.task.id, selected_task.id)) continue;
+                if (std.mem.eql(u8, parent_revision, revision_id)) continue;
+                try rows.append(self.alloc, try self.resultProjection(publication, path, parent_revision, &projection));
+            }
+        };
         const row_start = @min(offset, rows.items.len);
-        const end = @min(row_start +| 32, rows.items.len);
-        return json(self.alloc, .{ .revision = revision_id, .records = rows.items[row_start..end], .next_offset = if (end < rows.items.len) @as(?usize, end) else null, .total = rows.items.len });
+        var end = row_start;
+        var page: std.ArrayList(std.json.Value) = .empty;
+        var page_bytes: usize = 0;
+        while (end < rows.items.len and page.items.len < 32) : (end += 1) {
+            const row = rows.items[end];
+            const encoded = try json(self.alloc, row);
+            const bounded = if (encoded.len <= 8192) row else blk: {
+                const entity_id = model.text(row, "entity");
+                const id = model.text(row, "id");
+                const explicit_path = model.text(row, "source_path");
+                const path = if (explicit_path.len > 0) explicit_path else if (std.mem.eql(u8, entity_id, "omos_task")) try self.taskPath(id) else "omniform/company.json";
+                const own_revision = model.text(row, "revision");
+                const source_revision = if (own_revision.len > 0) own_revision else revision_id;
+                const original = try self.contentAt(path, source_revision);
+                break :blk (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = entity_id, .id = id, .complete = false, .source_path = path, .revision = source_revision, .bytes = original.len, .sha256 = try hash(self.alloc, original), .projection_bytes = encoded.len, .note = "Read the original record in bounded pages; this reference cannot establish unseen content." }), .{})).value;
+            };
+            const bounded_bytes = (try json(self.alloc, bounded)).len;
+            if (page.items.len > 0 and page_bytes + bounded_bytes > 64 * 1024) break;
+            page_bytes += bounded_bytes;
+            try page.append(self.alloc, bounded);
+        }
+        const edge_start = @min(offset, projection.relationships.items.len);
+        const edge_end = @min(edge_start +| 32, projection.relationships.items.len);
+        return json(self.alloc, .{ .revision = revision_id, .records = page.items, .relationships = projection.relationships.items[edge_start..edge_end], .relationship_total = projection.relationships.items.len, .next_relationship_offset = if (edge_end < projection.relationships.items.len) @as(?usize, edge_end) else null, .next_offset = if (end < rows.items.len) @as(?usize, end) else null, .total = rows.items.len });
+    }
+
+    fn resultProjection(self: Manager, publication: Publication, path: []const u8, revision_id: []const u8, projection: *@import("record_projection.zig").Projection) !std.json.Value {
+        var row = (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = "omos_result", .id = publication.operation, .data = .{ .task = publication.task.id, .status = "published", .summary = publication.review.candidate, .receipt = path }, .source_path = path, .revision = revision_id }), .{})).value;
+        if (publication.review.assessment_record) |id| {
+            try row.object.getPtr("data").?.object.put(self.alloc, "assessment", .{ .string = id });
+            try projection.relationships.append(self.alloc, .{ .relationship = "omos_assessment_result", .from = id, .to = publication.operation, .task = publication.task.id, .authority = .host_observed });
+        }
+        return row;
+    }
+
+    /// Audit canonical records without rewriting legacy data or replaying actions.
+    pub fn auditContracts(self: Manager) ![]const u8 {
+        const Issue = struct { task: []const u8, record: []const u8, reason: []const u8 };
+        var issues: std.ArrayList(Issue) = .empty;
+        var checked: usize = 0;
+        var legacy: usize = 0;
+        const tasks_value = try self.tasks();
+        for (tasks_value) |task| {
+            const basis = task.model_basis orelse {
+                legacy += 1;
+                continue;
+            };
+            const declaration_value = try self.loadDeclaration(basis.revision);
+            if (!model.hasOperation(declaration_value, "omos_record_evidence")) {
+                legacy += 1;
+                continue;
+            }
+            for (try self.taskHistory(task, try self.revision(task.branch))) |raw| {
+                const row = (try std.json.parseFromSlice(std.json.Value, self.alloc, raw, .{})).value;
+                const kind = model.text(row, "kind");
+                const operation = if (std.mem.eql(u8, kind, "action_intent")) "omos_record_action" else if (std.mem.eql(u8, kind, "tool_evidence")) "omos_record_evidence" else if (std.mem.eql(u8, kind, "task_plan")) "omos_record_plan" else "";
+                if (operation.len == 0 or !model.hasOperation(declaration_value, operation)) continue;
+                checked += 1;
+                const value = try omitNulls(self.alloc, model.field(row, "value") orelse .null);
+                model.validateOperation(self.alloc, declaration_value, operation, value, .input) catch |err| {
+                    try issues.append(self.alloc, .{ .task = task.id, .record = try hash(self.alloc, raw), .reason = @errorName(err) });
+                };
+            }
+        }
+        return json(self.alloc, .{ .version = "omos.contract-audit/v1", .tasks = tasks_value.len, .checked_records = checked, .legacy_tasks = legacy, .valid = issues.items.len == 0, .issues = issues.items });
     }
 
     pub fn exportRepository(self: Manager, destination: []const u8) !void {
@@ -1723,7 +2217,7 @@ fn allowedPath(path: []const u8) bool {
     while (parts.next()) |part| {
         if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..") or part[0] == '.') return false;
     }
-    for ([_][]const u8{ "memory/", "skills/", "artifacts/", "history/", "tasks/", "imports/", "acceptances/", "omniform/", "execution/", "records/", "proposals/", "activations/" }) |prefix| {
+    for ([_][]const u8{ "memory/", "skills/", "artifacts/", "history/", "tasks/", "imports/", "acceptances/", "omniform/", "execution/", "records/", "proposals/", "activations/", "jobs/" }) |prefix| {
         if (std.mem.startsWith(u8, path, prefix)) return true;
     }
     return std.mem.eql(u8, path, manifest_path);

@@ -11,6 +11,11 @@ pub const Evidence = struct {
     arguments: ?[]const u8 = null,
     status: ?types.PersistedToolStatus = null,
     content: []const u8,
+    action_id: ?[]const u8 = null,
+    source: ?[]const u8 = null,
+    obligations: []const []const u8 = &.{},
+    raw_call_id: ?[]const u8 = null,
+    assistant_index: ?usize = null,
 };
 
 pub const IndexEntry = struct {
@@ -23,6 +28,10 @@ pub const IndexEntry = struct {
     sha256: []const u8,
     content: []const u8,
     complete: bool,
+    action_id: ?[]const u8,
+    source: ?[]const u8,
+    obligations: []const []const u8,
+    raw_call_id: ?[]const u8,
 };
 
 pub const View = struct {
@@ -30,6 +39,7 @@ pub const View = struct {
     inspected: []usize,
     payloads: []const []const u8,
     raw_ranges: std.ArrayList(struct { ordinal: usize, start: usize, end: usize }) = .empty,
+    max_read_bytes: usize = 16384,
 
     pub fn rawInspected(self: View, ordinal: usize, offset: usize, bytes: usize) bool {
         var cursor = offset;
@@ -82,6 +92,10 @@ pub const View = struct {
                 .sha256 = try alloc.dupe(u8, &std.fmt.bytesToHex(&digest, .lower)),
                 .content = content,
                 .complete = complete,
+                .action_id = record.action_id,
+                .source = record.source,
+                .obligations = record.obligations,
+                .raw_call_id = record.raw_call_id,
             };
         }
         return result;
@@ -104,7 +118,7 @@ pub const View = struct {
             if (!std.mem.eql(u8, record.id, id)) continue;
             const payload = self.payloads[ordinal];
             if (command.offset > payload.len or (command.offset < payload.len and (payload[command.offset] & 0xc0) == 0x80)) return error.InvalidEvidenceOffset;
-            const chunk = prefix(payload[command.offset..], @min(command.limit, 16384));
+            const chunk = prefix(payload[command.offset..], @min(command.limit, self.max_read_bytes));
             if (chunk.len == 0 and command.offset < payload.len) return error.InvalidEvidenceOffset;
             try self.raw_ranges.append(alloc, .{ .ordinal = ordinal, .start = command.offset, .end = command.offset + chunk.len });
             if (command.offset <= self.inspected[ordinal]) self.inspected[ordinal] = @max(self.inspected[ordinal], command.offset + chunk.len);
@@ -119,6 +133,83 @@ pub const View = struct {
             }, .{});
         }
         return error.InvalidContractEvidence;
+    }
+
+    /// Exact relationship filters precede lexical discovery. Results retain their
+    /// original identities; snippets never establish inspection of omitted bytes.
+    pub fn retrieve(self: *View, alloc: std.mem.Allocator, raw: []const u8) ![]const u8 {
+        const Command = struct {
+            action: enum { query, search, related, coverage },
+            id: ?[]const u8 = null,
+            query: ?[]const u8 = null,
+            kind: ?@FieldType(Evidence, "kind") = null,
+            tool: ?[]const u8 = null,
+            status: ?types.PersistedToolStatus = null,
+            action_id: ?[]const u8 = null,
+            source: ?[]const u8 = null,
+            obligation: ?[]const u8 = null,
+            offset: usize = 0,
+            limit: usize = 16,
+        };
+        const command = try record_json.decode(Command, alloc, raw, .{});
+        if (command.limit == 0 or command.limit > 32) return error.InvalidEvidenceOffset;
+        if (command.action == .coverage) {
+            const id = command.id orelse return error.InvalidContractEvidence;
+            for (self.records, 0..) |record, ordinal| {
+                if (!std.mem.eql(u8, record.id, id)) continue;
+                const Gap = struct { offset: usize, bytes: usize };
+                var gaps: std.ArrayList(Gap) = .empty;
+                var cursor: usize = 0;
+                while (cursor < self.payloads[ordinal].len) {
+                    var end = cursor;
+                    var next = self.payloads[ordinal].len;
+                    for (self.raw_ranges.items) |range| {
+                        if (range.ordinal != ordinal) continue;
+                        if (range.start <= cursor) end = @max(end, range.end) else next = @min(next, range.start);
+                    }
+                    end = @max(end, self.inspected[ordinal]);
+                    if (end > cursor) {
+                        cursor = end;
+                        continue;
+                    }
+                    try gaps.append(alloc, .{ .offset = cursor, .bytes = next - cursor });
+                    cursor = next;
+                }
+                return std.json.Stringify.valueAlloc(alloc, .{ .id = id, .sha256 = try payloadHash(alloc, self.payloads[ordinal]), .bytes = self.payloads[ordinal].len, .missing = gaps.items }, .{});
+            }
+            return error.InvalidContractEvidence;
+        }
+        if (command.query) |query| if (query.len == 0 or query.len > 512) return error.InvalidEvidenceQuery;
+        if (command.action == .search and command.query == null) return error.InvalidEvidenceQuery;
+        var related_action: ?[]const u8 = null;
+        if (command.action == .related) {
+            const id = command.id orelse return error.InvalidContractEvidence;
+            const record = for (self.records) |record| {
+                if (std.mem.eql(u8, record.id, id)) break record;
+            } else return error.InvalidContractEvidence;
+            related_action = record.action_id orelse return error.MissingEvidenceRelationship;
+        }
+        var rows: std.ArrayList(IndexEntry) = .empty;
+        var total: usize = 0;
+        for (self.records, 0..) |record, ordinal| {
+            if (command.kind) |kind| if (record.kind != kind) continue;
+            if (command.status) |status| if (record.status != status) continue;
+            if (!optionalMatch(command.tool, record.tool) or !optionalMatch(command.source, record.source) or !optionalMatch(command.action_id, record.action_id) or !optionalMatch(related_action, record.action_id)) continue;
+            if (command.obligation) |id| {
+                const matched = for (record.obligations) |obligation| {
+                    if (std.mem.eql(u8, id, obligation)) break true;
+                } else false;
+                if (!matched) continue;
+            }
+            if (command.query) |query| {
+                if (std.ascii.findIgnoreCase(record.content, query) == null and
+                    std.ascii.findIgnoreCase(record.arguments orelse "", query) == null and
+                    std.ascii.findIgnoreCase(record.tool orelse "", query) == null) continue;
+            }
+            if (total >= command.offset and rows.items.len < command.limit) try rows.appendSlice(alloc, try self.index(alloc, ordinal, 1));
+            total += 1;
+        }
+        return std.json.Stringify.valueAlloc(alloc, .{ .evidence = rows.items, .total = total, .complete = true, .scope = "pinned_review_manifest", .nextOffset = if (command.offset +| rows.items.len < total) @as(?usize, command.offset + rows.items.len) else null }, .{});
     }
 
     /// Replay only pages whose complete payload hash still matches. The full
@@ -178,6 +269,35 @@ pub const View = struct {
         return error.InvalidContractEvidence;
     }
 };
+
+fn optionalMatch(filter: ?[]const u8, value: ?[]const u8) bool {
+    return if (filter) |expected| if (value) |actual| std.mem.eql(u8, expected, actual) else false else true;
+}
+
+test "completion review targeted retrieval preserves action relationships and inspection gaps" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const large = try alloc.alloc(u8, 20000);
+    @memset(large, 'x');
+    @memcpy(large[15000..15006], "failed");
+    var view = try View.init(alloc, &.{
+        .{ .id = "a", .tool = "shell", .status = .failure, .action_id = "call-1", .source = "source-1", .content = large },
+        .{ .id = "b", .tool = "read_file", .status = .success, .action_id = "call-2", .content = "Other result" },
+    });
+    const result = (try std.json.parseFromSlice(std.json.Value, alloc, try view.retrieve(alloc, "{\"action\":\"search\",\"query\":\"FAILED\",\"tool\":\"shell\"}"), .{})).value;
+    try std.testing.expectEqual(@as(i64, 1), result.object.get("total").?.integer);
+    try std.testing.expectError(error.UninspectedContractEvidence, view.requireInspected("a"));
+    _ = try view.page(alloc, "{\"action\":\"read\",\"id\":\"a\",\"offset\":0,\"limit\":1000}");
+    _ = try view.page(alloc, "{\"action\":\"read\",\"id\":\"a\",\"offset\":2000,\"limit\":1000}");
+    const coverage = (try std.json.parseFromSlice(std.json.Value, alloc, try view.retrieve(alloc, "{\"action\":\"coverage\",\"id\":\"a\"}"), .{})).value;
+    const missing = coverage.object.get("missing").?.array.items;
+    try std.testing.expectEqual(@as(i64, 1000), missing[0].object.get("offset").?.integer);
+    try std.testing.expectEqual(@as(i64, 1000), missing[0].object.get("bytes").?.integer);
+    const related = (try std.json.parseFromSlice(std.json.Value, alloc, try view.retrieve(alloc, "{\"action\":\"related\",\"id\":\"a\"}"), .{})).value;
+    try std.testing.expectEqual(@as(i64, 1), related.object.get("total").?.integer);
+    try std.testing.expectError(error.InvalidContractEvidence, view.retrieve(alloc, "{\"action\":\"related\",\"id\":\"invented\"}"));
+}
 
 fn payloadHash(alloc: std.mem.Allocator, payload: []const u8) ![]const u8 {
     var digest: [32]u8 = undefined;
