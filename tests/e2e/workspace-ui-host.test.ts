@@ -1,5 +1,7 @@
 import {afterEach,expect,test} from 'bun:test';
-import {resolve} from 'node:path';
+import {resolve,join} from 'node:path';
+import {mkdirSync} from 'node:fs';
+import {execFileSync} from 'node:child_process';
 import {NativeClient} from './workspace-ui-client.mjs';
 import {cleanupFixtures,fixture,model} from './fossil-workspace-helpers';
 const clients:NativeClient[]=[];
@@ -33,4 +35,12 @@ test('legacy interface history is retained once on an unpublished branch',async(
  const f=fixture();expect((await f.run(['fossil','init','--json'])).code).toBe(0);const native=host(f);const before=await native.request('snapshot',{action:'fossil.status'});
  const content=JSON.stringify({version:'omos.ui-legacy-input/v1',status:'unpublished_input',files:[{path:'.revisions/old.json',content:'Retained local appearance input'}]});const retained=await native.request('ui.import_legacy',{content});expect(retained.retained).toBe(true);expect(retained.publication).toBe('unpublished');expect(retained.artifact).toStartWith('artifacts/');
  const again=await native.request('ui.import_legacy',{content});expect(again.task).toBe(retained.task);const after=await native.request('snapshot',{action:'fossil.status'});expect(after.trunk_revision).toBe(before.trunk_revision);expect(after.tasks.length).toBe(1);expect(after.tasks[0].state).toBe('paused');
+},90000);
+
+
+test('a live UI host cannot silently retarget a changed workspace binding',async()=>{
+ const f=fixture();expect((await f.run(['fossil','init','--json'])).code).toBe(0);const native=host(f);const initial=await native.request('initialize');expect(initial.workspace).toBeString();
+ const other=join(f.home,'other-project');mkdirSync(other);execFileSync(resolve(import.meta.dir,'../../zig-out/bin/fx'),['fossil','init','--json'],{cwd:other,env:{...process.env,...f.env},encoding:'utf8'});
+ await expect(native.request('snapshot',{action:'fossil.status'})).rejects.toThrow('WorkspaceBindingChanged');
+ await expect(native.request('prompt',{text:'This request must not run in another repository.'},{id:'changed-binding-request'})).rejects.toThrow('WorkspaceBindingChanged');
 },90000);

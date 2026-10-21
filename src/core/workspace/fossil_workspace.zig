@@ -16,6 +16,13 @@ const manifest_path = "workspace.json";
 
 pub const Manifest = struct { format: u32 = 1, id: []const u8, kind: []const u8 = "omos-agent-workspace" };
 pub const Binding = struct { repository: []const u8, workspace_id: []const u8 };
+// Installed by a long-lived host before starting workers, cleared after joining them.
+// This fences configuration identity; canonical workspace data remains in Fossil.
+var host_binding: ?Binding = null;
+pub fn configureHostBinding(binding: ?Binding) void {
+    host_binding = binding;
+}
+
 pub const ReadDependency = struct { path: []const u8, base_hash: ?[]const u8, observed_hash: []const u8 };
 pub const Task = struct {
     id: []const u8,
@@ -293,14 +300,16 @@ fn bindingPath(alloc: Allocator) ![]const u8 {
 pub fn configured(alloc: Allocator) !?Binding {
     if (comptime builtin.target.cpu.arch.isWasm()) return null;
     const bytes = read(alloc, try bindingPath(alloc)) catch |err| switch (err) {
-        error.FileNotFound => return null,
+        error.FileNotFound => return if (host_binding != null) error.WorkspaceBindingChanged else null,
         else => return err,
     };
-    return try parse(alloc, Binding, bytes);
+    const binding = try parse(alloc, Binding, bytes);
+    if (host_binding) |pinned| if (!std.mem.eql(u8, binding.repository, pinned.repository) or !std.mem.eql(u8, binding.workspace_id, pinned.workspace_id)) return error.WorkspaceBindingChanged;
+    return binding;
 }
 
 /// Slices returned by this manager belong to its allocator, which must be an
-/// operation-scoped arena. The manager keeps no process-global workspace state.
+/// operation-scoped arena. Only an optional immutable host binding fence is global.
 pub const Manager = struct {
     expected_revision: ?[]const u8 = null,
     review_fence: ?@import("review_job.zig").Fence = null,

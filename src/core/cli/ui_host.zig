@@ -82,6 +82,8 @@ const Server = struct {
     job: ?*Job = null,
     thread: ?std.Thread = null,
     journal_dir: []const u8,
+    repository: []const u8,
+    workspace_id: []const u8,
 
     fn respond(self: *Server, id: []const u8, result: std.json.Value, err: ?[]const u8) !void {
         self.output_mutex.lockUncancelable(io.getIo());
@@ -113,7 +115,22 @@ const Server = struct {
     }
 
     fn execute(self: *Server, arena: std.mem.Allocator, id: []const u8, method: []const u8, params: std.json.Value) !std.json.Value {
-        if (std.mem.eql(u8, method, "initialize")) return value(arena, .{ .version = version, .project = try io.realpathAlloc(arena, "."), .active_turn = if (self.job) |job| job.id else null });
+        // A profile binding change never retargets a running UI host.
+        // Cancellation and public replay remain available for retained work.
+        if (!std.mem.eql(u8, method, "cancel") and !std.mem.eql(u8, method, "events") and !std.mem.eql(u8, method, "session.events")) {
+            const bound = (workspace.Manager.bound(arena) catch |err| {
+                if (self.job) |active| active.ui.stop();
+                return err;
+            }) orelse {
+                if (self.job) |active| active.ui.stop();
+                return error.WorkspaceBindingChanged;
+            };
+            if (!std.mem.eql(u8, bound.repository, self.repository) or !std.mem.eql(u8, bound.manifest.id, self.workspace_id)) {
+                if (self.job) |active| active.ui.stop();
+                return error.WorkspaceBindingChanged;
+            }
+        }
+        if (std.mem.eql(u8, method, "initialize")) return value(arena, .{ .version = version, .project = try io.realpathAlloc(arena, "."), .workspace = self.workspace_id, .active_turn = if (self.job) |job| job.id else null });
         if (std.mem.eql(u8, method, "prompt")) return self.start(arena, id, params);
         if (std.mem.eql(u8, method, "events")) return self.events(arena, params);
         if (std.mem.eql(u8, method, "session.events")) {
@@ -308,16 +325,16 @@ fn snapshotArgs(arena: std.mem.Allocator, action: []const u8, id: ?[]const u8, e
 
 pub fn run(runner: Runner) !void {
     @import("../agent/runtime/completion_review.zig").configureInvocation("ui-host");
-    {
-        var setup = std.heap.ArenaAllocator.init(alloc);
-        defer setup.deinit();
-        _ = (try workspace.Manager.bound(setup.allocator())) orelse return error.NoFossilWorkspace;
-    }
+    var setup = std.heap.ArenaAllocator.init(alloc);
+    defer setup.deinit();
+    const binding = (try workspace.Manager.bound(setup.allocator())) orelse return error.NoFossilWorkspace;
+    workspace.configureHostBinding(.{ .repository = binding.repository, .workspace_id = binding.manifest.id });
+    defer workspace.configureHostBinding(null);
     const home = io.getenv("HOME") orelse return error.HomeUnavailable;
     const directory = try alloc.print("{s}/.fx/ui-host/{s}", .{ home, try workspace.hash(alloc, try io.realpathAlloc(alloc, ".")) });
     defer alloc.free(directory);
     try std.Io.Dir.cwd().createDirPath(io.getIo(), directory);
-    var server: Server = .{ .runner = runner, .journal_dir = directory };
+    var server: Server = .{ .runner = runner, .journal_dir = directory, .repository = binding.repository, .workspace_id = binding.manifest.id };
     defer if (server.job) |job| {
         job.ui.stop();
         server.thread.?.join();
