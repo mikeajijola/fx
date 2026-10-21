@@ -92,18 +92,24 @@ class PgsoModelTests(unittest.TestCase):
         self.assertEqual(1.0, bytes_to_mib(1_048_576))
         self.assertEqual(6_887_888, evidence.size_bytes)
         self.assertEqual(6.5688018798828125, evidence.size_mib)
-        self.assertEqual(7.000, evidence.ceiling_mib)
-        self.assertEqual(0.4311981201171875, evidence.headroom_mib)
+        self.assertEqual(7.250, evidence.ceiling_mib)
+        self.assertEqual(0.6811981201171875, evidence.headroom_mib)
         self.assertEqual(0.250, evidence.preferred_headroom_mib)
         self.assertTrue(evidence.preferred_headroom_met)
 
     def test_size_gate_enforces_the_integral_byte_boundary(self) -> None:
-        self.assertEqual(7_340_032, size_gate(7_340_032).size_bytes)
-        with self.assertRaisesRegex(PgsoError, "exceeds 7.000 MiB"):
-            size_gate(7_340_033)
+        self.assertEqual(7_602_176, size_gate(7_602_176).size_bytes)
+        with self.assertRaisesRegex(PgsoError, "exceeds 7.250 MiB"):
+            size_gate(7_602_177)
+
+    def test_size_gate_retains_one_quarter_mib_at_the_adoption_boundary(self) -> None:
+        boundary = size_gate(7_340_032)
+        self.assertEqual(0.250, boundary.headroom_mib)
+        self.assertTrue(boundary.preferred_headroom_met)
+        self.assertFalse(size_gate(7_340_033).preferred_headroom_met)
 
     def test_size_gate_records_insufficient_preferred_headroom(self) -> None:
-        evidence = size_gate(7_200_000)
+        evidence = size_gate(7_400_000)
 
         self.assertFalse(evidence.preferred_headroom_met)
         self.assertGreater(evidence.headroom_mib, 0)
