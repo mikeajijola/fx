@@ -69,6 +69,7 @@ jobs:
           assert toolchain.llvm_version==identity['llvm_version']=='22.1.8'
           assert toolchain.zig_version==identity['zig_version']=='0.17.0'
           paths=p.PipelinePaths.create(root/'comparison')
+          paths.control_binary.parent.mkdir(parents=True,exist_ok=True)
           shutil.copy2(bitcode,paths.bitcode);shutil.copy2(profile,paths.merged_profile);shutil.copy2(seed/'control/bin/fx',paths.control_binary)
           variant=os.environ['VARIANT']
           if variant=='capped':extra=('-inline-threshold=100','-hot-callsite-threshold=500')
