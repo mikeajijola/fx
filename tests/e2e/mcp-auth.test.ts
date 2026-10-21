@@ -1077,7 +1077,8 @@ describe("MCP remote authentication lifecycle", () => {
       expect(start.searchParams.get("scope")).toBe("tools.read");
       const target = `http://127.0.0.1:${start.searchParams.get("port")}/slack/oauth/callback`;
       const body = await authorizePersonalFixture(auth, start);
-      const postCallback = (fields: URLSearchParams, origin = bridgeOrigin) => fetch(target, { method: "POST", headers: { origin }, body: fields, redirect: "manual" });
+      // Match the callback listener's one-shot connection lifetime.
+      const postCallback = (fields: URLSearchParams, origin = bridgeOrigin) => fetch(target, { method: "POST", headers: { origin, connection: "close" }, body: fields, redirect: "manual" });
       expect((await postCallback(body, "https://evil.example")).status).toBe(404);
       const wrong = new URLSearchParams(body);
       wrong.set("state", "wrong-state");
@@ -4452,7 +4453,8 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     // fx.sh's page posts what Slack sent back; only its origin is taken.
     const target = `http://127.0.0.1:${start.searchParams.get("port")}/slack/oauth/callback`;
     const body = await authorizePersonalFixture(auth, start);
-    const post = (fields: URLSearchParams, origin: string) => fetch(target, { method: "POST", headers: { origin }, body: fields, redirect: "manual" });
+    // Match the callback listener's one-shot connection lifetime.
+    const post = (fields: URLSearchParams, origin: string) => fetch(target, { method: "POST", headers: { origin, connection: "close" }, body: fields, redirect: "manual" });
     expect((await post(body, "https://evil.example")).status).toBe(404);
     expect(auth.tokenExchanges).toBe(0);
     expect((await post(body, bridgeOrigin)).status).toBe(200);

@@ -109,6 +109,20 @@ pub const NetworkFailureEvidence = struct {
 pub const AttemptEvidence = struct {
     provider_admitted: bool = false,
     network_failure: ?NetworkFailureEvidence = null,
+    tool_identity_failure: ?ToolIdentityFailure = null,
+};
+
+/// Bounded parser diagnostics; never retains arguments or provider reasoning.
+pub const ToolIdentityFailure = struct {
+    kind: enum { missing, malformed, unadvertised } = .missing,
+    name_bytes: [128]u8 = @splat(0),
+    name_len: usize = 0,
+    advertised_count: usize = 0,
+    advertised_hash: [64]u8 = @splat(0),
+
+    pub fn name(self: *const ToolIdentityFailure) []const u8 {
+        return self.name_bytes[0..self.name_len];
+    }
 };
 
 /// Gives a cooperative single-threaded host a chance to publish UI and runtime

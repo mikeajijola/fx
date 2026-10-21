@@ -843,15 +843,18 @@ pub const read_tool_result = ToolSpec{
 
 pub const fossil_workspace = ToolSpec{
     .name = "fossil_workspace",
-    .description = "Inspect task state, read/write memory or skills, attach a content-addressed artifact, or inspect history/diff. Branch and merge operations are host-only.",
+    .description = "Inspect the pinned OmniForm definition, query typed workspace records, retain a plan refinement or custom record, and propose a compatible definition for future tasks. Also read/write memory or skills, attach artifacts, inspect history/diff, or verify_manifest using files with path, sha256 and bytes. Contracts, evidence, assessments and publication are host-owned.",
     .model_schema = .{
         .name = "fossil_workspace",
-        .description = "Inspect task state, read/write memory or skills, attach a content-addressed artifact, or inspect history/diff. Branch and merge operations are host-only.",
+        .description = "Inspect the pinned OmniForm definition, query typed workspace records, retain a plan refinement or custom record, and propose a compatible definition for future tasks. Also read/write memory or skills, attach artifacts, inspect history/diff, or verify_manifest using files with path, sha256 and bytes. Contracts, evidence, assessments and publication are host-owned.",
         .input_schema = .{
             .properties = &.{
-                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "status", "read", "write", "artifact", "diff", "history" } } },
+                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "status", "read", "write", "artifact", "diff", "history", "verify_manifest", "definition", "query", "record", "propose_definition" } } },
                 .{ .name = "path", .json_type = .string },
                 .{ .name = "content", .json_type = .string },
+                .{ .name = "entity", .json_type = .string },
+                .{ .name = "offset", .json_type = .integer },
+                .{ .name = "execution", .json_type = .string },
             },
             .required = &.{"action"},
             .additional_properties = false,
@@ -977,7 +980,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "7887bb8b1784dcf41ac1fb2325a6b4a47a50589fed98a584dc055449372bc19a",
+        "86fe99e101c4c8181d7359d624b2920cc98a76c05b9e9366dd11300371cf1141",
         &actual_hex,
     );
 }

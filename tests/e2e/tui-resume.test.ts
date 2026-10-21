@@ -927,7 +927,11 @@ test.skipIf(!tmuxAvailable())(
         if (mode === "picker") {
           await active.sendText("/resume");
           await waitForSessionPicker(active);
+          // The header is painted before the asynchronous catalog has rows.
+          // Enter while it is still loading cannot select the saved session.
+          await active.waitForPane((pane) => /\b3 turns\b/.test(stripAnsi(pane)), TIMEOUT);
           await active.sendKeys("Enter");
+          await waitForSessionPickerClosed(active);
         }
         const resumed = await waitForScrollback(active, "RECENT_VISIBLE_REPLY");
         expect(resumed).toContain("RECENT_VISIBLE_REQUEST");

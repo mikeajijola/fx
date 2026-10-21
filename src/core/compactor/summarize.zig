@@ -24,6 +24,7 @@
 //! the store, so every compaction and every test runs this same code.
 
 const std = @import("std");
+const sort_utils = @import("../shared/sort_utils.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const checkpoint = @import("checkpoint.zig");
 const ledger = @import("ledger.zig");
@@ -453,7 +454,7 @@ fn compactPart(alloc: Allocator, request: Request, users: []const []const u8, mo
         try turn_records.append(scratch, .{ .number = turn.number, .text = text, .first_tool = turn.first_tool, .last_tool = turn.last_tool });
     }
     // The turn in progress is turn zero, so it goes first.
-    std.mem.sort(lint.Record, turn_records.items, {}, byNumber);
+    sort_utils.sort(lint.Record, turn_records.items, {}, byNumber);
 
     var written: ledger.Written = .{};
     if (plan.needsModel()) notes: {

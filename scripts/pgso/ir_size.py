@@ -2,6 +2,7 @@
 """Size passes for PGSO bitcode, run through the pinned LLVM C library.
 
     ir_size.py --libllvm <libLLVM.dylib> outline-helpers <in.bc> <out.bc>
+    ir_size.py --libllvm <libLLVM.dylib> outline-equality <in.bc> <out.bc>
     ir_size.py --libllvm <libLLVM.dylib> sparse-constants <in.bc> <out.bc>
 
 outline-helpers marks small shared std helpers as noinline: the allocator's
@@ -12,6 +13,12 @@ teardown. Zig inlines them at thousands of call sites (free alone at about
 poisoning, and calls. Run it on the emitted bitcode, before instrumentation,
 so training and profile use see the same inlining.
 
+outline-equality shares byte comparisons at control-layer call sites before
+instrumentation. It discovers the byte comparator through typed JSON and
+string-map functions, rejects ambiguous or forced-inline matches, and keeps
+the callee body and attributes. Indexer, rendering, and shared-primitive call
+sites use their existing policy. Benchmark modules receive the same pass.
+
 sparse-constants rewrites copies from mostly undefined internal constants
 into stores of their defined scalar leaves. Zig materializes `return error.X`
 from a function returning a large `E!T` as a constant `{ T undef, code,
@@ -19,7 +26,7 @@ padding undef }` copied into the result. Copying undefined bytes is refined
 by leaving the destination bytes unchanged, so only the defined bytes are
 stored. Run `opt -passes=globaldce,verify` afterwards to drop dead constants.
 
-Both commands print a JSON summary on stdout and exit nonzero when the input
+All commands print a JSON summary on stdout and exit nonzero when the input
 cannot be read. outline-helpers also fails when no allocator free helper
 matches, because that means std naming changed and the pass went stale.
 """
@@ -173,6 +180,77 @@ def outline_helpers(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> d
     }
 
 
+
+CONTROL_EQUALITY_SCOPES = (
+    "json.", "core.agent.", "core.workspace.", "core.session.",
+    "core.config.", "core.cli.", "core.tooling.", "core.permissions.",
+    "core.shell_command.", "core.mcp.", "core.mcp_host.", "gateway.", "tools.",
+)
+
+CONTROL_EQUALITY_EXCLUSIONS = ("core.agent.presentation.",)
+
+
+def _functions(llvm, module):
+    fn = llvm.FirstFunction(module)
+    while fn:
+        yield fn
+        fn = llvm.NextFunction(fn)
+
+
+def _calls(llvm, fn):
+    block = llvm.FirstBlock(fn)
+    while block:
+        inst = llvm.FirstInstruction(block)
+        while inst:
+            if llvm.IsACallInst(inst):
+                yield inst
+            inst = llvm.NextInstruction(inst)
+        block = llvm.NextBlock(block)
+
+
+def outline_equality(llvm, source, output):
+    f = llvm._fn
+    llvm.FirstBlock = f("LLVMGetFirstBasicBlock", P, P)
+    llvm.NextBlock = f("LLVMGetNextBasicBlock", P, P)
+    llvm.FirstInstruction = f("LLVMGetFirstInstruction", P, P)
+    llvm.NextInstruction = f("LLVMGetNextInstruction", P, P)
+    add = f("LLVMAddCallSiteAttribute", None, P, C.c_uint, P)
+    context, module = llvm.load(source)
+    # Discover the byte-comparison instantiation from pinned standard functions.
+    # Numeric Zig instantiation suffixes are not assumed to remain stable.
+    targets = set()
+    for fn in _functions(llvm, module):
+        if not (llvm.name(fn).startswith("json.static.") or llvm.name(fn) in ("hash_map.eqlString", "array_hash_map.eqlString")):
+            continue
+        for call in _calls(llvm, fn):
+            callee = llvm.CalledValue(call)
+            if re.fullmatch(r"mem\.eql__func_\d+", llvm.name(callee)):
+                targets.add(callee)
+    if len(targets) != 1:
+        raise PassError("expected one verified byte-comparison instantiation")
+    always = llvm.kind("alwaysinline")
+    for target in targets:
+        if llvm.GetEnumAttrAt(target, FUNCTION_INDEX, always):
+            raise PassError("byte comparison is alwaysinline")
+    attribute = llvm.CreateEnumAttr(context, llvm.kind("noinline"), 0)
+    counts = {}
+    for fn in _functions(llvm, module):
+        name = llvm.name(fn)
+        if not name.startswith(CONTROL_EQUALITY_SCOPES) or name.startswith(CONTROL_EQUALITY_EXCLUSIONS):
+            continue
+        for call in _calls(llvm, fn):
+            if llvm.CalledValue(call) not in targets:
+                continue
+            if llvm.CallSiteEnumAttr(call, FUNCTION_INDEX, always):
+                raise PassError("comparison call site is alwaysinline")
+            add(call, FUNCTION_INDEX, attribute)
+            scope = ".".join(name.split(".")[:2])
+            counts[scope] = counts.get(scope, 0) + 1
+    llvm.save(module, output)
+    return {"pass": "outline-equality", "call_sites": sum(counts.values()),
+            "targets": sorted(llvm.name(t) for t in targets), "scopes": counts}
+
+
 def _leaves(llvm: Llvm, td, value, base: int, out: list) -> None:
     if llvm.IsUndef(value):
         return
@@ -287,13 +365,14 @@ def sparse_constants(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--libllvm", required=True, type=pathlib.Path)
-    parser.add_argument("command", choices=("outline-helpers", "sparse-constants"))
+    parser.add_argument("command", choices=("outline-helpers", "outline-equality", "sparse-constants"))
     parser.add_argument("source", type=pathlib.Path)
     parser.add_argument("output", type=pathlib.Path)
     args = parser.parse_args(argv)
     try:
         llvm = Llvm(args.libllvm)
-        run = outline_helpers if args.command == "outline-helpers" else sparse_constants
+        run = {"outline-helpers": outline_helpers, "outline-equality": outline_equality,
+               "sparse-constants": sparse_constants}[args.command]
         summary = run(llvm, args.source, args.output)
     except (OSError, PassError) as error:
         sys.stderr.write(f"ir_size: {error}\n")

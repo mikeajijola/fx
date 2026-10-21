@@ -3,6 +3,7 @@
 //! when they belong to the current UTC day (`TodayIsToday`).
 
 const std = @import("std");
+const sort_utils = @import("../core/shared/sort_utils.zig");
 const report = @import("report.zig");
 const cache = @import("cache.zig");
 
@@ -91,7 +92,7 @@ pub fn build(gpa: Allocator, entry: ?cache.Entry, period: Period, now_ms: i64) A
             }
         }
     }
-    std.mem.sort(report.ModelRow, merged.items, {}, costDescending);
+    sort_utils.sort(report.ModelRow, merged.items, {}, costDescending);
 
     return .{
         .arena = arena,

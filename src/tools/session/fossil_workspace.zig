@@ -3,9 +3,12 @@ const workspace = @import("../../core/workspace/fossil_workspace.zig");
 const dispatch = @import("../../core/tooling/tool_dispatch.zig");
 
 const Input = struct {
-    action: enum { status, read, write, artifact, diff, history },
+    action: enum { status, read, write, artifact, diff, history, verify_manifest, definition, query, record, propose_definition },
     path: ?[]const u8 = null,
     content: ?[]const u8 = null,
+    entity: ?[]const u8 = null,
+    offset: usize = 0,
+    execution: ?[]const u8 = null,
 };
 const Parsed = std.json.Parsed(Input);
 
@@ -29,7 +32,7 @@ pub fn decode(ctx: dispatch.DispatchContext, args: []const u8) dispatch.Dispatch
 
 pub fn readsOnly(input: dispatch.ToolInput) bool {
     return switch (input.as(Parsed).value.action) {
-        .write, .artifact => false,
+        .write, .artifact, .record, .propose_definition => false,
         else => true,
     };
 }
@@ -58,12 +61,17 @@ fn execute(alloc: std.mem.Allocator, ctx: dispatch.DispatchContext, input: Input
         return std.json.Stringify.valueAlloc(alloc, snapshot, .{});
     }
     if (input.action == .history) return manager.history();
+    if (input.action == .definition) return std.json.Stringify.valueAlloc(alloc, try manager.definitionSnapshot(task), .{});
+    if (input.action == .query) return manager.queryRecords(task, input.entity, input.offset);
     if (input.action == .read) {
         const path = input.path orelse return error.MissingPath;
         return if (task) |active| manager.readContent(active, path) else manager.trunkContent(path);
     }
     const active = task orelse return error.SavedTaskRequired;
     switch (input.action) {
+        .propose_definition => return manager.proposeDefinition(active, input.content orelse return error.MissingContent, input.execution),
+        .record => return manager.writeRecord(active, input.entity orelse return error.MissingEntityType, input.content orelse return error.MissingContent),
+        .verify_manifest => return manager.verifyManifest(active, input.path orelse return error.MissingPath),
         .diff => return manager.diff(active),
         .write => {
             try manager.writeContent(active, input.path orelse return error.MissingPath, input.content orelse return error.MissingContent);

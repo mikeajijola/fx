@@ -9,8 +9,10 @@ import unittest
 
 from scripts.pgso.model import PgsoError, sha256_file
 from scripts.pgso.pipeline import (
+    ARGUMENT_CLEANUP_FLAGS,
+    ARGUMENT_CLEANUP_ROUNDS,
     BENCHMARK_USE_FLAGS,
-    FX_MACHINE_OUTLINER_FLAGS,
+    MACHINE_OUTLINER_FLAGS,
     GENERATION_FLAGS,
     IR_OUTLINER_FLAGS,
     OUTLINE_CLEANUP_FLAGS,
@@ -25,6 +27,7 @@ from scripts.pgso.pipeline import (
     apply_profile,
     apple_ld_system_stub,
     cleanup_outlined_ir_argv,
+    cleanup_outlined_arguments,
     candidate_object_argv,
     candidate_link_argv,
     candidate_runtime_probe_argv,
@@ -315,15 +318,37 @@ prefix = pathlib.Path(sys.argv[sys.argv.index('--prefix') + 1])
         self.assertEqual(b"BC\xc0\xdestaged", self.paths.bitcode.read_bytes())
         self.assertEqual(sha256_file(self.paths.bitcode), digest)
         lines = actions.read_text().splitlines()
-        self.assertEqual(2, len(lines))
+        self.assertEqual(3, len(lines))
         self.assertTrue(lines[0].startswith("zig build pgso-ir "))
         self.assertEqual(
             f"ir_size --libllvm {toolchain.libllvm} outline-helpers "
             f"{self.paths.bitcode} {self.paths.bitcode}.staged",
             lines[1],
         )
+        self.assertEqual(
+            f"ir_size --libllvm {toolchain.libllvm} outline-equality "
+            f"{self.paths.bitcode} {self.paths.bitcode}.staged",
+            lines[2],
+        )
         self.assertFalse(self.paths.bitcode.with_name("fx.bc.staged").exists())
         emit_bitcode(toolchain, self.spec, self.paths, expected_sha256=digest)
+
+    def test_emitted_identity_rejects_a_failed_equality_pass(self) -> None:
+        actions = self.root / "equality-emit-failure"
+        ir_size = self.write_executable(
+            "equality-failure",
+            "import pathlib,sys\n"
+            "if sys.argv[3] == 'outline-equality':\n"
+            "    sys.stderr.write('missing verified comparison')\n"
+            "    sys.exit(1)\n"
+            "pathlib.Path(sys.argv[-1]).write_bytes(b'BC\\xc0\\xdehelper-verified')\n",
+        )
+        toolchain = dataclasses.replace(self.toolchain, zig=self.write_bitcode_zig(actions), ir_size=ir_size)
+        self.spec.repo_root.mkdir(parents=True)
+        with self.assertRaisesRegex(PgsoError, "failed with exit code 1"):
+            emit_bitcode(toolchain, self.spec, self.paths)
+        self.assertEqual(b"BC\xc0\xdehelper-verified", self.paths.bitcode.read_bytes())
+        self.assertFalse(self.paths.candidate_binary.exists())
 
     def test_emitted_bitcode_accepts_the_darwin_bitcode_wrapper(self) -> None:
         actions = self.root / "emit-wrapper"
@@ -367,13 +392,16 @@ prefix = pathlib.Path(sys.argv[sys.argv.index('--prefix') + 1])
             f"""import pathlib,sys
 with pathlib.Path({str(actions)!r}).open('a') as stream:
     stream.write('opt ' + ' '.join(sys.argv[1:]) + '\\n')
-pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'bitcode')""",
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'BC\\xc0\\xdebitcode')""",
         )
         paths = PipelinePaths.create(self.root / "run-bench", selector="ui_activity")
         toolchain = dataclasses.replace(
             self.toolchain,
             opt=opt,
             ir_size=self.write_ir_size(actions),
+            llvm_nm=self.write_executable(
+                "benchmark-nm", "print('_main T ---------------- 0')",
+            ),
         )
         paths.bitcode.write_bytes(b"same bitcode")
         paths.merged_profile.write_bytes(b"profile")
@@ -382,10 +410,15 @@ pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'bitcode')""",
 
         self.assertEqual(paths.profile_use_bitcode, result)
         lines = actions.read_text().splitlines()
-        self.assertEqual(3, len(lines))
+        self.assertEqual(9, len(lines))
         self.assertIn(f"-passes={PROFILE_PREPARATION_PASSES},default<O2>,mergefunc,iroutliner", lines[0])
         self.assertIn(f"sparse-constants {paths.profile_use_bitcode} ", lines[1])
         self.assertIn("-passes=globaldce,verify", lines[2])
+        for index in range(ARGUMENT_CLEANUP_ROUNDS):
+            self.assertIn(ARGUMENT_CLEANUP_FLAGS[0], lines[3 + 3 * index])
+            self.assertTrue((paths.logs / f"argument-cleanup-{index}.json").is_file())
+            self.assertTrue((paths.logs / f"argument-{index}-sparse-constants.json").is_file())
+        self.assertTrue((paths.logs / "argument-public-symbols-after.json").is_file())
 
     def test_profile_pipelines_use_the_exact_accepted_flags(self) -> None:
         self.assertEqual(
@@ -430,8 +463,10 @@ pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'bitcode')""",
         self.assertEqual(
             (
                 "-machine-outliner-reruns=1",
+                "-enable-tail-merge",
+                "-tail-merge-threshold=1000",
             ),
-            FX_MACHINE_OUTLINER_FLAGS,
+            MACHINE_OUTLINER_FLAGS,
         )
         self.assertEqual(
             (
@@ -645,9 +680,9 @@ pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'bitcode')""",
             ),
             candidate,
         )
-        for flag in FX_MACHINE_OUTLINER_FLAGS:
+        for flag in MACHINE_OUTLINER_FLAGS:
             self.assertIn(flag, candidate_object)
-            self.assertNotIn(flag, benchmark_object)
+            self.assertIn(flag, benchmark_object)
 
     def test_candidate_object_and_signing_contract(self) -> None:
         actions = self.root / "candidate-actions.txt"
@@ -749,7 +784,8 @@ pathlib.Path(sys.argv[sys.argv.index('-map') + 1]).write_bytes({link_map!r}.enco
                 f"{self.paths.profile_use_bitcode} -o "
                 f"{self.paths.profile_use_ir}",
                 "artifact -filetype=obj -O=2 "
-                "-machine-outliner-reruns=1 "
+                "-machine-outliner-reruns=1 -enable-tail-merge "
+                "-tail-merge-threshold=1000 "
                 f"{self.paths.profile_use_bitcode} -o "
                 f"{self.paths.profile_use_object}",
                 "probe cc -### -target aarch64-macos -O2 -Wl,-dead_strip -s "
@@ -891,7 +927,7 @@ output.write_bytes(b'merged profile')""",
             f"""import pathlib,sys
 with pathlib.Path({str(actions)!r}).open('a') as stream:
     stream.write('opt ' + ' '.join(sys.argv[1:]) + '\\n')
-pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'bitcode')""",
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'BC\\xc0\\xdebitcode')""",
         )
         split = self.write_executable(
             "llvm-split",
@@ -935,9 +971,9 @@ print('_main T ---------------- 0')""",
         )
 
         self.assertEqual(self.paths.profile_use_bitcode, result)
-        self.assertEqual(b"bitcode", result.read_bytes())
+        self.assertEqual(b"BC\xc0\xdebitcode", result.read_bytes())
         lines = actions.read_text().splitlines()
-        self.assertEqual(10, len(lines))
+        self.assertEqual(18, len(lines))
         self.assertIn("-passes=function(sroa,instcombine<no-verify-fixpoint>,loop-unroll-full,instcombine<no-verify-fixpoint>,simplifycfg),default<O2>,mergefunc", lines[0])
         self.assertNotIn("iroutliner", lines[0])
         self.assertEqual("nm", lines[1])
@@ -953,6 +989,9 @@ print('_main T ---------------- 0')""",
         self.assertIn("-passes=globaldce,verify", lines[8])
         self.assertTrue(lines[8].endswith(f"-o {self.paths.profile_use_bitcode}"))
         self.assertEqual("nm", lines[9])
+        for index in range(ARGUMENT_CLEANUP_ROUNDS):
+            self.assertIn(ARGUMENT_CLEANUP_FLAGS[0], lines[10 + 3 * index])
+        self.assertEqual(["nm", "nm"], lines[-2:])
         self.assertFalse(
             self.paths.profile_use_bitcode.with_name(
                 self.paths.profile_use_bitcode.name + ".sparse"
@@ -960,6 +999,26 @@ print('_main T ---------------- 0')""",
         )
         self.assertTrue((self.paths.logs / "public-symbols-before.json").is_file())
         self.assertTrue((self.paths.logs / "public-symbols-after.json").is_file())
+
+    def test_argument_cleanup_rejects_invalid_output_before_replacing_input(self) -> None:
+        original = b"BC\xc0\xdeoriginal"
+        for output, warning, message in (
+            (b"not bitcode", "", "invalid LLVM bitcode header"),
+            (b"BC\xc0\xdechanged", "warning", "wrote unexpected stderr"),
+        ):
+            with self.subTest(message=message):
+                self.paths.profile_use_bitcode.write_bytes(original)
+                opt = self.write_executable(
+                    "invalid-argument-opt",
+                    f"import pathlib,sys\npathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes({output!r})\nsys.stderr.write({warning!r})",
+                )
+                toolchain = dataclasses.replace(
+                    self.toolchain, opt=opt,
+                    llvm_nm=self.write_executable("argument-nm", "print('_main T ---------------- 0')"),
+                )
+                with self.assertRaisesRegex(PgsoError, message):
+                    cleanup_outlined_arguments(toolchain, self.paths)
+                self.assertEqual(original, self.paths.profile_use_bitcode.read_bytes())
 
     def test_profile_use_rejects_optimizer_warnings(self) -> None:
         opt = self.write_executable(
@@ -1168,13 +1227,13 @@ sys.stderr.write('optimizer warning')""",
                         expected_contract=self.good_link_contract(),
                     )
 
-    def test_candidate_size_rejects_more_than_7_000_mib(self) -> None:
+    def test_candidate_size_rejects_more_than_7_250_mib(self) -> None:
         candidate = self.root / "candidate"
         candidate.write_bytes(b"")
         with candidate.open("r+b") as stream:
-            stream.truncate(7_340_033)
+            stream.truncate(7_602_177)
 
-        with self.assertRaisesRegex(PgsoError, "exceeds 7.000 MiB"):
+        with self.assertRaisesRegex(PgsoError, "exceeds 7.250 MiB"):
             validate_candidate_size(candidate)
 
     def test_candidate_must_not_create_an_adversarial_profile_file(self) -> None:

@@ -2,7 +2,7 @@
 
 This directory owns the non-publishing Stage 1 build for a smaller macOS arm64 `fx` candidate. It preserves Zig ReleaseSafe semantics and the complete product feature set, then uses native LLVM profiles to keep measured hot code speed-oriented and compile profile-proven cold functions for size.
 
-The candidate is accepted only when it is no larger than **7.000 MiB**, has the preferred **0.250 MiB** of size headroom, passes the deterministic product corpus, and stays within a **10%** p50 and p95 performance regression limit. The ordinary ReleaseSafe binary remains the control and recovery path.
+This fork accepts a candidate only when it stays below the **7.250 MiB** ceiling with at least **0.250 MiB** of size headroom, giving a **7.000 MiB** adoption target. It must also pass the deterministic product corpus and stay within a **10%** p50 and p95 performance regression limit. The ordinary ReleaseSafe binary remains the control and recovery path.
 
 ## Toolchain and target
 
@@ -16,6 +16,11 @@ The driver requires:
 - Bun `1.3.14`
 - Hyperfine `1.20.0`
 - the selected source commit, update channel, bitcode hash, corpus hash, and profile-generation flags
+
+The distributed workflow uses the standard `macos-26` ARM64 runner image.
+The separate macOS compatibility workflow continues to test on `macos-15`.
+Both images use the standard M1 runner class. The pinned toolchain and
+`aarch64-macos` target preserve the minimum deployment version of macOS 15.
 
 The pipeline does not use the host CPU as the release target. The final candidate must match the control's architecture, minimum macOS version, SDK compatibility stamp, main-stack request, and dynamic-library dependency versions. It must contain a valid code signature, contain no profile sections or profile-runtime dependency, and produce no profile output when executed.
 
@@ -61,25 +66,27 @@ python3 -m scripts.pgso all \
 
 The production workflow runs the same gate as a distributed DAG. One seed job
 builds the control, bitcode, and instrumented binary. Up to twenty training
-jobs execute non-overlapping corpus assignments, one coordinator validates and
+shards execute non-overlapping corpus assignments, with at most four active
+jobs to limit runner-allocation failures. One coordinator validates and
 merges every shard profile, builds three dedicated heavy-workload benchmark
 pairs, adds their hash-compatible speed evidence to the production profile,
 and builds the candidate. Up to twenty behavior jobs then verify
-non-overlapping candidate assignments. The six startup and six heavy-workload
+non-overlapping candidate assignments, also with at most four active jobs. The six startup and six heavy-workload
 comparisons run on twelve fresh machines. Every performance job measures its
 immutable control and candidate on the same machine.
 
 The fx candidate applies the accepted whole-program profile-use pipeline, then
 uses LLVM's deterministic name-hash split to divide the optimized IR into two
-balanced modules. Each module is outlined sequentially before the modules are
+modules. Each module is outlined sequentially before the modules are
 relinked and their original private linkage is restored. This keeps the IR
 outliner's suffix-tree memory below the standard runner limit without changing
-the training corpus, benchmark candidates, or performance measurement hardware.
+the training corpus or performance measurement hardware. Benchmark artifacts
+keep their single-module outlining pass.
 Generated IR helpers are kept in one dense linker cluster ordered by their
 hottest profiled caller so outlining does not scatter startup code across cold
 pages.
 
-Two size passes in [`ir_size.py`](ir_size.py) run through the pinned LLVM C
+Three size passes in [`ir_size.py`](ir_size.py) run through the pinned LLVM C
 library. Right after Zig emits bitcode, `outline-helpers` marks small shared
 std helpers `noinline`: the allocator's slice `free`, `remap`, and aligned
 allocation, the writer's `write`, `writeAll`, and allocating-writer setup and
@@ -87,16 +94,39 @@ teardown, and the byte list's `appendSlice` and `deinit`. Zig otherwise copies
 them into thousands of call sites (`free` alone into about 11,000). The pass
 runs before instrumentation, so training, profile use, and the recorded
 bitcode identity all include it. It reports matches per pattern and fails if
-the allocator `free` helper does not match. After profile use and outlining,
+the allocator `free` helper does not match. A matching `alwaysinline` helper
+also fails instead of emitting conflicting attributes. Changes to this pass
+require fresh training; profiles from another inlining graph cannot qualify
+the candidate. `outline-equality` then shares byte-comparison code at selected
+control-layer call sites. It discovers the exact comparator from the pinned
+standard library's JSON and string-map functions. It adds call-site `noinline`
+attributes and preserves the comparator's body and attributes. Indexer,
+renderer, agent-presentation, and shared-primitive call sites retain their
+existing policy. Ambiguous discovery and conflicting `alwaysinline` attributes
+fail before the transformed bitcode is recorded. The same discovery and scope
+rules apply to every benchmark module. Changes require fresh training because
+they affect the graph seen by instrumentation. After profile use and outlining,
 `sparse-constants` rewrites copies from mostly undefined internal constants
 into stores of their defined bytes, then `globaldce,verify` drops the dead
 constants. Zig emits such a constant for each `return error.X` from a
 function returning a large error union. Undefined bytes become "destination
 unchanged", a refinement of copying undefined bytes; explicit values,
-including zeros, are still stored. Benchmark artifacts receive both passes so
+including zeros, are still stored. Benchmark artifacts receive all three passes so
 their candidates keep the production code shape. The candidate link passes
 `-no_compact_unwind`: fx builds without unwind tables, and newer Apple linkers
 otherwise emit about 160 KB of compact unwind data.
+
+After the sparse rewrite, CLI and benchmark artifacts receive two bounded
+argument-cleanup rounds. LLVM promotes safe pointer reads to value arguments,
+then simplifies the helpers and their callers. The second round handles
+opportunities exposed by the first caller cleanup. Conditional pointer reads,
+writes, and checked arithmetic retain their semantics. Each round verifies IR
+and rejects warnings or an invalid bitcode header before atomically replacing
+the previous output. Sparse rewriting runs again after each round, with
+separate audit logs. A changed public symbol surface rejects the candidate. CLI and benchmark
+candidates also share the backend policy: one machine-outliner rerun and a
+tail-merge comparison threshold of 1,000. The size and performance gates
+qualify this complete policy together.
 
 `python3 -m scripts.pgso.distributed plan` emits deterministic, non-empty
 GitHub Actions matrices. The remaining distributed subcommands are workflow

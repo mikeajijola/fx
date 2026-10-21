@@ -10,6 +10,7 @@
 //! this file never sees the session manager.
 
 const std = @import("std");
+const sort_utils = @import("../shared/sort_utils.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
@@ -940,7 +941,7 @@ pub fn fingerprintOf(a: Allocator, dir: *io_mod.VerifiedDir) ![64]u8 {
         } else false;
         if (!skip) try names.append(a, try a.dupe(u8, entry.name));
     }
-    std.mem.sort([]const u8, names.items, {}, lessThan);
+    sort_utils.sort([]const u8, names.items, {}, lessThan);
     for ([_][]const u8{ "subagent/children.json", "client/system-prompt.txt", "client/mcp-tool-identities.json" }) |name| try names.append(a, name);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     var buffer: [64 * 1024]u8 = undefined;

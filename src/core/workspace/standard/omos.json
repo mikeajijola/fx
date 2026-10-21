@@ -1,0 +1,1058 @@
+{
+  "apiVersion": "omniform.org/v1alpha1",
+  "kind": "Company",
+  "metadata": {
+    "id": "omos_workspace",
+    "name": "omos agent workspace"
+  },
+  "spec": {
+    "providers": {
+      "inference": {
+        "provider": "configured"
+      },
+      "skills": {
+        "provider": "omos"
+      },
+      "machines": {
+        "provider": "native"
+      },
+      "memory": {
+        "provider": "fossil"
+      }
+    },
+    "capabilities": [
+      {
+        "id": "general_task",
+        "name": "General task",
+        "description": "Answer requests and carry out authorized work using retained evidence.",
+        "requires": [
+          {
+            "id": "reasoning",
+            "primitiveFamily": "inference"
+          },
+          {
+            "id": "retained_workspace",
+            "primitiveFamily": "memory"
+          }
+        ],
+        "realisations": [
+          "general_task_native"
+        ]
+      },
+      {
+        "id": "coding_task",
+        "name": "Coding task",
+        "description": "Inspect and edit repository source, implement requested changes, run applicable tests and report verified outcomes.",
+        "requires": [
+          {
+            "id": "reasoning",
+            "primitiveFamily": "inference"
+          },
+          {
+            "id": "repository_tools",
+            "primitiveFamily": "skills"
+          },
+          {
+            "id": "validation_commands",
+            "primitiveFamily": "machines"
+          },
+          {
+            "id": "retained_workspace",
+            "primitiveFamily": "memory"
+          }
+        ],
+        "realisations": [
+          "coding_task_native"
+        ]
+      }
+    ],
+    "resources": {
+      "inference": [
+        {
+          "id": "configured_model",
+          "name": "Configured reasoning model",
+          "offers": [
+            "reasoning"
+          ],
+          "spec": {
+            "implementation": "omos_model"
+          }
+        }
+      ],
+      "skills": [
+        {
+          "id": "native_repository",
+          "name": "Native repository tools",
+          "offers": [
+            "repository_tools"
+          ],
+          "spec": {
+            "implementation": "omos_repository"
+          }
+        }
+      ],
+      "machines": [
+        {
+          "id": "native_commands",
+          "name": "Native validation commands",
+          "offers": [
+            "validation_commands"
+          ],
+          "spec": {
+            "implementation": "omos_shell"
+          }
+        }
+      ],
+      "memory": [
+        {
+          "id": "fossil_workspace",
+          "name": "Bound Fossil workspace",
+          "offers": [
+            "retained_workspace"
+          ],
+          "spec": {
+            "implementation": "omos_fossil"
+          }
+        }
+      ]
+    },
+    "realisations": [
+      {
+        "id": "general_task_native",
+        "name": "General task in omos",
+        "capability": "general_task",
+        "participants": [
+          {
+            "resource": "configured_model",
+            "supplies": [
+              "reasoning"
+            ]
+          },
+          {
+            "resource": "fossil_workspace",
+            "supplies": [
+              "retained_workspace"
+            ]
+          }
+        ]
+      },
+      {
+        "id": "coding_task_native",
+        "name": "Coding task in omos",
+        "capability": "coding_task",
+        "participants": [
+          {
+            "resource": "configured_model",
+            "supplies": [
+              "reasoning"
+            ]
+          },
+          {
+            "resource": "fossil_workspace",
+            "supplies": [
+              "retained_workspace"
+            ]
+          },
+          {
+            "resource": "native_repository",
+            "supplies": [
+              "repository_tools"
+            ]
+          },
+          {
+            "resource": "native_commands",
+            "supplies": [
+              "validation_commands"
+            ]
+          }
+        ]
+      }
+    ],
+    "operations": [
+      {
+        "id": "complete_task",
+        "capability": "general_task",
+        "description": "Fulfil the original request with verified evidence and an accurate final answer.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "request": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "request"
+          ]
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "summary": {
+              "type": "string"
+            },
+            "evidence": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "summary",
+            "evidence"
+          ]
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
+        ]
+      },
+      {
+        "id": "change_code",
+        "capability": "coding_task",
+        "description": "Fulfil the original request with verified evidence and an accurate final answer.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "request": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "request"
+          ]
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "summary": {
+              "type": "string"
+            },
+            "evidence": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "summary",
+            "evidence"
+          ]
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
+        ]
+      },
+      {
+        "id": "omos_record_action",
+        "capability": "general_task",
+        "description": "Record host-observed action proposals; execution still requires host admission.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "calls": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "arguments": {
+                    "type": "string"
+                  },
+                  "execution_id": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "id",
+                  "name",
+                  "arguments"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": [
+            "calls"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
+        ]
+      },
+      {
+        "id": "omos_record_evidence",
+        "capability": "general_task",
+        "description": "Record original host-observed evidence with exact producing action references.",
+        "input": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "tool",
+                  "candidate",
+                  "workspace",
+                  "context",
+                  "verification"
+                ]
+              },
+              "tool": {
+                "type": "string"
+              },
+              "arguments": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "content": {
+                "type": "string"
+              },
+              "action_id": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string"
+              },
+              "obligations": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "raw_call_id": {
+                "type": "string"
+              },
+              "assistant_index": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "id",
+              "kind",
+              "content"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
+        ]
+      },
+      {
+        "id": "omos_record_plan",
+        "capability": "general_task",
+        "description": "Retain a host plan that preserves its parent task obligations.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "task": {
+              "type": "string",
+              "minLength": 1
+            },
+            "summary": {
+              "type": "string",
+              "minLength": 1
+            },
+            "obligations": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "description": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "id",
+                  "description"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "checks": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "basis": {
+              "type": "object"
+            }
+          },
+          "required": [
+            "task",
+            "summary",
+            "obligations",
+            "checks",
+            "basis"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
+        ]
+      },
+      {
+        "id": "omos_record_assessment",
+        "capability": "general_task",
+        "description": "Retain an independent assessment against the exact task contract.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "contractId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "version": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "obligations": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "pending",
+                      "met",
+                      "blocked"
+                    ]
+                  },
+                  "evidence": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "note": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "id",
+                  "status",
+                  "note"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": [
+            "contractId",
+            "version",
+            "obligations"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
+        ]
+      },
+      {
+        "id": "omos_workspace_request",
+        "capability": "general_task",
+        "description": "Access a workspace through its pinned contract; host authority and permissions remain outside the declaration.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "type": "string",
+              "const": "omos.workspace-api/v1"
+            },
+            "workspace": {
+              "type": "string",
+              "minLength": 1
+            },
+            "definition_hash": {
+              "type": "string",
+              "minLength": 1
+            },
+            "revision": {
+              "type": "string",
+              "minLength": 1
+            },
+            "action": {
+              "type": "string",
+              "enum": [
+                "definition",
+                "query",
+                "read",
+                "record",
+                "propose",
+                "audit",
+                "queue_review",
+                "job"
+              ]
+            },
+            "task": {
+              "type": "string"
+            },
+            "entity": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "job": {
+              "type": "string",
+              "minLength": 1
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16384
+            }
+          },
+          "required": [
+            "version",
+            "workspace",
+            "definition_hash",
+            "revision",
+            "action"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "workspace": {
+              "type": "string"
+            },
+            "definition_hash": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "data": {}
+          },
+          "required": [
+            "workspace",
+            "definition_hash",
+            "revision",
+            "data"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "api",
+          "cli"
+        ]
+      },
+      {
+        "id": "omos_record_review_job",
+        "capability": "general_task",
+        "description": "Retain a host-owned review job, its governing workspace contract, and its fenced lease identity.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "type": "string",
+              "minLength": 1
+            },
+            "id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "task": {
+              "type": "string",
+              "minLength": 1
+            },
+            "definition_hash": {
+              "type": "string",
+              "minLength": 1
+            },
+            "candidate_hash": {
+              "type": "string",
+              "minLength": 1
+            },
+            "owner": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "workspace_definition_hash": {
+              "type": "string",
+              "minLength": 1
+            },
+            "workspace_definition_revision": {
+              "type": "string",
+              "minLength": 1
+            },
+            "state": {
+              "type": "string",
+              "enum": [
+                "queued",
+                "running",
+                "pending",
+                "changes_required",
+                "blocked",
+                "published",
+                "failed"
+              ]
+            },
+            "contract_version": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "generation": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "lease_expires_ms": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "attempts": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "review_attempts": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "reported_tokens": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "started_ms": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "budget_epoch": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "version",
+            "id",
+            "task",
+            "definition_hash",
+            "candidate_hash",
+            "owner",
+            "reason",
+            "workspace_definition_hash",
+            "workspace_definition_revision",
+            "state",
+            "contract_version",
+            "generation",
+            "lease_expires_ms",
+            "attempts",
+            "review_attempts",
+            "reported_tokens",
+            "started_ms",
+            "budget_epoch"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "api",
+          "cli"
+        ]
+      }
+    ],
+    "semantic": {
+      "version": "omniseedos.semantic/v1",
+      "entityTypes": [
+        {
+          "id": "omos_task",
+          "fields": {
+            "objective": "string",
+            "state": "string",
+            "contract": "json",
+            "basis": "json"
+          },
+          "required": [
+            "objective",
+            "state",
+            "contract"
+          ],
+          "indexed": []
+        },
+        {
+          "id": "omos_capability",
+          "fields": {
+            "name": "string",
+            "requires": "json",
+            "operations": "json"
+          },
+          "required": [
+            "name",
+            "requires"
+          ],
+          "indexed": []
+        },
+        {
+          "id": "omos_plan",
+          "fields": {
+            "task": "string",
+            "summary": "string",
+            "obligations": "json",
+            "checks": "json",
+            "basis": "json"
+          },
+          "required": [
+            "task",
+            "summary",
+            "obligations"
+          ],
+          "indexed": []
+        },
+        {
+          "id": "omos_action",
+          "fields": {
+            "task": "string",
+            "calls": "json",
+            "source": "string",
+            "operation": "string"
+          },
+          "required": [
+            "task",
+            "calls"
+          ],
+          "indexed": []
+        },
+        {
+          "id": "omos_evidence",
+          "fields": {
+            "task": "string",
+            "records": "json",
+            "source": "string",
+            "action": "string",
+            "obligations": "json"
+          },
+          "required": [
+            "task",
+            "records"
+          ],
+          "indexed": []
+        },
+        {
+          "id": "omos_assessment",
+          "fields": {
+            "task": "string",
+            "phase": "string",
+            "decision": "json",
+            "evidence": "json",
+            "obligations": "json",
+            "basis": "json"
+          },
+          "required": [
+            "task",
+            "phase",
+            "decision"
+          ],
+          "indexed": []
+        },
+        {
+          "id": "omos_result",
+          "fields": {
+            "task": "string",
+            "status": "string",
+            "summary": "string",
+            "assessment": "string",
+            "receipt": "string",
+            "remaining": "json"
+          },
+          "required": [
+            "task",
+            "status",
+            "summary"
+          ],
+          "indexed": []
+        },
+        {
+          "id": "omos_definition_proposal",
+          "fields": {
+            "task": "string",
+            "hash": "string",
+            "state": "string",
+            "reason": "string"
+          },
+          "required": [
+            "task",
+            "hash",
+            "state"
+          ],
+          "indexed": []
+        },
+        {
+          "id": "omos_memory",
+          "fields": {
+            "path": "string"
+          },
+          "required": [
+            "path"
+          ]
+        },
+        {
+          "id": "omos_skill",
+          "fields": {
+            "path": "string"
+          },
+          "required": [
+            "path"
+          ]
+        },
+        {
+          "id": "omos_artifact",
+          "fields": {
+            "path": "string"
+          },
+          "required": [
+            "path"
+          ]
+        },
+        {
+          "id": "omos_event",
+          "fields": {
+            "task": "string",
+            "kind": "string",
+            "payload": "json"
+          },
+          "required": [
+            "task",
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "id": "omos_review_job",
+          "fields": {
+            "task": "string",
+            "state": "string",
+            "generation": "number",
+            "contract_version": "number",
+            "definition_hash": "string",
+            "candidate_hash": "string"
+          },
+          "required": [
+            "task",
+            "state",
+            "generation",
+            "contract_version",
+            "definition_hash",
+            "candidate_hash"
+          ]
+        },
+        {
+          "id": "omos_workspace_definition_proposal",
+          "fields": {
+            "workspace": "string",
+            "hash": "string",
+            "state": "string",
+            "reason": "string"
+          },
+          "required": [
+            "workspace",
+            "hash",
+            "state",
+            "reason"
+          ]
+        }
+      ],
+      "relationships": [
+        {
+          "id": "omos_task_evidence",
+          "from": "omos_task",
+          "to": "omos_evidence",
+          "kind": "provenance"
+        },
+        {
+          "id": "omos_task_plan",
+          "from": "omos_task",
+          "to": "omos_plan",
+          "kind": "dependency"
+        },
+        {
+          "id": "omos_task_result",
+          "from": "omos_task",
+          "to": "omos_result",
+          "kind": "provenance"
+        },
+        {
+          "id": "omos_plan_actions",
+          "from": "omos_plan",
+          "to": "omos_action",
+          "kind": "dependency"
+        },
+        {
+          "id": "omos_action_evidence",
+          "from": "omos_action",
+          "to": "omos_evidence",
+          "kind": "provenance"
+        },
+        {
+          "id": "omos_evidence_assessment",
+          "from": "omos_evidence",
+          "to": "omos_assessment",
+          "kind": "provenance"
+        },
+        {
+          "id": "omos_assessment_result",
+          "from": "omos_assessment",
+          "to": "omos_result",
+          "kind": "provenance"
+        },
+        {
+          "id": "omos_evidence_receipt",
+          "from": "omos_evidence",
+          "to": "omos_evidence",
+          "kind": "provenance"
+        }
+      ]
+    }
+  }
+}

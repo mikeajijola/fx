@@ -1780,6 +1780,48 @@ fn runNonInteractiveWithDeps(
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .fossil, "fossil", err, rest);
                 return .handled_failure;
             };
+            if (options.action == .serve) {
+                const workspace = @import("../workspace/fossil_workspace.zig");
+                const manager = (try workspace.Manager.bound(arena.allocator())) orelse {
+                    try writeLookupFailure(alloc, deps, "fossil", error.NoFossilWorkspace, if (options.json) .json else .text);
+                    return .handled_failure;
+                };
+                const Ready = struct {
+                    deps: RunDeps,
+                    config: Config,
+                    fn emit(raw: *anyopaque, text: []const u8) !void {
+                        const self: *@This() = @ptrCast(@alignCast(raw));
+                        try writeFormattedOutput(self.deps, text, .json);
+                    }
+                    fn reviewJob(raw: *anyopaque, worker_manager: @import("../workspace/fossil_workspace.zig").Manager, job: @import("../workspace/review_job.zig").Job, cancel: *std.atomic.Value(bool)) !void {
+                        const self: *@This() = @ptrCast(@alignCast(raw));
+                        var startup = try self.deps.load_startup_state_with_auth_mode(worker_manager.alloc, self.config.gateway_provider.oauth_transport, self.config.secret_store, self.config.default_model, self.config.default_agent_step_limit, self.config.auth_mode);
+                        defer startup.deinit(worker_manager.alloc);
+                        if (startup.model_requests_blocked) return error.ModelRequestsBlocked;
+                        var providers = self.config.provider_set;
+                        providers.definitions = startup.configured_providers.definitions;
+                        const credential: types.CredentialLease = if (startup.auth_mode == .host_managed) .host_managed else .{ .direct = .{
+                            .secret_bytes = if (startup.credential) |value| value.token else "",
+                            .source = if (startup.credential) |value| value.source else null,
+                            .account_id = if (startup.credential) |value| value.account_id else null,
+                            .tenant_context = startup.gatewayTeam(),
+                        } };
+                        try @import("../workspace/review_worker.zig").perform(worker_manager, job, .{
+                            .provider = providers.select(startup.provider).agent_stream_or_unavailable(),
+                            .provider_id = startup.provider,
+                            .credential = credential,
+                            .model = @import("../agent/runtime/completion_review.zig").selectModel(io_mod.getenv("FX_CONTRACT_REVIEW_MODEL") orelse "", startup.provider, startup.configured_providers.definitions, startup.selected_model),
+                            .cancel = cancel,
+                        });
+                    }
+                };
+                var ready: Ready = .{ .deps = deps, .config = cfg };
+                @import("../workspace/workspace_server.zig").run(manager, if (options.path) |port| try std.fmt.parseInt(u16, port, 10) else 8765, options.writable, &ready, Ready.emit, if (options.writable) .{ .context = &ready, .run = Ready.reviewJob } else null) catch |err| {
+                    try writeLookupFailure(alloc, deps, "fossil", err, if (options.json) .json else .text);
+                    return .handled_failure;
+                };
+                return .handled_success;
+            }
             const snapshot = fossil_commands.execute(arena.allocator(), options) catch |err| {
                 try writeLookupFailure(alloc, deps, "fossil", err, if (options.json) .json else .text);
                 return .handled_failure;

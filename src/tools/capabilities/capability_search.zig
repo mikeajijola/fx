@@ -136,7 +136,7 @@ pub fn call(
     defer mcp_result.deinit(ctx.allocator);
     if (mcp_result.notice) |notice| try tool_dispatch.reportContextNotice(ctx, notice);
 
-    const combined = combineProjected(
+    var combined = combineProjected(
         ctx.allocator,
         if (skill_result) |*result| result else null,
         mcp_result.model_output,
@@ -145,9 +145,57 @@ pub fn call(
         error.OutOfMemory => return error.OutOfMemory,
         else => return executionFailure(ctx.allocator, "combined", err),
     };
+    combined = addWorkspaceResults(ctx, input, combined, output_cap) catch |err| {
+        ctx.allocator.free(combined);
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return executionFailure(ctx.allocator, "workspace", err);
+    };
     errdefer ctx.allocator.free(combined);
     for (mcp_result.selected_tools) |selected| try tool_dispatch.reportSelectedDynamicTool(ctx, selected.name, selected.schema_json, selected.mcp_binding);
     return .{ .success = combined };
+}
+
+fn addWorkspaceResults(ctx: tool_dispatch.DispatchContext, input: *const Input, initial: []u8, output_cap: usize) ![]u8 {
+    var combined = initial;
+    if (comptime !@import("builtin").target.cpu.arch.isWasm()) {
+        if (input.server == null and ctx.fossil_workspace_available) {
+            var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+            defer arena.deinit();
+            if (try @import("../../core/workspace/fossil_workspace.zig").Manager.bound(arena.allocator())) |manager| {
+                const task = if (ctx.fossil_session_id) |id| try manager.active(id) else null;
+                const snapshot = try manager.definitionSnapshot(task);
+                if (snapshot != .null) {
+                    const model = @import("../../core/workspace/definition.zig");
+                    const declaration_value = model.field(snapshot, "declaration").?;
+                    const declaration = try model.parse(arena.allocator(), try std.json.Stringify.valueAlloc(arena.allocator(), declaration_value, .{}));
+                    var declared: std.ArrayList(std.json.Value) = .empty;
+                    for (model.items(model.spec(declaration.value), "capabilities")) |capability| {
+                        const id = model.text(capability, "id");
+                        if (lexical_relevance.score(&input.prepared, &.{id}, &.{ model.text(capability, "name"), model.text(capability, "description") }, &.{}) == null) continue;
+                        if (declared.items.len >= 16) break;
+                        var row = capability;
+                        const native = model.nativeCapability(declaration, id);
+                        try row.object.put(arena.allocator(), "host_binding", .{ .string = if (native) "native_task_runtime" else "unbound" });
+                        try row.object.put(arena.allocator(), "availability", .{ .string = if (native) "available_subject_to_host_permissions" else "declared_only" });
+                        try declared.append(arena.allocator(), row);
+                    }
+                    var parsed_output = try std.json.parseFromSlice(std.json.Value, arena.allocator(), combined, .{});
+                    try parsed_output.value.object.put(arena.allocator(), "workspace_capabilities", .{ .array = declared.toManaged(arena.allocator()) });
+                    try parsed_output.value.object.put(arena.allocator(), "workspace_basis", model.field(snapshot, "basis").?);
+                    if (declared.items.len > 0) {
+                        _ = parsed_output.value.object.swapRemove("state");
+                        if (parsed_output.value.object.getPtr("counts")) |counts| try counts.object.put(arena.allocator(), "workspace_capabilities", .{ .integer = @intCast(declared.items.len) });
+                    }
+                    const augmented = try std.json.Stringify.valueAlloc(ctx.allocator, parsed_output.value, .{});
+                    if (augmented.len <= output_cap) {
+                        ctx.allocator.free(combined);
+                        combined = augmented;
+                    } else ctx.allocator.free(augmented);
+                }
+            }
+        }
+    }
+    return combined;
 }
 
 pub fn readsOnly(_: tool_dispatch.ToolInput) bool {

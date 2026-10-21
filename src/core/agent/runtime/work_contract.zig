@@ -1,5 +1,6 @@
 //! Host-owned requirements and assessments; the kernel owns continuation.
 const std = @import("std");
+const record_json = @import("../../shared/record_json.zig");
 
 pub const bridge_name = "__libfx_contract_assess";
 pub const max_bytes = 64 * 1024;
@@ -24,7 +25,7 @@ pub const Assessment = struct {
     obligations: []const Report,
 };
 pub const Disposition = enum { fulfilled, continue_work, blocked };
-pub const Decision = struct { disposition: Disposition, feedback: []const u8 };
+pub const Decision = struct { disposition: Disposition, feedback: []const u8, verification_pending: bool = false };
 
 fn bounded(value: []const u8, limit: usize) bool {
     return value.len <= limit and std.mem.trim(u8, value, " \t\r\n").len > 0 and std.unicode.utf8ValidateSlice(value);
@@ -32,7 +33,7 @@ fn bounded(value: []const u8, limit: usize) bool {
 
 pub fn parse(alloc: std.mem.Allocator, raw: []const u8) !std.json.Parsed(Definition) {
     if (raw.len > max_bytes) return error.InvalidWorkContract;
-    const parsed = std.json.parseFromSlice(Definition, alloc, raw, .{ .allocate = .alloc_always }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidWorkContract;
+    const parsed = record_json.parse(Definition, alloc, raw, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidWorkContract;
     errdefer parsed.deinit();
     const value = parsed.value;
     if (!bounded(value.id, 128) or value.version == 0 or !bounded(value.objective, 8192) or value.obligations.len == 0 or value.obligations.len > 100) return error.InvalidWorkContract;
@@ -49,7 +50,7 @@ pub fn parse(alloc: std.mem.Allocator, raw: []const u8) !std.json.Parsed(Definit
 /// permits completion. Evidence resolution and truth remain host responsibilities.
 pub fn assess(alloc: std.mem.Allocator, definition: Definition, raw: []const u8) !Decision {
     if (raw.len > max_bytes) return error.InvalidContractAssessment;
-    const parsed = std.json.parseFromSlice(Assessment, alloc, raw, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidContractAssessment;
+    const parsed = record_json.parse(Assessment, alloc, raw, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidContractAssessment;
     defer parsed.deinit();
     const assessment = parsed.value;
     if (!std.mem.eql(u8, assessment.contractId, definition.id) or assessment.version != definition.version or assessment.obligations.len != definition.obligations.len) return error.InvalidContractAssessment;
@@ -83,6 +84,18 @@ test "work contract validates identity and unique nonempty obligations" {
     defer valid.deinit();
     try std.testing.expectError(error.InvalidWorkContract, parse(alloc, "{\"id\":\"x\",\"version\":1,\"objective\":\"task\",\"obligations\":[]}"));
     try std.testing.expectError(error.InvalidWorkContract, parse(alloc, "{\"id\":\"x\",\"version\":1,\"objective\":\"task\",\"obligations\":[{\"id\":\"a\",\"description\":\"A\"},{\"id\":\"a\",\"description\":\"B\"}]}"));
+}
+
+test "work contract parsed ownership survives mutation of caller bytes" {
+    const alloc = std.testing.allocator;
+    const bytes = try alloc.dupe(u8, test_definition);
+    defer alloc.free(bytes);
+    const parsed = try parse(alloc, bytes);
+    defer parsed.deinit();
+    @memset(bytes, ' ');
+    try std.testing.expectEqualStrings("task", parsed.value.id);
+    try std.testing.expectEqualStrings("Save a report", parsed.value.objective);
+    try std.testing.expectEqualStrings("Report exists", parsed.value.obligations[0].description);
 }
 
 const test_definition = "{\"id\":\"task\",\"version\":1,\"objective\":\"Save a report\",\"obligations\":[{\"id\":\"report\",\"description\":\"Report exists\"}]}";
