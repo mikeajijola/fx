@@ -451,6 +451,7 @@ const DiscardPristineSessionFn = *const fn (?*anyopaque, *AskContext, *session_s
 const PersistYoloAcknowledgmentFn = *const fn (Allocator) config_runtime.CommitAttempt;
 
 const RunDeps = struct {
+    ui_host: ?*@import("../workspace/ui_session.zig").Host = null,
     stdin_ctx: ?*anyopaque = null,
     stdout_ctx: ?*anyopaque = null,
     stderr_ctx: ?*anyopaque = null,
@@ -846,6 +847,7 @@ const AskContext = struct {
     }
 
     fn cancelFlag(self: *AskContext) *std.atomic.Value(bool) {
+        if (self.deps.ui_host) |ui| return &ui.cancel;
         if (comptime supports_headless_interrupt) {
             if (self.use_process_interrupt_flag) {
                 return &headless_interrupt.cancel_requested;
@@ -1231,7 +1233,7 @@ const AskContext = struct {
                 .context = @ptrCast(self),
                 .resolve_fn = resolveModelOverride,
             },
-            .interactive = false,
+            .interactive = self.deps.ui_host != null,
             .lifecycle_view = self.lifecycle_view,
             .lifecycle_scope = self.lifecycleContext().scope,
         };
@@ -1354,6 +1356,46 @@ pub fn run(alloc: Allocator, args: []const [:0]const u8, cfg: Config, context_re
         .load_mcp_runtime = cfg.load_mcp_runtime,
         .load_mcp_host = cfg.load_mcp_host,
         .install_headless_interrupt = true,
+    });
+}
+
+pub fn runUi(alloc: Allocator, args: []const [:0]const u8, cfg: Config, context_registry: context_contract.Registry, tool_set: tool_set_contract.ToolSet, ui: *@import("../workspace/ui_session.zig").Host) !u8 {
+    const Adapter = struct {
+        fn output(raw: ?*anyopaque, text: []const u8) !void {
+            const host_ui: *@import("../workspace/ui_session.zig").Host = @ptrCast(@alignCast(raw.?));
+            const data = try std.json.parseFromSlice(std.json.Value, std.heap.c_allocator, text, .{});
+            defer data.deinit();
+            const model = @import("../workspace/definition.zig");
+            try host_ui.emit(.{ .type = "result", .data = .{
+                .final_output = model.text(data.value, "final_output"),
+                .exit_code = model.field(data.value, "exit_code") orelse @as(std.json.Value, .{ .integer = 1 }),
+                .@"error" = model.field(data.value, "error") orelse .null,
+                .model = model.text(data.value, "model"),
+                .session_id = model.text(data.value, "session_id"),
+                .usage = model.field(data.value, "usage") orelse .null,
+            } });
+        }
+        fn notice(raw: ?*anyopaque, text: []const u8) !void {
+            const host_ui: *@import("../workspace/ui_session.zig").Host = @ptrCast(@alignCast(raw.?));
+            try host_ui.emit(.{ .type = "notice", .text = text });
+        }
+    };
+    var stopping = std.atomic.Value(bool).init(false);
+    const monitor = try std.Thread.spawn(.{}, @import("../workspace/ui_session.zig").Host.monitor, .{ ui, &stopping });
+    defer {
+        stopping.store(true, .release);
+        monitor.join();
+    }
+    return runWithDeps(alloc, args, cfg, .{
+        .ui_host = ui,
+        .stdout_ctx = ui,
+        .stderr_ctx = ui,
+        .write_stdout = Adapter.output,
+        .write_stderr = Adapter.notice,
+        .context_registry = context_registry,
+        .tool_set = tool_set,
+        .load_mcp_runtime = cfg.load_mcp_runtime,
+        .load_mcp_host = cfg.load_mcp_host,
     });
 }
 
@@ -1729,6 +1771,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer if (owned_resumed_model) |model| alloc.free(model);
     var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
     defer ctx.deinit();
+    if (options.deps.ui_host) |ui| ui.attach(&ctx.worker);
+    defer if (options.deps.ui_host) |ui| ui.attach(null);
     ctx.use_process_interrupt_flag = options.deps.install_headless_interrupt;
     try ctx.checkCancellation();
     var presenter: ?ask_presentation.Runtime = null;
@@ -1926,6 +1970,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         try ctx.session.snapshotImageCatalog(alloc, current_images);
     defer types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
 
+    if (ctx.deps.ui_host) |ui| try ui.beginSession(ctx.activeSessionId() orelse return error.SessionPersistenceUnavailable);
     try ctx.checkCancellation();
     ctx.loaded_skills = try options.deps.load_skills(
         alloc,
@@ -2075,6 +2120,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .auto_compact_percent = startup.auto_compact_percent,
         .cancel_flag = ctx.cancelFlag(),
         .contract_review_enabled = completion_review.enabled(),
+        .ui_host = ctx.deps.ui_host,
         .fossil_session_id = if (completion_review.enabled()) ctx.activeSessionId() else null,
         .fossil_ephemeral = completion_review.enabled() and ctx.writable == null,
 
@@ -2329,6 +2375,7 @@ fn finalizeFreshAuthSession(ctx: *AskContext, result: *PromptRunResult) void {
 
 fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
     return .{
+        .take_steering_boundary = if (ctx.deps.ui_host != null) takeUiSteering else null,
         .ctx = @ptrCast(ctx),
         .agent_stream_provider = ctx.agentStreamProvider(),
         .confirm_session_writer = confirmSessionWriter,
@@ -2382,6 +2429,11 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .record_tool_call_failed = recordToolCallFailed,
         .report_usage = reportUsage,
     };
+}
+
+fn takeUiSteering(raw: *anyopaque, alloc: Allocator, _: u64, _: worker_runtime.SteeringBoundaryKind) !worker_runtime.SteeringBoundaryResult {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw));
+    return ctx.deps.ui_host.?.takeSteering(alloc);
 }
 
 fn modelCatalogUnavailable(raw_ctx: *anyopaque) bool {
@@ -2800,6 +2852,7 @@ fn promptCliPermissionApproval(
     ctx: *AskContext,
     label: []const u8,
 ) !PermissionApprovalPromptResult {
+    if (ctx.deps.ui_host) |ui| return if (try ui.approve(label)) .approve else .deny;
     if (!cliContextPermissionPromptAllowed(ctx)) return .unavailable;
     return try ctx.deps.permission_approval_prompt(
         ctx.deps.permission_approval_prompt_ctx,
@@ -3416,6 +3469,13 @@ fn pushEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
 
 fn pushText(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (ctx.deps.ui_host) |ui| switch (emission) {
+        .assistant_started => try ui.emit(.{ .type = "assistant_started" }),
+        .assistant_restarted => try ui.emit(.{ .type = "assistant_restarted" }),
+        .assistant_source => |text| try ui.emit(.{ .type = "text_delta", .text = text }),
+        .operational => |text| try ui.emit(.{ .type = "notice", .text = text }),
+        else => {},
+    };
     switch (emission) {
         .assistant_started => {
             discard_restarted_json_preview(ctx);
@@ -3490,6 +3550,12 @@ fn writeRawAssistantBytes(ctx: *AskContext, text: []const u8) !void {
 
 fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (ctx.deps.ui_host) |ui| switch (event) {
+        .authoritative_started => |value| try ui.emit(.{ .type = "tool_start", .call_id = value.id.call_id, .name = value.tool_name }),
+        .progress => |value| try ui.emit(.{ .type = "tool_progress", .call_id = value.id.call_id, .text = value.text }),
+        .terminal => |value| try ui.emit(.{ .type = "tool_end", .call_id = value.id.call_id, .outcome = value.outcome }),
+        else => {},
+    };
     if (ctx.output_mode.isTerminal()) {
         try ctx.presenter.?.pushToolLifecycle(event);
     }
@@ -3731,8 +3797,9 @@ fn formatToolExecutionError(_: *anyopaque, arena: Allocator, tool_name: []const 
     return tool_result_errors.formatToolExecutionErrorJson(arena, tool_name, err);
 }
 
-fn onCommandOutputChunk(raw_ctx: *anyopaque, _: ?types.ToolLifecycleId, _: command_output_content.Stream, chunk: []const u8) !void {
+fn onCommandOutputChunk(raw_ctx: *anyopaque, identity: ?types.ToolLifecycleId, stream: command_output_content.Stream, chunk: []const u8) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (ctx.deps.ui_host) |ui| try ui.emit(.{ .type = "command_output", .call_id = if (identity) |id| id.call_id else null, .stream = @tagName(stream), .text = chunk });
     if (ctx.output_mode.isTerminal()) return;
     try ctx.writeStderr(chunk);
     if (chunk.len > 0) ctx.command_output_line_open = chunk[chunk.len - 1] != '\n';

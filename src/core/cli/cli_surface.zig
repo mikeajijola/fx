@@ -67,6 +67,7 @@ const CommandCatalog = command_specs.TopLevelRegistry;
 const TopLevelKind = command_specs.TopLevelKind;
 
 pub const Command = union(enum) {
+    ui_host: []const [:0]const u8,
     interactive,
     help,
     ask: []const [:0]const u8,
@@ -646,6 +647,8 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
             if (command_specs.matchesTopLevel(command_catalog, command, .teams)) return .{ .teams = args[1..] };
         },
         'u' => {
+            if (command_specs.matchesTopLevel(command_catalog, command, .ui_host)) return .{ .ui_host = args[1..] };
+
             if (command_specs.matchesTopLevel(command_catalog, command, .usage)) return .{ .usage = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .upgrade)) return .{ .upgrade = args[1..] };
         },
@@ -1134,6 +1137,26 @@ fn runNonInteractiveWithDeps(
         .interactive, .resume_session => unreachable,
         .help => {
             try writeTopLevelHelp(alloc, cfg.command_catalog, deps, cfg.version, .stdout);
+            return .handled_success;
+        },
+        .ui_host => |rest| {
+            if (rest.len != 1 or !std.mem.eql(u8, rest[0], "--stdio")) return error.InvalidUiHostArgs;
+            const Adapter = struct {
+                config: Config,
+                fn prompt(raw: *anyopaque, args: []const [:0]const u8, ui: *@import("../workspace/ui_session.zig").Host) !u8 {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return cli_ask.runUi(std.heap.c_allocator, args, workflowConfig(self.config), self.config.context_registry, self.config.tool_set, ui);
+                }
+                fn snapshot(raw: *anyopaque, arena: Allocator, args: []const [:0]const u8) ![]const u8 {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    var capture = UiCapture{ .arena = arena };
+                    const outcome = try runIfRequestedWithDeps(arena, args, self.config, .{ .stdout_ctx = &capture, .stderr_ctx = &capture, .write_stdout = UiCapture.write, .write_stderr = UiCapture.write });
+                    if (outcome == .handled_failure) return error.SnapshotFailed;
+                    return capture.bytes.toOwnedSlice(arena);
+                }
+            };
+            var adapter: Adapter = .{ .config = cfg };
+            try @import("ui_host.zig").run(.{ .context = &adapter, .prompt = Adapter.prompt, .snapshot = Adapter.snapshot });
             return .handled_success;
         },
         .ask => |rest| {
@@ -3913,6 +3936,16 @@ test "session recovery boundary failures keep stable text and json guidance" {
         ) != null,
     );
 }
+
+const UiCapture = struct {
+    arena: Allocator,
+    bytes: std.ArrayList(u8) = .empty,
+    fn write(raw: ?*anyopaque, text: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (self.bytes.items.len + text.len > 8 * 1024 * 1024) return error.SnapshotTooLarge;
+        try self.bytes.appendSlice(self.arena, text);
+    }
+};
 
 fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
     return .{

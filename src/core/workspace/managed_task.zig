@@ -102,13 +102,13 @@ pub const Turn = struct {
         for (try self.manager.taskHistory(self.task, self.reviewed_revision.?)) |bytes| {
             const Entry = struct { kind: []const u8, task: []const u8, contract_version: u32, value: std.json.Value };
             const entry = (try std.json.parseFromSlice(Entry, alloc, bytes, .{ .ignore_unknown_fields = true })).value;
-            if (std.mem.eql(u8, entry.kind, "command_receipt")) {
+            if (std.mem.eql(u8, entry.kind, "command_receipt") or std.mem.eql(u8, entry.kind, "ui_source_validation")) {
                 const content = try std.json.Stringify.valueAlloc(alloc, entry.value, .{});
                 try evidence.append(alloc, .{
                     .id = try alloc.print("command-receipt:{s}", .{try workspace.hash(alloc, content)}),
                     .kind = .verification,
                     .content = content,
-                    .status = if (std.mem.eql(u8, @import("definition.zig").text(entry.value, "outcome"), "failed")) .failure else null,
+                    .status = if (std.mem.eql(u8, @import("definition.zig").text(entry.value, "outcome"), "failed") or std.mem.eql(u8, @import("definition.zig").text(entry.value, "status"), "failed")) .failure else if (std.mem.eql(u8, entry.kind, "ui_source_validation") and std.mem.eql(u8, @import("definition.zig").text(entry.value, "status"), "passed")) .success else null,
                     .action_id = @import("definition.zig").text(entry.value, "action_id"),
                     .source = @import("definition.zig").text(entry.value, "source"),
                 });

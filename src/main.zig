@@ -3786,7 +3786,8 @@ fn hasPosixArgVector() bool {
 
 fn needsFullEntryConfig(args: []const [:0]const u8) bool {
     const command = cli_surface.commandAfterGlobalLaunchArgs(args) orelse return false;
-    return std.mem.eql(u8, command, "ask") or
+    return std.mem.eql(u8, command, "ui-host") or
+        std.mem.eql(u8, command, "ask") or
         std.mem.eql(u8, command, "acp") or
         std.mem.eql(u8, command, "pr") or
         std.mem.eql(u8, command, "issue");
@@ -3811,7 +3812,8 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
             std.mem.eql(u8, effective_args[1], "approve") or
             std.mem.eql(u8, effective_args[1], "reject");
     }
-    return std.mem.eql(u8, command, "fossil") or
+    return std.mem.eql(u8, command, "ui-host") or
+        std.mem.eql(u8, command, "fossil") or
         std.mem.eql(u8, command, "slack") or
         std.mem.eql(u8, command, "login") or
         std.mem.eql(u8, command, "logout") or

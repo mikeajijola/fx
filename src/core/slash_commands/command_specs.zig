@@ -10,6 +10,7 @@ const mod_registry = @import("../mods/registry.zig");
 const Allocator = std.mem.Allocator;
 
 pub const TopLevelKind = enum {
+    ui_host,
     help,
     ask,
     acp,

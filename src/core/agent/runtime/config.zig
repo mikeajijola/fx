@@ -50,6 +50,7 @@ pub const Config = struct {
     cancel_flag: *std.atomic.Value(bool),
     review_enabled: bool = false,
     contract_review_enabled: bool = false,
+    ui_host: ?*@import("../../workspace/ui_session.zig").Host = null,
     fossil_session_id: ?[]const u8 = null,
     fossil_parent_session_id: ?[]const u8 = null,
     fossil_ephemeral: bool = false,

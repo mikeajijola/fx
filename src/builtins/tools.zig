@@ -843,18 +843,19 @@ pub const read_tool_result = ToolSpec{
 
 pub const fossil_workspace = ToolSpec{
     .name = "fossil_workspace",
-    .description = "Inspect the pinned OmniForm definition, query typed workspace records, retain a plan refinement or custom record, and propose a compatible definition for future tasks. Also read/write memory or skills, attach artifacts, inspect history/diff, or verify_manifest using files with path, sha256 and bytes. Contracts, evidence, assessments and publication are host-owned.",
+    .description = "Inspect the pinned OmniForm definition, query typed workspace records, retain a plan refinement or custom record, and propose a compatible definition for future tasks. Also read/write memory, skills or UI source, restore_ui from a historical revision on this task branch, attach artifacts, inspect history/diff, or verify_manifest using files with path, sha256 and bytes. Contracts, evidence, assessments and publication are host-owned.",
     .model_schema = .{
         .name = "fossil_workspace",
-        .description = "Inspect the pinned OmniForm definition, query typed workspace records, retain a plan refinement or custom record, and propose a compatible definition for future tasks. Also read/write memory or skills, attach artifacts, inspect history/diff, or verify_manifest using files with path, sha256 and bytes. Contracts, evidence, assessments and publication are host-owned.",
+        .description = "Inspect the pinned OmniForm definition, query typed workspace records, retain a plan refinement or custom record, and propose a compatible definition for future tasks. Also read/write memory, skills or UI source, restore_ui from a historical revision on this task branch, attach artifacts, inspect history/diff, or verify_manifest using files with path, sha256 and bytes. Contracts, evidence, assessments and publication are host-owned.",
         .input_schema = .{
             .properties = &.{
-                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "status", "read", "write", "artifact", "diff", "history", "verify_manifest", "definition", "query", "record", "propose_definition" } } },
+                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "status", "read", "write", "artifact", "diff", "history", "verify_manifest", "definition", "query", "record", "propose_definition", "restore_ui" } } },
                 .{ .name = "path", .json_type = .string },
                 .{ .name = "content", .json_type = .string },
                 .{ .name = "entity", .json_type = .string },
                 .{ .name = "offset", .json_type = .integer },
                 .{ .name = "execution", .json_type = .string },
+                .{ .name = "revision", .json_type = .string },
             },
             .required = &.{"action"},
             .additional_properties = false,

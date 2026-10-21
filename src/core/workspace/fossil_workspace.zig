@@ -797,6 +797,7 @@ pub const Manager = struct {
         const lease = try Lease.acquire(self.alloc, self.root);
         defer lease.release();
         var task = try self.loadTask(id);
+        try self.checkExpectedRevision(task.branch);
         if (!std.mem.eql(u8, project, task.project_root)) return error.TaskProjectMismatch;
         if (task.state == .accepted and !try self.publicationPending(task)) return error.TaskAlreadyAccepted;
         if (try self.active(session)) |previous| {
@@ -1247,6 +1248,160 @@ pub const Manager = struct {
         return records.toOwnedSlice(self.alloc);
     }
 
+    pub fn restoreUi(self: Manager, task: Task, source: []const u8) ![]const u8 {
+        if (source.len != 40 and source.len != 64) return error.InvalidFossilRevision;
+        for (source) |ch| if (!std.ascii.isHex(ch)) return error.InvalidFossilRevision;
+        const identity = try parse(self.alloc, Manifest, try self.contentAt("workspace.json", source));
+        if (!std.mem.eql(u8, identity.id, self.manifest.id)) return error.WorkspaceIdentityMismatch;
+        const source_files = try self.inventory(source);
+        const manifest = try self.contentAt("ui/manifest.json", source);
+        _ = try parse(self.alloc, std.json.Value, manifest);
+        const lease = try Lease.acquire(self.alloc, self.root);
+        defer lease.release();
+        try self.checkExpectedRevision(task.branch);
+        const current = try self.loadTask(task.id);
+        if (current.state == .accepted or current.state == .publication_pending) return error.TaskIsReadOnly;
+        if (current.definition.version != task.definition.version) return error.StaleWorkContract;
+        const tree = try self.checkout(task.branch);
+        for (try self.inventory(task.branch)) |path| {
+            if (!@import("ui_artifact.zig").safePath(path)) continue;
+            const retained = for (source_files) |previous| {
+                if (std.mem.eql(u8, path, previous)) break true;
+            } else false;
+            if (!retained) try remove(try join(self.alloc, tree, path));
+        }
+        var count: usize = 0;
+        for (source_files) |path| {
+            if (!@import("ui_artifact.zig").safePath(path)) continue;
+            var directory = try contentParent(self.alloc, tree, path);
+            defer directory.close(io_mod.getIo());
+            try atomicWriteAt(self.alloc, directory, std.Io.Dir.path.basename(path), try self.contentAt(path, source));
+            count += 1;
+        }
+        const changes = try self.run(tree, &.{ "changes", "--hash", "--differ" });
+        const extras = try self.run(tree, &.{"extras"});
+        const revision_id = if (changes.len > 0 or extras.len > 0) try self.commit(tree, "Restore historical UI source on task branch") else try self.currentRevision(task);
+        return json(self.alloc, .{ .task = task.id, .revision = revision_id, .source_revision = source, .files = count, .publication = "pending", .note = "Restored UI source is a private task preview. Host validation, independent review and publication remain required." });
+    }
+
+    pub fn uiChanged(self: Manager, from: []const u8, to: []const u8) !bool {
+        const changed = try self.run(null, &.{ "diff", "--internal", "--brief", "--from", from, "--to", to, "-R", self.repository });
+        var lines = std.mem.splitScalar(u8, changed, '\n');
+        while (lines.next()) |line| {
+            var fields = std.mem.tokenizeAny(u8, line, " \t");
+            _ = fields.next();
+            const path = fields.next() orelse continue;
+            if (std.mem.startsWith(u8, path, "ui/")) return true;
+        }
+        return false;
+    }
+
+    pub fn validUiReceipt(self: Manager, revision_id: []const u8, receipt: std.json.Value) !bool {
+        if (!std.mem.eql(u8, model.text(receipt, "version"), "omos.ui-validation/v1") or !std.mem.eql(u8, model.text(receipt, "status"), "passed") or model.text(receipt, "compiler_identity").len != 64 or model.text(receipt, "bundle_hash").len != 64) return false;
+        const manifest_value = try parse(self.alloc, std.json.Value, try self.contentAt("ui/manifest.json", revision_id));
+        if (!std.mem.eql(u8, model.text(manifest_value, "toolchain"), model.text(receipt, "compiler_identity"))) return false;
+        const files_value = model.field(receipt, "files") orelse return false;
+        if (files_value != .array) return false;
+        const files = files_value.array.items;
+        var count: usize = 0;
+        for (try self.inventory(revision_id)) |path| {
+            if (!std.mem.startsWith(u8, path, "ui/")) continue;
+            count += 1;
+            const file = for (files) |entry| {
+                if (std.mem.eql(u8, model.text(entry, "path"), path)) break entry;
+            } else return false;
+            const bytes = try self.contentAt(path, revision_id);
+            const size = model.field(file, "bytes") orelse return false;
+            if (size != .integer or size.integer != bytes.len) return false;
+            if (!std.mem.eql(u8, try hash(self.alloc, bytes), model.text(file, "sha256"))) return false;
+        }
+        return count == files.len and count > 0;
+    }
+
+    pub fn hasUiReceipt(self: Manager, task: Task, revision_id: []const u8) !bool {
+        for (try self.taskHistory(task, revision_id)) |bytes| {
+            const entry = try parse(self.alloc, std.json.Value, bytes);
+            if (!std.mem.eql(u8, model.text(entry, "kind"), "ui_source_validation")) continue;
+            const contract_version = model.field(entry, "contract_version") orelse continue;
+            if (contract_version != .integer or contract_version.integer != task.definition.version) continue;
+            const receipt = model.field(entry, "value") orelse continue;
+            if (try self.validUiReceipt(revision_id, receipt)) return true;
+        }
+        return false;
+    }
+
+    pub fn uiHistory(self: Manager, offset: usize) ![]const u8 {
+        const output = try self.run(null, &.{ "timeline", "ancestors", "trunk", "--path", "ui", "--type", "ci", "--limit", "32", "--offset", try self.alloc.print("{d}", .{offset}), "--format", "%H|%d|%c", "-R", self.repository });
+        var rows: std.ArrayList(struct { revision: []const u8, date: []const u8, label: []const u8 }) = .empty;
+        var lines = std.mem.splitScalar(u8, output, '\n');
+        while (lines.next()) |line| {
+            var fields = std.mem.splitScalar(u8, line, '|');
+            const revision_id = fields.next() orelse continue;
+            if (revision_id.len != 40 and revision_id.len != 64) continue;
+            const date = fields.next() orelse continue;
+            try rows.append(self.alloc, .{ .revision = revision_id, .date = date, .label = fields.rest() });
+        }
+        return json(self.alloc, .{ .versions = rows.items, .next_offset = if (rows.items.len == 32) @as(?usize, offset + 32) else null });
+    }
+
+    /// Installation is a host bootstrap operation, never an agent completion.
+    /// It only creates the first UI tree and verifies every committed byte.
+    pub fn installUi(self: Manager, expected: []const u8, files: []const @import("ui_artifact.zig").File) ![]const u8 {
+        if (files.len == 0 or files.len > 512) return error.InvalidUiManifest;
+        var total: usize = 0;
+        var has_manifest = false;
+        for (files, 0..) |file, i| {
+            total = try std.math.add(usize, total, (try @import("ui_artifact.zig").bytes(self.alloc, file)).len);
+            if (total > max_bytes) return error.UiSourceTooLarge;
+            for (files[0..i]) |previous| if (std.mem.eql(u8, file.path, previous.path)) return error.InvalidUiManifest;
+            if (std.mem.eql(u8, file.path, "ui/manifest.json")) {
+                const manifest_value = try parse(self.alloc, std.json.Value, try @import("ui_artifact.zig").bytes(self.alloc, file));
+                if (!std.mem.eql(u8, model.text(manifest_value, "version"), "omos.ui-source/v1") or !std.mem.eql(u8, model.text(manifest_value, "bridge"), "omos.ui-bridge/v1") or !std.mem.eql(u8, model.text(manifest_value, "renderer"), "omos.react/v1") or model.text(manifest_value, "toolchain").len != 64) return error.UnsupportedUiRenderer;
+                has_manifest = true;
+            }
+        }
+        if (!has_manifest) return error.InvalidUiManifest;
+        const lease = try Lease.acquire(self.alloc, self.root);
+        defer lease.release();
+        if (!std.mem.eql(u8, expected, try self.revision("trunk"))) return error.WorkspaceRevisionChanged;
+        for (try self.inventory("trunk")) |path| if (std.mem.startsWith(u8, path, "ui/")) return error.UiAlreadyInstalled;
+        const tree = try self.checkout("trunk");
+        if ((try self.run(tree, &.{ "changes", "--hash", "--differ" })).len > 0 or (try self.run(tree, &.{ "extras", "--dotfiles" })).len > 0) return error.WorkspaceRecoveryRequired;
+        for (files) |file| {
+            var directory = try contentParent(self.alloc, tree, file.path);
+            defer directory.close(io_mod.getIo());
+            try atomicWriteAt(self.alloc, directory, std.Io.Dir.path.basename(file.path), try @import("ui_artifact.zig").bytes(self.alloc, file));
+        }
+        const revision_id = try self.commit(tree, "Install verified workspace UI source");
+        for (files) |file| if (!std.mem.eql(u8, file.sha256, try hash(self.alloc, try self.contentAt(file.path, revision_id)))) return error.WorkspaceVerificationFailed;
+        return json(self.alloc, .{ .kind = "ui_installation", .workspace = self.manifest.id, .revision = revision_id, .verified = true, .files = files.len, .bytes = total });
+    }
+
+    /// Batch source writes share the normal task lease, version fence and commit.
+    pub fn writeUi(self: Manager, task: Task, files: []const @import("ui_artifact.zig").File) ![]const u8 {
+        if (files.len == 0 or files.len > 512) return error.InvalidUiManifest;
+        var total: usize = 0;
+        for (files, 0..) |file, i| {
+            total = try std.math.add(usize, total, (try @import("ui_artifact.zig").bytes(self.alloc, file)).len);
+            for (files[0..i]) |previous| if (std.mem.eql(u8, file.path, previous.path)) return error.InvalidUiManifest;
+        }
+        if (total > max_bytes) return error.UiSourceTooLarge;
+        const lease = try Lease.acquire(self.alloc, self.root);
+        defer lease.release();
+        try self.checkExpectedRevision(task.branch);
+        const current = try self.loadTask(task.id);
+        if (current.state == .accepted or current.state == .publication_pending) return error.TaskIsReadOnly;
+        if (current.definition.version != task.definition.version) return error.StaleWorkContract;
+        const tree = try self.checkout(task.branch);
+        for (files) |file| {
+            var directory = try contentParent(self.alloc, tree, file.path);
+            defer directory.close(io_mod.getIo());
+            try atomicWriteAt(self.alloc, directory, std.Io.Dir.path.basename(file.path), try @import("ui_artifact.zig").bytes(self.alloc, file));
+        }
+        const revision_id = try self.commit(tree, "Update task UI source");
+        return json(self.alloc, .{ .workspace = self.manifest.id, .task = task.id, .revision = revision_id, .publication = "pending" });
+    }
+
     pub fn writeContent(self: Manager, task: Task, path: []const u8, bytes: []const u8) !void {
         if (!allowedMutablePath(path)) return error.WorkspacePathDenied;
         return self.writeContentInternal(task, path, bytes);
@@ -1288,6 +1443,12 @@ pub const Manager = struct {
         const files = try self.run(null, &.{ "ls", "-r", task.branch, "-R", self.repository });
         var lines = std.mem.splitScalar(u8, files, '\n');
         var total: usize = 0;
+        for ([_][]const u8{ "ui/AGENTS.md", "ui/manifest.json" }) |path| {
+            const bytes = self.readContent(task, path) catch continue;
+            if (bytes.len > 4096) continue;
+            total += bytes.len;
+            try relevant.append(self.alloc, .{ .path = path, .content = bytes });
+        }
         while (lines.next()) |raw| {
             const path = std.mem.trim(u8, raw, " \r\t");
             if (!std.mem.startsWith(u8, path, "memory/") and !std.mem.startsWith(u8, path, "skills/")) continue;
@@ -1476,6 +1637,7 @@ pub const Manager = struct {
         if (latest.state == .accepted) return self.revision(task.parent);
         if (!std.mem.eql(u8, review.revision, try self.revision(task.branch))) return error.WorkspaceRevisionChanged;
         if ((try self.entries(try self.journalDir(task))).len != 0) return error.WorkspacePendingEvidence;
+        if (try self.uiChanged(latest.base_revision, review.revision) and !try self.hasUiReceipt(latest, review.revision)) return error.UiValidationRequired;
         try self.ensureMergeable(latest, review.revision, try self.revision(task.parent));
         try self.validateDependencies(latest);
         const operation = try hash(self.alloc, try json(self.alloc, .{ task.id, review.revision, review.contract_version, task.parent }));
@@ -2205,7 +2367,7 @@ test "workspace paths omit only valid atomic record temporaries" {
 
 fn allowedMutablePath(path: []const u8) bool {
     if (!allowedPath(path)) return false;
-    return std.mem.startsWith(u8, path, "memory/") or std.mem.startsWith(u8, path, "skills/") or std.mem.startsWith(u8, path, "artifacts/");
+    return std.mem.startsWith(u8, path, "memory/") or std.mem.startsWith(u8, path, "skills/") or std.mem.startsWith(u8, path, "artifacts/") or std.mem.startsWith(u8, path, "ui/");
 }
 
 fn allowedPath(path: []const u8) bool {
@@ -2217,7 +2379,7 @@ fn allowedPath(path: []const u8) bool {
     while (parts.next()) |part| {
         if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..") or part[0] == '.') return false;
     }
-    for ([_][]const u8{ "memory/", "skills/", "artifacts/", "history/", "tasks/", "imports/", "acceptances/", "omniform/", "execution/", "records/", "proposals/", "activations/", "jobs/" }) |prefix| {
+    for ([_][]const u8{ "memory/", "skills/", "artifacts/", "ui/", "history/", "tasks/", "imports/", "acceptances/", "omniform/", "execution/", "records/", "proposals/", "activations/", "jobs/" }) |prefix| {
         if (std.mem.startsWith(u8, path, prefix)) return true;
     }
     return std.mem.eql(u8, path, manifest_path);
@@ -2227,6 +2389,7 @@ test "workspace paths cannot address host state or contract authority" {
     for ([_][]const u8{ "../auth.json", "/etc/passwd", "memory/../../tasks/a", "memory/.fslckout", "memory/../x", "memory/a\\b", "tasks/a.json", "acceptances/a.json" }) |path| try std.testing.expect(!allowedMutablePath(path));
     try std.testing.expect(allowedMutablePath("memory/preferences.md"));
     try std.testing.expect(allowedMutablePath("skills/research/SKILL.md"));
+    try std.testing.expect(allowedMutablePath("ui/theme.json"));
 }
 
 fn fault(point: []const u8) !void {
