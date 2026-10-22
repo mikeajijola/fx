@@ -9,13 +9,13 @@ afterEach(async () => {
   cleanupFixtures();
 });
 
-async function savedContract(f: ReturnType<typeof fixture>, assessment: () => string = () => "blocked") {
+async function savedContract(f: ReturnType<typeof fixture>, assessment: Parameters<typeof model>[2] = () => "blocked") {
   expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
   const provider = model(f, (_body, count) => count === 1 ? writeMemory("Retain this contract's evidence.") : { content: "The work and evidence are retained." }, assessment);
   const first = await f.run(["ask", "Save a preference and keep the work contract available for continuation", "--json"]);
   expect(first.code, first.stderr).toBe(1);
   const snapshot = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout);
-  return { task: snapshot.tasks[0], provider };
+  return { task: snapshot.tasks[0], provider, first };
 }
 
 function host(f: ReturnType<typeof fixture>) {
@@ -74,7 +74,10 @@ test("CLI schedules share a revision-fenced calendar and survive workspace expor
 test("workspace host starts an overdue contract once and publishes retained work", async () => {
   const f = fixture();
   let resume = false;
-  const { task, provider } = await savedContract(f, () => resume ? "met" : "blocked");
+  const { task, provider, first } = await savedContract(f, () => resume ? "met" : {
+    name: "omos_review_evidence", args: { action: "query", kind: "candidate" },
+  });
+  expect(first.stderr, first.stdout).toContain("Verification is pending");
   const actors = provider.counts().actors;
   const created = await f.run(["schedule", "add", task.id, "--at", "2020-01-01T09:00:00Z", "--json"]);
   expect(created.code, created.stderr).toBe(0);
@@ -82,7 +85,7 @@ test("workspace host starts an overdue contract once and publishes retained work
   expect(schedule.state).toBe("overdue");
   resume = true;
   const native = host(f);
-  const final: any = await until(() => native.request("schedule", { action: "show", id: schedule.id }), (snapshot: any) => ["completed", "failed", "waiting"].includes(snapshot.schedules[0]?.state));
+  const final: any = await until(() => native.request("schedule", { action: "show", id: schedule.id }), (snapshot: any) => snapshot.schedules[0]?.finished_ms != null && ["completed", "failed", "waiting"].includes(snapshot.schedules[0]?.state));
   expect(final.schedules[0].state, final.schedules[0].reason + native.stderr).toBe("completed");
   expect(final.schedules[0].task_state).toBe("accepted");
   expect(final.schedules[0].started_ms).toBeGreaterThan(schedule.at_ms);

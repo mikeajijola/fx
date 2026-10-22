@@ -4126,6 +4126,25 @@ const RoutingFakeApp = struct {
         return false;
     }
 
+    pub fn snapshotCachedModelIds(self: *RoutingFakeApp, alloc: std.mem.Allocator) !?std.ArrayList([]u8) {
+        if (self.model_cache_loading) return null;
+        var ids: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (ids.items) |id| alloc.free(id);
+            ids.deinit(alloc);
+        }
+        for (self.model_completion_values) |value| {
+            const copy = try alloc.dupe(u8, value);
+            errdefer alloc.free(copy);
+            try ids.append(alloc, copy);
+        }
+        return ids;
+    }
+
+    pub fn fetchModelIds(_: *RoutingFakeApp) !std.ArrayList([]u8) {
+        return error.FetchFailed;
+    }
+
     pub fn resolvedModelCapabilities(self: *RoutingFakeApp, model: []const u8) model_capabilities.Capabilities {
         if (self.gateway_metadata_model) |metadata_model| {
             if (std.mem.eql(u8, metadata_model, model)) {

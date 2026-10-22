@@ -2941,6 +2941,7 @@ fn cliPermissionPromptAllowed(
 }
 
 fn cliContextPermissionPromptAllowed(ctx: *const AskContext) bool {
+    if (ctx.deps.ui_host != null) return true;
     return cliPermissionPromptAllowed(
         ctx.output_mode,
         ctx.prompt_permissions,
@@ -7312,6 +7313,37 @@ test "fx ask permission prompt policy requires explicit captured-mode opt in and
             ),
         );
     }
+}
+
+test "fx ask native approval transport does not require terminal stdin" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup);
+    deps.stdin_is_tty = TestTty.no;
+    var ctx = AskContext.init(alloc, testConfig(), deps, "/Users/example/workspace");
+    defer ctx.deinit();
+    var headless: @import("../workspace/schedule_worker.zig").Headless = .{ .alloc = alloc };
+    headless.init("/Users/example/workspace");
+    defer headless.ui.deinit();
+
+    for ([_]OutputMode{ .json, .quiet }) |mode| {
+        ctx.output_mode = mode;
+        ctx.prompt_permissions = true;
+        try std.testing.expect(!cliContextPermissionPromptAllowed(&ctx));
+        try std.testing.expect(cliAdmissionContext(&ctx, &.{}, null).permission_prompter == null);
+        ctx.deps.ui_host = &headless.ui;
+        try std.testing.expect(cliContextPermissionPromptAllowed(&ctx));
+        try std.testing.expect(cliAdmissionContext(&ctx, &.{}, null).permission_prompter != null);
+        ctx.deps.ui_host = null;
+    }
+    ctx.deps.ui_host = &headless.ui;
+    try std.testing.expectEqual(PermissionApprovalPromptResult.deny, try promptCliPermissionApproval(&ctx, "Write the retained report"));
+    try std.testing.expect(headless.blocked.load(.acquire));
+    try std.testing.expect(headless.ui.cancel.load(.acquire));
+    try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 }
 
 test "fx ask captured permission prompt opt in uses the existing prompter" {
