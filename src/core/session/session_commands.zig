@@ -3,6 +3,7 @@ const build_options = @import("build_options");
 const app_permission_runtime = @import("../app/app_permission_runtime.zig");
 const app_session_runtime = @import("../app/app_session_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
+const completion_review = @import("../agent/runtime/completion_review.zig");
 const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -362,6 +363,66 @@ pub fn Commands(comptime App: type) type {
             const resolved = try resolveModelQuery(app, query);
             defer app.alloc.free(resolved);
             try setResolvedModel(app, resolved, true);
+        }
+
+        pub fn handleReviewModel(app: *App, query: []const u8) !void {
+            const trimmed = std.mem.trim(u8, query, " \t\r\n");
+            const defs = configuredDefinitions(app);
+            const active_provider = provider_runtime.provider(app);
+            const active_model = provider_runtime.model(app);
+            if (trimmed.len == 0 or std.ascii.eqlIgnoreCase(trimmed, "status")) {
+                const current_override = if (comptime @hasField(App, "review_model")) app.review_model else "";
+                const sel = completion_review.resolveSelection(current_override, active_provider, defs, active_model);
+                const mode_label = if (current_override.len > 0) "override" else "default";
+                const body = try app.alloc.print("{s} (provider: {s}, {s})", .{ sel.model, sel.provider.label(), mode_label });
+                defer app.alloc.free(body);
+                try app.writeDomainNotice(.{ .topic = "review-model", .tone = .neutral, .body = body }, true);
+                return;
+            }
+
+            if (std.ascii.eqlIgnoreCase(trimmed, "reset") or
+                std.ascii.eqlIgnoreCase(trimmed, "default") or
+                std.ascii.eqlIgnoreCase(trimmed, "clear") or
+                std.ascii.eqlIgnoreCase(trimmed, "off"))
+            {
+                if (comptime @hasField(App, "review_model")) {
+                    if (app.review_model.len > 0) app.alloc.free(app.review_model);
+                    app.review_model = &.{};
+                }
+                var attempt = config_runtime.attemptUserPreferences(app.alloc, .{ .clear_review_model = true });
+                defer attempt.deinit(app.alloc);
+                const sel = completion_review.resolveSelection("", active_provider, defs, active_model);
+                const body = try app.alloc.print("Reset reviewer model to default: {s} (provider: {s})", .{ sel.model, sel.provider.label() });
+                defer app.alloc.free(body);
+                try app.writeDomainNotice(.{ .topic = "review-model", .tone = .neutral, .body = body }, true);
+                app.shell.render_requests.request(.footer);
+                return;
+            }
+
+            const inferred = completion_review.inferProviderSelection(trimmed, active_provider, defs, active_model);
+            const resolved = if (inferred.provider.eql(active_provider) and std.mem.indexOfAny(u8, trimmed, ": \t") == null)
+                try resolveModelQuery(app, trimmed)
+            else
+                try app.alloc.dupe(u8, trimmed);
+            errdefer app.alloc.free(resolved);
+
+            if (comptime @hasField(App, "review_model")) {
+                if (app.review_model.len > 0) app.alloc.free(app.review_model);
+                app.review_model = resolved;
+            } else {
+                defer app.alloc.free(resolved);
+            }
+
+            const saved_value = if (comptime @hasField(App, "review_model")) app.review_model else resolved;
+            var attempt = config_runtime.attemptUserPreferences(app.alloc, .{ .review_model = saved_value });
+            defer attempt.deinit(app.alloc);
+
+            const sel = completion_review.resolveSelection(saved_value, active_provider, defs, active_model);
+            const body = try app.alloc.print("Switched reviewer model to {s} (provider: {s})", .{ sel.model, sel.provider.label() });
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{ .topic = "review-model", .tone = .neutral, .body = body }, true);
+            if (comptime @hasDecl(App, "playInteractionSound")) app.playInteractionSound();
+            app.shell.render_requests.request(.footer);
         }
 
         pub fn handlePermissions(app: *App, rest: []const u8) !void {
@@ -885,11 +946,12 @@ pub fn Commands(comptime App: type) type {
             ultrafast_mode: bool,
         ) !void {
             try setResolvedModelRuntime(app, model);
+            const effective_model = provider_runtime.model(app);
             var patch = app_session_runtime.SessionPreferencePatch{
                 .provider = provider_runtime.provider(app),
-                .model = model,
+                .model = effective_model,
             };
-            const capabilities = model_capabilities.resolveForApp(App, app, model);
+            const capabilities = model_capabilities.resolveForApp(App, app, effective_model);
             if (capabilities.reasoning_efforts.len > 0) {
                 try applyEffort(app, effort, false, false);
                 patch.effort = effort;
@@ -1132,17 +1194,41 @@ pub fn Commands(comptime App: type) type {
             try app.writeDomainNotice(.{ .topic = "settings", .tone = .@"error", .body = msg }, true);
         }
 
+        fn configuredDefinitions(app: *const App) []const @import("../config/configured_provider.zig").Definition {
+            if (comptime @hasField(App, "provider_selection")) {
+                return app.provider_selection.definitions.definitions;
+            }
+            return &.{};
+        }
+
         fn fetchModelIds(app: *App) !std.ArrayList([]u8) {
             return app.fetchModelIds();
         }
 
         fn resolveModelQuery(app: *App, query: []const u8) ![]u8 {
+            const defs = configuredDefinitions(app);
+            const current_provider = provider_runtime.provider(app);
+            const inferred = completion_review.inferProviderSelection(query, current_provider, defs, provider_runtime.model(app));
+            const cross_provider = !inferred.provider.eql(current_provider) or std.mem.indexOfAny(u8, std.mem.trim(u8, query, " \t"), ": \t") != null;
+
             if (try app.snapshotCachedModelIds(app.alloc)) |snapshot| {
                 var ids = snapshot;
                 defer freeStringList(app.alloc, &ids);
+                if (cross_provider) {
+                    for (ids.items) |id| {
+                        if (std.ascii.eqlIgnoreCase(id, query) or containsIgnoreCase(id, query)) {
+                            return app.alloc.dupe(u8, id);
+                        }
+                    }
+                    return app.alloc.dupe(u8, query);
+                }
                 if (try resolveModelQueryFromIds(app.alloc, ids.items, query)) |resolved| {
                     return resolved;
                 }
+            }
+
+            if (cross_provider) {
+                return app.alloc.dupe(u8, query);
             }
 
             var ids = fetchModelIds(app) catch {
@@ -1158,8 +1244,12 @@ pub fn Commands(comptime App: type) type {
         }
 
         fn setResolvedModel(app: *App, resolved: []const u8, announce: bool) !void {
-            const model_changed = !std.mem.eql(u8, provider_runtime.model(app), resolved);
+            const previous_model = try app.alloc.dupe(u8, provider_runtime.model(app));
+            defer app.alloc.free(previous_model);
+            const previous_provider = provider_runtime.provider(app);
             try setResolvedModelRuntime(app, resolved);
+            const model_changed = !std.mem.eql(u8, previous_model, provider_runtime.model(app)) or
+                !previous_provider.eql(provider_runtime.provider(app));
             if (model_changed and app.fast_mode) {
                 try applyFastMode(app, false, false, false);
             }
@@ -1171,7 +1261,7 @@ pub fn Commands(comptime App: type) type {
                 app,
                 .{
                     .provider = provider_runtime.provider(app),
-                    .model = resolved,
+                    .model = provider_runtime.model(app),
                     .fast_mode = app.fast_mode,
                     .ultrafast_mode = app.worker.agent_turn_settings.ultrafast_mode,
                 },
@@ -1246,7 +1336,42 @@ pub fn Commands(comptime App: type) type {
         }
 
         fn setResolvedModelRuntime(app: *App, resolved: []const u8) !void {
-            if (!std.mem.eql(u8, provider_runtime.model(app), resolved)) {
+            if (comptime @hasField(App, "provider_selection")) {
+                const current_provider = provider_runtime.provider(app);
+                const inferred = completion_review.inferProviderSelection(
+                    resolved,
+                    current_provider,
+                    app.provider_selection.definitions.definitions,
+                    provider_runtime.model(app),
+                );
+                if (!inferred.provider.eql(current_provider)) {
+                    var switched = false;
+                    provider_runtime.replaceSelection(app, inferred.provider, inferred.model) catch {
+                        try provider_runtime.replaceModel(app, inferred.model);
+                    };
+                    switched = provider_runtime.provider(app).eql(inferred.provider);
+                    if (switched) {
+                        if (comptime @hasField(App, "auth") and @hasDecl(@TypeOf(app.auth), "adoptCredential") and @hasDecl(@TypeOf(app.auth), "oauthTransport")) {
+                            if (auth_runtime.prepareCredential(
+                                app.alloc,
+                                app.auth.oauthTransport(),
+                                if (comptime @hasDecl(@TypeOf(app.auth), "secretStore")) app.auth.secretStore() else host.unavailable_secret_store,
+                                inferred.provider,
+                                null,
+                            ) catch null) |cred_val| {
+                                var cred = cred_val;
+                                _ = app.auth.adoptCredential(app.alloc, &cred);
+                            }
+                        }
+                        if (comptime @hasField(App, "model_cache")) {
+                            app.model_cache.resetForProviderChange();
+                            if (comptime @hasDecl(App, "ensureModelCache")) app.ensureModelCache();
+                        }
+                    }
+                } else if (!std.mem.eql(u8, provider_runtime.model(app), inferred.model)) {
+                    try provider_runtime.replaceModel(app, inferred.model);
+                }
+            } else if (!std.mem.eql(u8, provider_runtime.model(app), resolved)) {
                 try provider_runtime.replaceModel(app, resolved);
             }
             const selected = provider_runtime.model(app);
@@ -2345,10 +2470,22 @@ test "session_commands handleModel resolves fuzzy cached model and syncs queued 
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", app.worker.synced_model.?);
     try std.testing.expectEqual(model_provider.ProviderId.codex, app.last_preference_provider.?);
     try std.testing.expectEqualStrings(
-        "fx v" ++ build_options.app_version ++ " | workspace",
+        "omniseedos v" ++ build_options.app_version ++ " | workspace",
         app.terminalTitleLabelText(),
     );
     try expectTranscriptContains(&app, "* Switched to anthropic/claude-sonnet-4-20250514");
+}
+
+test "session_commands model change retains the previous value across replacement" {
+    var app = try FakeApp.init(std.testing.allocator, "/tmp/workspace", "anthropic/old");
+    defer app.deinit();
+    app.fast_mode = true;
+    // Equal-length replacement reuses the fake app's model allocation. A
+    // borrowed previous slice would now equal the new model and miss the change.
+    try Commands(FakeApp).handleModel(&app, "anthropic/new");
+    try std.testing.expectEqualStrings("anthropic/new", app.selected_model.items);
+    try std.testing.expect(!app.fast_mode);
+    try std.testing.expectEqual(false, app.worker.synced_fast_mode.?);
 }
 
 test "session_commands handleModel falls back to raw query when model fetch fails" {
@@ -2362,7 +2499,7 @@ test "session_commands handleModel falls back to raw query when model fetch fail
     try std.testing.expectEqualStrings("custom/provider-model", app.selected_model.items);
     try std.testing.expectEqualStrings("custom/provider-model", app.worker.synced_model.?);
     try std.testing.expectEqualStrings(
-        "fx v" ++ build_options.app_version ++ " | workspace",
+        "omniseedos v" ++ build_options.app_version ++ " | workspace",
         app.terminalTitleLabelText(),
     );
 }
@@ -2910,7 +3047,7 @@ test "session_commands model picker accepts the current selected model slice" {
     try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.worker.synced_model.?);
     try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.last_preference_model.items);
     try std.testing.expectEqualStrings(
-        "fx v" ++ build_options.app_version ++ " | workspace",
+        "omniseedos v" ++ build_options.app_version ++ " | workspace",
         app.terminalTitleLabelText(),
     );
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);

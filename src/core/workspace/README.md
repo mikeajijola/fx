@@ -51,6 +51,59 @@ known to be absent. Possible provider effects use the existing reconciliation
 path before any retry. Repeated rejection pauses the turn. Earlier successful
 actions remain retained.
 
+## Schedule work contracts
+
+Schedule an existing unfinished root task with an explicit timestamp:
+
+```sh
+omos schedule add TASK_ID --at '2026-10-23T09:00:00+01:00'
+omos schedule list --json
+omos schedule show SCHEDULE_ID
+omos schedule move SCHEDULE_ID --at '2026-10-24T10:00:00Z'
+omos schedule cancel SCHEDULE_ID
+```
+
+Timestamps require seconds and an explicit UTC offset. `list` accepts `--from`
+and `--to` for a half-open date range. JSON responses include the calendar
+revision; pass it with `--revision HASH` when changing a calendar you previously
+read. Cancelling a start preserves the contract and its evidence.
+
+The persistent native `ui-host --stdio` or writable `fossil serve` host runs due
+contracts through their saved native sessions. The host must be running, the
+project directory must exist, and the original native session must be available.
+Overdue starts queue when the host returns. A workspace actor lock prevents
+concurrent scheduled and interactive root invocations. Ordinary permission rules,
+bounded invocations, independent assessment, and verified publication still apply.
+A headless HTTP host retains work when it needs user input.
+
+Schedules and their transition history live on the portable `omos-schedules`
+Fossil branch. Credentials and session checkpoints remain profile state. A lost
+worker lease retains an interrupted schedule for inspection and continuation;
+it does not automatically replay potentially completed external effects.
+Reschedule retained waiting work explicitly after resolving its blocker.
+
+Authenticated user updates mark a contract revision pending. The independent
+planner can replace affected obligations while preserving unrelated obligations
+and host requirements. The host records old and new contract versions and the
+user amendments that caused the change. Work resumes against the revised
+requirements, with existing evidence available for independent reassessment.
+
+The workspace UI Calendar displays planned starts, current requirements,
+schedule history, and execution state. Its editor creates, moves, or cancels
+starts with a revision fence. Calendar timestamps display in the browser's
+local timezone; stored execution instants use UTC. Schedules are one-time starts,
+not deadlines or recurring templates.
+
+### Calendar service
+
+`POST /v1/schedules` uses the existing workspace service bearer authentication.
+Requests contain `version: "omos.schedule/v1"`, the bound `workspace` identity,
+and an `action` of `list`, `show`, `add`, `move`, or `cancel`. `show`, `move`, and
+`cancel` take `id`; `add` takes `task`; `add` and `move` take `at`. `list` accepts
+`from` and `to`. Mutations require writable service mode and the calendar
+`revision` returned by the previous read. The native UI bridge exposes the same
+operations through its typed `schedule` method.
+
 ## Declare the workspace model
 
 New workspaces contain `omniform/company.json` and `execution/omos.json`.

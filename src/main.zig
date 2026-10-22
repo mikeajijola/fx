@@ -2445,7 +2445,30 @@ const App = struct {
 
     pub fn modelCompletions(self: *App, query: []const u8, out: [][]const u8) usize {
         self.ensureModelCache();
-        return self.model_cache.modelCompletions(query, out);
+        var count = self.model_cache.modelCompletions(query, out);
+        const normalized = std.mem.trim(u8, query, " \t");
+        for (self.provider_selection.definitions.definitions) |definition| {
+            for (definition.model_metadata) |meta| {
+                count = appendUniqueModelCompletion(out, count, normalized, meta.id);
+            }
+            if (definition.reviewer_model) |rm| {
+                count = appendUniqueModelCompletion(out, count, normalized, rm);
+            }
+        }
+        for ([_][]const u8{ "openai/gpt-5.6-luna", "gpt-5.6-luna", "grok-4.5", "gemini-3.8-flash" }) |builtin_id| {
+            count = appendUniqueModelCompletion(out, count, normalized, builtin_id);
+        }
+        return count;
+    }
+
+    fn appendUniqueModelCompletion(out: [][]const u8, count: usize, query: []const u8, candidate: []const u8) usize {
+        if (count >= out.len) return count;
+        if (query.len > 0 and !@import("core/shared/text_utils.zig").containsIgnoreCase(candidate, query)) return count;
+        for (out[0..count]) |existing| {
+            if (std.ascii.eqlIgnoreCase(existing, candidate)) return count;
+        }
+        out[count] = candidate;
+        return count + 1;
     }
 
     pub fn catalogModelCompletion(self: *App, model: []const u8) ?[]const u8 {
@@ -3786,6 +3809,8 @@ fn hasPosixArgVector() bool {
 
 fn needsFullEntryConfig(args: []const [:0]const u8) bool {
     const command = cli_surface.commandAfterGlobalLaunchArgs(args) orelse return false;
+    const effective_args = cli_surface.argsAfterGlobalLaunchArgs(args);
+    if (std.mem.eql(u8, command, "fossil") and effective_args.len > 1 and std.mem.eql(u8, effective_args[1], "serve")) return true;
     return std.mem.eql(u8, command, "ui-host") or
         std.mem.eql(u8, command, "ask") or
         std.mem.eql(u8, command, "acp") or
@@ -3814,6 +3839,7 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
     }
     return std.mem.eql(u8, command, "ui-host") or
         std.mem.eql(u8, command, "fossil") or
+        std.mem.eql(u8, command, "schedule") or
         std.mem.eql(u8, command, "slack") or
         std.mem.eql(u8, command, "login") or
         std.mem.eql(u8, command, "logout") or
@@ -3902,7 +3928,10 @@ test "early threaded io is resolved after global launch args" {
 }
 
 test "full entry config commands also use early threaded io" {
+    try std.testing.expect(needsFullEntryConfig(&.{ "fossil", "serve", "--write" }));
+    try std.testing.expect(!needsFullEntryConfig(&.{ "fossil", "status" }));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "fossil")}));
+    try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "schedule")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "ask")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "acp")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "pr")}));

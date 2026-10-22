@@ -5,9 +5,12 @@ const io = @import("../shared/io.zig");
 const workspace = @import("fossil_workspace.zig");
 const service = @import("workspace_service.zig");
 
-pub fn run(manager: workspace.Manager, port: u16, writable: bool, context: *anyopaque, ready: *const fn (*anyopaque, []const u8) anyerror!void, executor: ?@import("review_worker.zig").Executor) !void {
+pub fn run(manager: workspace.Manager, port: u16, writable: bool, context: *anyopaque, ready: *const fn (*anyopaque, []const u8) anyerror!void, executor: ?@import("review_worker.zig").Executor, schedule_executor: ?@import("schedule_worker.zig").Executor) !void {
+    @import("../agent/runtime/completion_review.zig").configureInvocation("ui-host");
     @import("../shared/debug_trace.zig").configureFromEnv(manager.alloc, std.Io.Dir.path.dirname(manager.repository) orelse ".");
     defer @import("../shared/debug_trace.zig").shutdown();
+    workspace.configureHostBinding(.{ .repository = manager.repository, .workspace_id = manager.manifest.id });
+    defer workspace.configureHostBinding(null);
     const token = io.getenv("OMOS_WORKSPACE_TOKEN") orelse return error.MissingWorkspaceServiceToken;
     if (token.len < 32 or token.len > 1024 or std.mem.findScalar(u8, token, '\r') != null or std.mem.findScalar(u8, token, '\n') != null) return error.InvalidWorkspaceServiceToken;
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", port);
@@ -18,6 +21,12 @@ pub fn run(manager: workspace.Manager, port: u16, writable: bool, context: *anyo
     defer if (scheduler) |*worker| {
         worker.stopping.store(true, .release);
         thread.?.join();
+    };
+    var schedule_worker: ?@import("schedule_worker.zig").Scheduler = if (writable and schedule_executor != null) .{ .manager = manager, .executor = schedule_executor.? } else null;
+    const schedule_thread: ?std.Thread = if (schedule_worker) |*worker| try std.Thread.spawn(.{}, @import("schedule_worker.zig").Scheduler.loop, .{worker}) else null;
+    defer if (schedule_worker) |*worker| {
+        worker.stopping.store(true, .release);
+        schedule_thread.?.join();
     };
     try ready(context, try std.json.Stringify.valueAlloc(manager.alloc, .{ .service = "omos.workspace-api/v1", .port = listener.socket.address.getPort(), .workspace = manager.manifest.id, .writable = writable }, .{}));
     var connections: [32]?std.Thread = @splat(null);
@@ -119,14 +128,15 @@ fn dispatch(manager: workspace.Manager, request: *std.http.Server.Request, token
         const snapshot = try manager.definitionSnapshot(null);
         return request.respond(try std.json.Stringify.valueAlloc(manager.alloc, .{ .workspace = manager.manifest.id, .definition = snapshot, .revision = (try manager.snapshot("")).trunk_revision }, .{}), .{ .keep_alive = keep_alive.*, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
     }
-    if (request.head.method != .POST or !std.mem.eql(u8, request.head.target, "/v1/workspace")) return request.respond("{\"error\":\"NotFound\"}", .{ .status = .not_found, .keep_alive = keep_alive.* });
+    const schedules = std.mem.eql(u8, request.head.target, "/v1/schedules");
+    if (request.head.method != .POST or (!schedules and !std.mem.eql(u8, request.head.target, "/v1/workspace"))) return request.respond("{\"error\":\"NotFound\"}", .{ .status = .not_found, .keep_alive = keep_alive.* });
     if (request.head.content_length) |length| if (length > 1024 * 1024) {
         keep_alive.* = false;
         return request.respond("{\"error\":\"RequestTooLarge\"}", .{ .status = .payload_too_large, .keep_alive = false });
     };
     const body_reader = try request.readerExpectContinue(&.{});
     const raw = try body_reader.allocRemaining(manager.alloc, .limited(1024 * 1024));
-    const response = service.execute(manager, raw, writable) catch |err| {
+    const response = (if (schedules) service.executeSchedule(manager, raw, writable) else service.execute(manager, raw, writable)) catch |err| {
         @import("../shared/debug_trace.zig").logf("workspace", "workspace service rejected error={s}", .{@errorName(err)});
         const status: std.http.Status = switch (err) {
             error.WorkspaceIdentityMismatch, error.ServiceReadOnly, error.HostOwnedEntity, error.WorkspacePathDenied => .forbidden,

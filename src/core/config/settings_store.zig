@@ -121,6 +121,8 @@ pub const UserSettingsPatch = struct {
     notification_turn_end: ?bool = null,
     notification_attention_required: ?bool = null,
     notification_max: ?bool = null,
+    review_model: ?[]const u8 = null,
+    clear_review_model: bool = false,
 
     fn isEmpty(self: UserSettingsPatch) bool {
         return self.connection == null and
@@ -142,7 +144,9 @@ pub const UserSettingsPatch = struct {
             self.session_titles == null and
             self.notification_turn_end == null and
             self.notification_attention_required == null and
-            self.notification_max == null;
+            self.notification_max == null and
+            self.review_model == null and
+            !self.clear_review_model;
     }
 };
 
@@ -1090,6 +1094,11 @@ fn applyUserPatchToRoot(
         application.changed = true;
     }
     if (patch.yolo_acknowledged) |value| application.changed = try putBool(arena, &root.object, "yolo_acknowledged", value) or application.changed;
+    if (patch.review_model) |value| application.changed = try putString(arena, &root.object, "review_model", value) or application.changed;
+    if (patch.clear_review_model and root.object.contains("review_model")) {
+        _ = root.object.orderedRemove("review_model");
+        application.changed = true;
+    }
     if (patch.effort) |value| application.changed = try putString(arena, &root.object, "effort", value.label()) or application.changed;
     if (patch.fast_mode) |value| application.changed = try putBool(arena, &root.object, "fast_mode", value) or application.changed;
     if (patch.ultrafast_mode) |value| application.changed = try putBool(arena, &root.object, "ultrafast_mode", value) or application.changed;

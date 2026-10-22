@@ -303,7 +303,8 @@ fn fetch_cli_catalog(raw: ?*anyopaque, alloc: Allocator, input: gateway_provider
 const Review = struct { definition: *const definitions.Definition, input: classifier.ProviderInput };
 fn review(raw: ?*anyopaque, alloc: Allocator, input: classifier.ProviderInput, request: classifier.ReviewRequest) !classifier.ParseOutcome {
     var state = Review{ .definition = definition_at(raw), .input = input };
-    return classifier.Reviewer.withTransportModel(.{ .context = &state, .build_fn = build_review, .send_fn = send_review }, input.cancel_flag, classifier.Reviewer.default_timeout_ms, state.definition.reviewer_model orelse request.review_turn.model).review(alloc, request);
+    const selected_model = if (input.reviewer_model.len > 0) input.reviewer_model else state.definition.reviewer_model orelse request.review_turn.model;
+    return classifier.Reviewer.withTransportModel(.{ .context = &state, .build_fn = build_review, .send_fn = send_review }, input.cancel_flag, classifier.Reviewer.default_timeout_ms, selected_model).review(alloc, request);
 }
 fn build_review(raw: *anyopaque, alloc: Allocator, model: []const u8, _: []const u8, instructions: []const types.ChatMessage, messages: []const types.ChatMessage, target_id: []const u8, deadline: std.Io.Clock.Timestamp, cancel: *std.atomic.Value(bool)) ![]u8 {
     const state: *Review = @ptrCast(@alignCast(raw));

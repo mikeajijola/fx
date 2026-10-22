@@ -385,6 +385,7 @@ pub fn Handlers(comptime App: type) type {
                 .attach_image = commandAttachImage,
                 .manage_images = commandManageImages,
                 .handle_model = commandHandleModel,
+                .handle_review_model = commandHandleReviewModel,
                 .handle_permissions = commandHandlePermissions,
                 .handle_allowlist = commandHandleAllowlist,
                 .show_stats = commandShowStats,
@@ -791,6 +792,11 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleModel(ctx: *anyopaque, query: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try session_commands.Commands(App).handleModel(app, query);
+        }
+
+        fn commandHandleReviewModel(ctx: *anyopaque, query: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try session_commands.Commands(App).handleReviewModel(app, query);
         }
 
         fn commandHandlePermissions(ctx: *anyopaque, rest: []const u8) !void {

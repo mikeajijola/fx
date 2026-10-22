@@ -291,6 +291,17 @@ pub fn run(
             turn.active_work_id orelse "unknown",
         },
     );
+    const review_selection = @import("../agent/runtime/completion_review.zig").resolveSelection(config.tool_context.reviewer_model, admission.provider, config.provider_set.definitions, admission.model);
+    const cross_review_credential = if (!review_selection.provider.eql(admission.provider))
+        @import("../auth/auth_runtime.zig").prepareCredential(
+            arena,
+            config.tool_context.oauth_transport,
+            config.tool_context.secret_store,
+            review_selection.provider,
+            null,
+        ) catch null
+    else
+        null;
     const deps = runtimeDeps(&context);
     agent_runtime.processAgentPrompt(
         &turn.sessionRuntime().agent,
@@ -321,7 +332,15 @@ pub fn run(
             .auto_compact_percent = config.tool_context.auto_compact_percent,
             .cancel_flag = cancel,
             .contract_review_enabled = @import("../agent/runtime/completion_review.zig").enabled(),
-            .contract_review_model = @import("../agent/runtime/completion_review.zig").selectModel(config.tool_context.reviewer_model, admission.provider, config.provider_set.definitions, admission.model),
+            .contract_review_model = review_selection.model,
+            .contract_review_provider = review_selection.provider,
+            .contract_review_stream_provider = config.provider_set.select(review_selection.provider).agent_stream_or_unavailable(),
+            .contract_review_credential = if (cross_review_credential) |cred| .{ .direct = .{
+                .secret_bytes = cred.token,
+                .source = cred.source,
+                .account_id = cred.accountId(),
+                .tenant_context = cred.gatewayTeam(),
+            } } else null,
             .fossil_session_id = if (config.tool_context.fossil_workspace_available) turn.child_id else null,
             .fossil_parent_session_id = config.tool_context.subagent_caller_id orelse config.tool_context.lifecycle_scope.session_id,
             .fossil_ephemeral = config.tool_context.fossil_workspace_available and config.tool_context.lifecycle_scope.session_id == null,

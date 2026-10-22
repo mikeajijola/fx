@@ -18,6 +18,8 @@ pub const Host = struct {
     validation_id: usize = 0,
     validation_response: ?[]u8 = null,
     session_id: []const u8 = "",
+    project_root: ?[]const u8 = null,
+    execution_lease_held: bool = false,
 
     pub fn emit(self: *Host, value: anytype) !void {
         const bytes = try std.json.Stringify.valueAlloc(std.heap.c_allocator, value, .{});

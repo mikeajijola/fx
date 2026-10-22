@@ -61,6 +61,9 @@ pub const Turn = struct {
 
     // Checkpoints and reviews share these retained-evidence traversal paths.
     pub noinline fn progress(self: *Turn, alloc: std.mem.Allocator, messages: []const types.ChatMessage) !void {
+        const latest = try self.manager.loadTask(self.task.id);
+        if (latest.definition.version != self.task.definition.version) self.invalidateAssessment();
+        self.task = latest;
         const evidence = try review.collectToolEvidence(alloc, messages);
         const coding = if (self.task.model_basis) |basis| if (basis.capability) |id| std.mem.eql(u8, id, "coding_task") else false else false;
         const source = if (coding) try @import("source_state.zig").fingerprint(alloc, self.task.project_root, self.manager.repository) else null;
@@ -88,13 +91,28 @@ pub const Turn = struct {
         // User corrections are authenticated by the runtime's message origin.
         for (messages) |message| {
             if (message.role == .user and (message.context_origin == .user_turn or message.restored_steering)) {
-                if (message.content) |content| self.task = try self.manager.amend(self.task, content);
+                if (message.content) |content| {
+                    const previous_version = self.task.definition.version;
+                    self.task = try self.manager.amend(self.task, content);
+                    if (self.task.definition.version != previous_version) self.invalidateAssessment();
+                }
             }
         }
     }
 
+    fn invalidateAssessment(self: *Turn) void {
+        self.reviewed_revision = null;
+        self.assessment = "";
+        self.assessment_record = null;
+        self.review_snapshot = "";
+        self.review_only_candidate = null;
+        self.prior_review_pages = &.{};
+        self.prior_review_checkpoints = &.{};
+    }
+
     pub noinline fn beforeReview(self: *Turn, alloc: std.mem.Allocator, messages: []const types.ChatMessage) ![]const review.Evidence {
         try self.progress(alloc, messages);
+        if (self.task.revision_pending) return error.TaskContractRevisionPending;
         self.reviewed_revision = try self.manager.checkpoint(self.task);
         var evidence: std.ArrayList(review.Evidence) = .empty;
         var pages: std.ArrayList([]const u8) = .empty;

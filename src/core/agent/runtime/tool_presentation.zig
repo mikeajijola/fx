@@ -1064,7 +1064,7 @@ pub fn finishExecutedToolStatus(
             );
             if (std.mem.eql(u8, call.name, "shell")) {
                 if (try tool_result_errors.isTerminalEndedFailure(arena, safe_result)) {
-                    break :blk try arena.print("{s} · ended when fx exited", .{base});
+                    break :blk try arena.print("{s} · ended when omniseedos exited", .{base});
                 }
                 if (try tool_result_errors.inspectTerminalActionFieldCorrection(
                     arena,

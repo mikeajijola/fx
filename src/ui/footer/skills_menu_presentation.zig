@@ -437,9 +437,9 @@ fn composeEmptyRow(
 
 fn skillSourceScopeLabel(source: skill_runtime.SkillSource) []const u8 {
     return switch (source) {
-        .global_fx => "fx · Global",
-        .workspace_fx => "fx · Workspace",
-        .workspace_shared => "fx · Workspace",
+        .global_fx => "omniseedos · Global",
+        .workspace_fx => "omniseedos · Workspace",
+        .workspace_shared => "omniseedos · Workspace",
         .workspace_opencode => "OpenCode · Workspace",
         .global_opencode => "OpenCode · Global",
         .workspace_codex => "Codex · Workspace",
@@ -466,7 +466,7 @@ fn visibleSkillCount(projection: SkillsMenuProjection) usize {
 }
 
 test "skills menu labels native workspace skills with lowercase product name" {
-    try std.testing.expectEqualStrings("fx · Workspace", skillSourceScopeLabel(.workspace_fx));
+    try std.testing.expectEqualStrings("omniseedos · Workspace", skillSourceScopeLabel(.workspace_fx));
 }
 
 test "skills menu renders source tabs and single-line results" {
@@ -551,7 +551,7 @@ test "skills menu narrow header always shows the active source" {
         defer fx_prepared.deinit(alloc);
         var fx_header = try composeSkillsMenuRow(alloc, fx_prepared, 0, width);
         defer fx_header.deinit(alloc);
-        try std.testing.expect(std.mem.find(u8, fx_header.items, "[fx]") != null);
+        try std.testing.expect(std.mem.find(u8, fx_header.items, "[omniseedos]") != null);
         try std.testing.expect(std.mem.find(u8, fx_header.items, "[Fx]") == null);
         try std.testing.expect(
             display_width.visibleWidthIgnoringAnsi(fx_header.items) <= width,

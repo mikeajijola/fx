@@ -134,4 +134,66 @@ describe("portable Fossil agent workspace", () => {
     expect(m.packets.at(-1).userSteering).toContain("The detail is blue");
   }, 60000);
 
+  test("a user update revises affected obligations and preserves the remaining contract", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let blocked = true;
+    const update = "Explain the HTML format instead of PDF. Keep the source comparison.";
+    const m = model(f, () => ({ content: blocked ? "Waiting for the requested format choice." : "HTML uses markup and keeps the original source comparison." }), () => blocked ? "blocked" : "met", {
+      plan: { capability: "general_task", summary: "Explain the format and compare sources", obligations: [{ id: "format", description: "Explain the PDF format" }, { id: "sources", description: "Compare the original sources" }], checks: [] },
+      revise: () => ({ capability: "general_task", summary: "The user replaced the PDF explanation with HTML", obligations: [{ id: "format", description: "Explain the HTML format" }], checks: [], superseded: ["format"] }),
+    });
+    const first = await f.run(["ask", "Explain PDF and compare the original sources after I confirm the format", "--json"]);
+    expect(first.code, first.stderr).toBe(1);
+    const session = JSON.parse(first.stdout).session_id;
+    const before = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    expect((await f.run(["ask", "--resume-id", session, "continue", "--json"])).code).toBe(1);
+    expect(m.revisionPackets).toHaveLength(0);
+    blocked = false;
+    const result = await f.run(["ask", "--resume-id", session, update, "--json"]);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    const after = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    expect(after.id).toBe(before.id);
+    expect(after.definition.version).toBe(before.definition.version + 1);
+    expect(after.revision_pending).toBe(false);
+    expect(after.planned_amendments).toBe(1);
+    expect(after.definition.obligations).toEqual([
+      before.definition.obligations[0], { id: "sources", description: "Compare the original sources" }, { id: "format", description: "Explain the HTML format" },
+    ]);
+    expect(m.revisionPackets).toHaveLength(1);
+    expect(m.revisionPackets[0].context.pendingAmendments).toEqual([update]);
+    expect(m.packets.at(-1).contract.version).toBe(after.definition.version);
+    const history = f.fossil("ls", "-r", after.branch).split("\n").filter(path => path.startsWith(`history/${after.id}/`)).map(path => JSON.parse(f.fossil("cat", path, "-r", after.branch)));
+    const revision = history.find(row => row.kind === "contract_revision");
+    expect(revision.value.previous_contract.obligations.find((o: any) => o.id === "format").description).toBe("Explain the PDF format");
+    expect(revision.value.superseded).toEqual(["format"]);
+    expect(revision.value.amendments).toEqual([update]);
+  }, 120000);
+
+  test("an invalid revision pauses before the actor and can resume from the retained user update", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let blocked = true, valid = false;
+    const m = model(f, () => ({ content: blocked ? "Waiting for detail." : "Explained the changed detail." }), () => blocked ? "blocked" : "met", {
+      plan: { capability: "general_task", summary: "Explain the requested detail", obligations: [{ id: "detail", description: "Explain the initial detail" }], checks: [] },
+      revise: () => ({ capability: "general_task", summary: "Apply the user's changed detail", obligations: [{ id: "detail", description: "Explain the changed detail" }], checks: [], superseded: valid ? ["detail"] : [] }),
+    });
+    const first = await f.run(["ask", "Explain a detail after I provide it", "--json"]);
+    const session = JSON.parse(first.stdout).session_id;
+    blocked = false;
+    const invalid = await f.run(["ask", "--resume-id", session, "The detail has changed", "--json"]);
+    expect(invalid.code, invalid.stderr).toBe(1);
+    expect(m.counts().actors).toBe(1);
+    const pending = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    expect(pending.revision_pending).toBe(true);
+    expect(pending.definition.obligations.find((o: any) => o.id === "detail").description).toBe("Explain the initial detail");
+    valid = true;
+    const resumed = await f.run(["ask", "--resume-id", session, "continue", "--json"]);
+    expect(resumed.code, resumed.stderr + resumed.stdout).toBe(0);
+    expect(m.revisionPackets).toHaveLength(2);
+    const after = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    expect(after.definition.version).toBe(pending.definition.version);
+    expect(after.revision_pending).toBe(false);
+  }, 120000);
+
 });

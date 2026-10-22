@@ -11,6 +11,7 @@ assessment compares those records with the task's acceptance obligations.
 | Workspace declaration | Pinned OmniForm standard and native profile | Host proposal activation | Structural, semantic and compatibility validation |
 | Execution policy | `omos.execution/v1` | Host activation | Bounded policy fields; automatic changes cannot increase allowances |
 | Task | Pinned declaration, policy and original request | Host | Preserved acceptance obligations and contract revision |
+| Contract amendment and revision | Authenticated user update and current task | Host and independent planner | Version fence, explicit superseded IDs and preserved unaffected obligations |
 | Plan | Parent task and `omos_record_plan` | Host planner | Typed fields and preservation of parent requirements |
 | Action intent | `omos_record_action` | Host | Invocation and transcript position qualify provider call IDs; intent is not execution |
 | Evidence | `omos_record_evidence` | Host | Typed record and producing action identity |
@@ -22,14 +23,40 @@ assessment compares those records with the task's acceptance obligations.
 Operation schemas are declared in `standard/omos.json`. They describe host
 records and do not advertise executable model tools. The native host enforces
 permissions, evidence inspection and protected task transitions separately.
-Agents can propose plan refinements, but cannot remove or rewrite an existing
-obligation. Protected records cannot be written through typed record APIs.
+Agents can propose plan refinements through typed records. Changing an existing
+obligation requires the separate host revision process below. Protected records
+cannot be written through typed record APIs.
 
 Existing tasks keep their pinned declaration and execution basis. A missing
 review policy uses the legacy eight-call, 60-second, single-attempt policy.
 Fresh workspaces explicitly record the current review defaults. A declaration
 without the newer record operations uses the legacy adapter; audit reports
 these tasks rather than rewriting their history.
+
+## User updates
+
+For model-pinned tasks, an authenticated user update increments the contract
+version and marks its requirements for revision. Before the next actor request,
+the independent planner identifies affected obligation IDs and proposes their
+replacement requirements. The host preserves every unlisted obligation and
+the protected `request_` requirements. The planner cannot supersede `coding_`
+requirements. When an authenticated update withdraws all coding work, the host
+switches the task to `general_task` and removes only its native
+`coding_validation` and `coding_summary` requirements. Continuing a task without
+an update preserves its capability and requirements.
+
+The `contract_amendment` history record retains the user text and previous
+contract. The `contract_revision` record retains the previous and current
+contracts, previous and current capabilities, superseded IDs, removed native
+requirements, planner summary, and applied amendments. The original
+request and all evidence remain available. Earlier assessments cannot accept
+the new contract version; the assessor checks retained evidence against the
+current requirements and applies authenticated user changes in order.
+
+While revision is pending, the host blocks new actor actions, review jobs, and
+publication. A rejected revision retains the update for a later continuation.
+Updates received during execution are applied at the next steering boundary;
+actions already performed remain in the evidence history.
 
 ## Retrieval and derived relationships
 

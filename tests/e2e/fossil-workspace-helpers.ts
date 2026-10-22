@@ -37,21 +37,25 @@ export function fixture() {
   return { home, cwd, env, run, fossil };
 }
 
-export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: number) => object, assess?: (packet: any) => string | { name: string; args: object } | Promise<string | { name: string; args: object }>, governance: { plan?: object; progress?: (packet: any) => object } = {}) {
+export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: number) => object, assess?: (packet: any) => string | { name: string; args: object } | Promise<string | { name: string; args: object }>, governance: { plan?: object; revise?: (packet: any) => object; progress?: (packet: any) => object } = {}) {
   let actors = 0, assessments = 0;
   const packets: any[] = [];
+  const revisionPackets: any[] = [];
   const server = Bun.serve({
     hostname: "127.0.0.1", port: 0,
     async fetch(request) {
       if (request.method !== "POST") return Response.json({ data: [] });
       const body = await request.json() as any;
       let delta: any, reason = "stop";
-      if (body.tools?.some((tool: any) => tool.function?.name === "omos_task_plan" || tool.function?.name === "omos_progress_assessment")) {
+      if (body.tools?.some((tool: any) => tool.function?.name === "omos_task_plan" || tool.function?.name === "omos_progress_assessment" || tool.function?.name === "omos_contract_revision")) {
         const planning = body.tools.some((tool: any) => tool.function?.name === "omos_task_plan");
+        const revising = body.tools.some((tool: any) => tool.function?.name === "omos_contract_revision");
         const packet = JSON.parse(body.messages.find((message: any) => message.role === "user").content);
+        if (revising) revisionPackets.push(packet);
         const decision = planning ? governance.plan ?? { capability: "general_task", summary: "Answer the original request", obligations: [], checks: [] }
+          : revising ? governance.revise?.(packet) ?? { capability: packet.context.model.basis?.capability ?? "general_task", summary: "Retain requirements with the supplied clarification", obligations: [], checks: [], superseded: [] }
           : governance.progress?.(packet) ?? { outcome: "continue_work", meaningful: false, evidence: [], remaining: packet.context.contract.obligations.map((o: any) => o.id), note: "No further useful progress observed" };
-        delta = { tool_calls: [{ index: 0, id: `governance-${actors}`, type: "function", function: { name: planning ? "omos_task_plan" : "omos_progress_assessment", arguments: JSON.stringify(decision) } }] };
+        delta = { tool_calls: [{ index: 0, id: `governance-${actors}`, type: "function", function: { name: planning ? "omos_task_plan" : revising ? "omos_contract_revision" : "omos_progress_assessment", arguments: JSON.stringify(decision) } }] };
         reason = "tool_calls";
       } else if (body.tools?.some((tool: any) => tool.function?.name === "omos_contract_assessment")) {
         assessments++;
@@ -81,7 +85,7 @@ export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: n
     provider: "local", models: { local: "fixture-model" }, permission_mode: "full-access", auto_upgrade: false, session_titles: false,
     providers: { local: { protocol: "openai-chat-completions", base_url: `http://127.0.0.1:${server.port}/v1`, auth: { type: "none" }, model_metadata: { "fixture-model": { supports_tool_use: true, context_window: 262144, max_output_tokens: 8192 } } } },
   }));
-  return { packets, counts: () => ({ actors, assessments }) };
+  return { packets, revisionPackets, counts: () => ({ actors, assessments }) };
 }
 
 export function writeMemory(content: string) {

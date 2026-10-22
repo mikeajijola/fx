@@ -1494,6 +1494,8 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     } else if (picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
                         try completion_rt.openCurrentModelPicker(app);
+                    } else if (picker_state.isBareReviewModelCommandAtCursor(&app.input_runtime.edit_state)) {
+                        try completion_rt.openCurrentReviewModelPicker(app);
                     } else if (completion_rt.hasFileQuery(app)) {
                         if ((try completion_rt.autocompleteFilePickerSelection(app, max_input_len)) == .limit_exceeded) {
                             try input_limit_feedback.report(App, app, .composer, 1);
@@ -1589,6 +1591,10 @@ pub fn Runtime(comptime App: type) type {
                     }
                     if (picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
                         try openModelBrowseCatalog(app);
+                        return;
+                    }
+                    if (picker_state.isBareReviewModelCommandAtCursor(&app.input_runtime.edit_state)) {
+                        try openReviewModelBrowseCatalog(app);
                         return;
                     }
                     if (provider_picker_rt.hasQuery(app)) {
@@ -2395,9 +2401,34 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(App, "ensureModelCache")) app.ensureModelCache();
             if (comptime @hasField(App, "skills")) app.skills.closeMenu();
             try app.model_cache.openMenu();
+            populateCrossProviderMenuItems(app);
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
             app.shell.render_requests.request(.footer);
+        }
+
+        fn openReviewModelBrowseCatalog(app: *App) !void {
+            if (comptime !@hasField(App, "model_cache")) return;
+            if (comptime @hasDecl(App, "ensureModelCache")) app.ensureModelCache();
+            if (comptime @hasField(App, "skills")) app.skills.closeMenu();
+            try app.model_cache.openMenuForTarget(.review);
+            populateCrossProviderMenuItems(app);
+            app.input_runtime.inputResetState().clearCurrent(app.alloc);
+            paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            app.shell.render_requests.request(.footer);
+        }
+
+        fn populateCrossProviderMenuItems(app: *App) void {
+            if (comptime !@hasField(App, "model_cache") or !@hasField(App, "provider_selection")) return;
+            if (!app.model_cache.menu.active or app.model_cache.menu.load_state != .ready) return;
+            for (app.provider_selection.definitions.definitions) |definition| {
+                for (definition.model_metadata) |meta| {
+                    app.model_cache.appendExtraMenuItem(meta.id, model_capabilities.resolveForApp(App, app, meta.id)) catch {};
+                }
+                if (definition.reviewer_model) |rm| {
+                    app.model_cache.appendExtraMenuItem(rm, model_capabilities.resolveForApp(App, app, rm)) catch {};
+                }
+            }
         }
 
         /// Ctrl+P opens the same catalog `/model` opens, but the composer is
@@ -2791,6 +2822,7 @@ pub fn Runtime(comptime App: type) type {
         fn submitModelMenuSelection(app: *App) !bool {
             if (comptime !@hasField(App, "model_cache")) return false;
             if (!app.model_cache.menu.active) return false;
+            const target = app.model_cache.menu.target;
             const selected = (try app.model_cache.menu.selectedModelAlloc(app.alloc)) orelse {
                 app.shell.render_requests.request(.footer);
                 return true;
@@ -2805,6 +2837,10 @@ pub fn Runtime(comptime App: type) type {
             app.model_cache.closeMenu();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            if (target == .review) {
+                try session_commands.Commands(App).handleReviewModel(app, selected);
+                return true;
+            }
             try completion_rt.beginExactModelSelection(app, selected);
             return true;
         }
@@ -2857,6 +2893,10 @@ pub fn Runtime(comptime App: type) type {
                     idx,
                 ) orelse return false;
                 const spec = app.slashRegistry().matchExact(selected) orelse return false;
+                if (spec.command.kind == .review_model) {
+                    try openReviewModelBrowseCatalog(app);
+                    return true;
+                }
                 if (spec.command.kind != .model) return false;
                 try openModelBrowseCatalog(app);
                 return true;
@@ -11323,7 +11363,7 @@ test "app_input_runtime active Ctrl-C cancels stream and arms exit window" {
     var rendered = try app.shell.prepareTranscriptSource(alloc, null);
     defer rendered.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelled") != null);
-    try std.testing.expect(std.mem.find(u8, rendered.bytes, "What can fx do differently?") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "What can omniseedos do differently?") != null);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "System:") == null);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelling") == null);
     try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
@@ -11348,7 +11388,7 @@ test "automatic compaction cancellation is silent only while compaction is activ
         try std.testing.expect(app.worker.cancel_requested);
         var rendered = try app.shell.prepareTranscriptSource(alloc, null);
         defer rendered.deinit(alloc);
-        try std.testing.expectEqual(settled, std.mem.find(u8, rendered.bytes, "What can fx do differently?") != null);
+        try std.testing.expectEqual(settled, std.mem.find(u8, rendered.bytes, "What can omniseedos do differently?") != null);
         try std.testing.expectEqualStrings("", app.notice_body.items);
     }
 }
@@ -11380,7 +11420,7 @@ test "app_input_runtime active tool Escape presents final cancellation immediate
     var rendered = try app.shell.prepareTranscriptSource(alloc, null);
     defer rendered.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelled") != null);
-    try std.testing.expect(std.mem.find(u8, rendered.bytes, "What can fx do differently?") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "What can omniseedos do differently?") != null);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "System:") == null);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelling") == null);
     try std.testing.expectEqual(@as(usize, 1), app.shell.activeToolActivityCount());
@@ -11403,7 +11443,7 @@ test "app_input_runtime second Ctrl-C after active cancellation exits without du
     defer rendered.deinit(alloc);
     try std.testing.expectEqual(
         @as(usize, 1),
-        std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+        std.mem.count(u8, rendered.bytes, "What can omniseedos do differently?"),
     );
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "System:") == null);
 }

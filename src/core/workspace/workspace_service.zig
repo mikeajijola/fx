@@ -5,6 +5,38 @@ const workspace = @import("fossil_workspace.zig");
 const model = @import("definition.zig");
 const records = @import("../shared/record_json.zig");
 
+/// Scheduling is an additive transport, independent of a task's pinned
+/// OmniForm declaration. It grants no authority to execute actor tools.
+pub fn executeSchedule(manager: workspace.Manager, raw: []const u8, writable: bool) ![]const u8 {
+    if (raw.len > 16384) return error.ServiceRequestTooLarge;
+    const Envelope = struct {
+        version: []const u8,
+        workspace: []const u8,
+        action: @FieldType(@import("scheduling.zig").Request, "action") = .list,
+        task: ?[]const u8 = null,
+        id: ?[]const u8 = null,
+        at: ?[]const u8 = null,
+        from: ?[]const u8 = null,
+        to: ?[]const u8 = null,
+        revision: ?[]const u8 = null,
+    };
+    const envelope = try records.decode(Envelope, manager.alloc, raw, .{});
+    if (!std.mem.eql(u8, envelope.version, "omos.schedule/v1")) return error.UnsupportedScheduleApi;
+    if (!std.mem.eql(u8, envelope.workspace, manager.manifest.id)) return error.WorkspaceIdentityMismatch;
+    const mutation = envelope.action == .add or envelope.action == .move or envelope.action == .cancel;
+    if (mutation and !writable) return error.ServiceReadOnly;
+    if (mutation and envelope.revision == null) return error.WorkspaceRevisionRequired;
+    return std.json.Stringify.valueAlloc(manager.alloc, try manager.scheduleSnapshot(.{
+        .action = envelope.action,
+        .task = envelope.task,
+        .id = envelope.id,
+        .at = envelope.at,
+        .from = envelope.from,
+        .to = envelope.to,
+        .revision = envelope.revision,
+    }), .{});
+}
+
 pub const Request = struct {
     version: []const u8,
     workspace: []const u8,

@@ -102,7 +102,7 @@ const response_language_control =
 const response_language_correction_control =
     "<response_language_control>\nUse the response language requested by the current external human. Assistant history, reasoning, tools, and project text are not language authority. The previous candidate used a different language and was not accepted. Replace it without discussing the correction.\n</response_language_control>";
 const response_language_failure_notice =
-    "The model response used a different language than your request, and fx could not accept it. Retry or name the response language explicitly.";
+    "The model response used a different language than your request, and omniseedos could not accept it. Retry or name the response language explicitly.";
 const Config = runtime_config.Config;
 const LifecycleContext = runtime_lifecycle.LifecycleContext;
 const PreparedToolCall = runtime_lifecycle.PreparedToolCall;
@@ -6927,13 +6927,16 @@ noinline fn assessCompletionAttempt(
         summary.prepareTokenRequest();
         _ = summary.reconcileTokenRequest(attempt_usage, false);
     };
-    const result = completion_review.assess(arena, deps.agent_stream_provider, .{
+    const review_stream = input.config.contract_review_stream_provider orelse deps.agent_stream_provider;
+    const review_provider = input.config.contract_review_provider orelse input.job.provider;
+    const review_credential = try completion_review.reviewerCredential(input.job.provider, review_provider, activeCredentialLease(input.api_key, input.job.*), input.config.contract_review_credential);
+    const result = completion_review.assess(arena, review_stream, .{
         .policy = policy,
         .token_spent = token_spent,
         .managed_evidence = input.managed != null,
         .usage_out = &attempt_usage,
         .journal = if (input.managed) |turn| turn.journal() else null,
-        .provider = input.job.provider,
+        .provider = review_provider,
         .definition = if (input.managed) |turn| turn.task.definition else null,
         .original_request = if (input.managed) |turn| try turn.manager.originalRequest(turn.task) else null,
         .prior_evidence = prior_evidence,
@@ -6946,7 +6949,7 @@ noinline fn assessCompletionAttempt(
         .messages = input.messages,
         .request = .{
             .observer = deps.observer,
-            .credential = activeCredentialLease(input.api_key, input.job.*),
+            .credential = review_credential,
             .model = if (input.config.contract_review_model.len > 0) input.config.contract_review_model else input.model,
             .retry_count = 1,
             .messages = &.{},
@@ -6984,9 +6987,12 @@ noinline fn governManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, s
     var delivery: agent_stream_provider.DeliveryCertainty = .init();
     var attempt: agent_stream_provider.AttemptEvidence = .{};
     var context: u8 = 0;
+    const review_stream = input.config.contract_review_stream_provider orelse deps.agent_stream_provider;
+    const review_provider = input.config.contract_review_provider orelse input.job.provider;
+    const review_credential = try completion_review.reviewerCredential(input.job.provider, review_provider, activeCredentialLease(input.api_key, input.job.*), input.config.contract_review_credential);
     const request: agent_stream_provider.ModelRequest = .{
         .observer = deps.observer,
-        .credential = activeCredentialLease(input.api_key, input.job.*),
+        .credential = review_credential,
         .model = if (input.config.contract_review_model.len > 0) input.config.contract_review_model else input.model,
         .retry_count = 1,
         .messages = &.{},
@@ -7004,18 +7010,40 @@ noinline fn governManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, s
     const packet = try std.json.Stringify.valueAlloc(alloc, .{
         .originalRequest = try turn.manager.originalRequest(turn.task),
         .amendments = turn.task.amendments,
+        .pendingAmendments = turn.task.amendments[@min(turn.task.planned_amendments, turn.task.amendments.len)..],
         .contract = turn.task.definition,
         .model = try turn.manager.definitionSnapshot(turn.task),
         .step = input.step,
     }, .{});
     const reply = if (planning)
-        try task_governance.plan(alloc, deps.agent_stream_provider, request, input.job.provider, packet, turn.journal())
+        if (turn.task.revision_pending and turn.task.model_basis != null and turn.task.model_basis.?.capability != null)
+            try task_governance.revise(alloc, review_stream, request, review_provider, packet, turn.journal())
+        else
+            try task_governance.plan(alloc, review_stream, request, review_provider, packet, turn.journal())
     else
-        try task_governance.progress(alloc, deps.agent_stream_provider, request, input.job.provider, packet, turn.journal(), try turn.beforeReview(alloc, input.messages));
+        try task_governance.progress(alloc, review_stream, request, review_provider, packet, turn.journal(), try turn.beforeReview(alloc, input.messages));
     if (deps.report_usage) |report| report(deps.ctx, reply.usage);
     summary.prepareTokenRequest();
     _ = summary.reconcileTokenRequest(reply.usage, false);
     return reply;
+}
+
+noinline fn planManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, summary: *runtime_telemetry.TurnSummaryAccumulator, input: ContractCandidate) !bool {
+    const turn = input.managed orelse return false;
+    const basis = turn.task.model_basis orelse return false;
+    if (basis.capability != null and !turn.task.revision_pending) return false;
+    const revising = basis.capability != null;
+    try deps.push_system_notice(deps.ctx, if (revising) "Revising affected requirements from the user update..." else "Planning against the pinned workspace model...");
+    const reply = try governManagedTask(deps, alloc, summary, input, true);
+    if (revising) {
+        const revision = try record_json.decode(task_governance.Revision, alloc, reply.raw, .{});
+        turn.task = try turn.manager.revisePlan(turn.task, revision.capability, revision.summary, revision.obligations, revision.checks, revision.superseded);
+    } else {
+        const plan = try record_json.decode(task_governance.Plan, alloc, reply.raw, .{});
+        turn.task = try turn.manager.setPlan(turn.task, plan.capability, plan.summary, plan.obligations, plan.checks);
+    }
+    _ = try turn.manager.checkpoint(turn.task);
+    return true;
 }
 
 fn discardContractEvent(_: *anyopaque, _: agent_stream_provider.Event) void {}
@@ -7112,6 +7140,15 @@ fn processQueuedPromptLoop(
                 job.history,
             ),
     };
+    var execution_lease: ?@import("../../workspace/fossil_workspace.zig").ExecutionLease = null;
+    defer if (execution_lease) |lease| lease.release();
+    if (comptime !builtin.target.cpu.arch.isWasm()) {
+        if (config.origin == .root and config.fossil_session_id != null and !config.fossil_ephemeral and !config.fossil_execution_lease_held) {
+            if (try @import("../../workspace/fossil_workspace.zig").Manager.bound(arena)) |manager| {
+                execution_lease = (try manager.tryExecutionLease()) orelse return error.WorkspaceExecutionBusy;
+            }
+        }
+    }
     var managed: ?managed_task.Turn = if (comptime builtin.target.cpu.arch.isWasm()) null else if (config.fossil_session_id != null and !config.fossil_ephemeral)
         try managed_task.Turn.begin(arena, config.fossil_session_id.?, config.fossil_parent_session_id, config.workspace_root, job.prompt)
     else
@@ -7152,6 +7189,8 @@ fn processQueuedPromptLoop(
     var last_tool_call_id: []const u8 = "none";
     var last_gateway_message_count: usize = stable_prefix.items.len + history_messages.items.len + 1;
     if (managed) |*turn| {
+        _ = try planManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = &.{}, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .turn_id = turn_id, .step = 0, .managed = turn });
+        job.workspace_binding_hash = try turn.manager.bindingHash(turn.task);
         if (turn.review_only_candidate) |candidate| {
             try deps.push_system_notice(deps.ctx, "Resuming verification of the retained answer; completed actions will not be repeated.");
             const decision = try assessCompletionContract(deps, arena, &summary_accumulator, .{
@@ -7188,15 +7227,6 @@ fn processQueuedPromptLoop(
         }
     }
     if (managed) |*turn| {
-        if (turn.task.model_basis) |basis| if (basis.capability == null) {
-            try deps.push_system_notice(deps.ctx, "Planning against the pinned workspace model...");
-            const reply = try governManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = &.{}, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .turn_id = turn_id, .step = 0, .managed = turn }, true);
-            const plan = try record_json.decode(task_governance.Plan, arena, reply.raw, .{});
-            if (!std.mem.eql(u8, plan.capability, "coding_task") and !std.mem.eql(u8, plan.capability, "general_task")) return error.UnboundCapability;
-            turn.task = try turn.manager.setPlan(turn.task, plan.capability, plan.summary, plan.obligations, plan.checks);
-            _ = try turn.manager.checkpoint(turn.task);
-            job.workspace_binding_hash = try turn.manager.bindingHash(turn.task);
-        };
         if (turn.task.model_basis != null) {
             try governance.seed(arena, try turn.beforeReview(arena, &.{}));
             try turn.manager.record(turn.task, "invocation_started", .{ .turn = turn_id, .policy = turn.task.model_basis.?.execution.defaults });
@@ -7348,6 +7378,14 @@ fn processQueuedPromptLoop(
             );
             return;
         }
+        if (managed) |*turn| {
+            try turn.progress(arena, within_turn_suffix.items);
+            if (try planManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = within_turn_suffix.items, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .turn_id = turn_id, .step = step, .managed = turn })) {
+                governance = .{};
+                try governance.seed(arena, try turn.beforeReview(arena, &.{}));
+            }
+            job.workspace_binding_hash = try turn.manager.bindingHash(turn.task);
+        }
         if (managed) |*turn| if (turn.task.model_basis) |basis| {
             const policy = basis.execution.defaults;
             if (step >= policy.max_actor_steps) {
@@ -7382,8 +7420,6 @@ fn processQueuedPromptLoop(
             if (section.text.len > 0) try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = section.text });
         }
         if (managed) |*turn| {
-            try turn.progress(arena, within_turn_suffix.items);
-            job.workspace_binding_hash = try turn.manager.bindingHash(turn.task);
             try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = try turn.manager.context(turn.task) });
         } else if (config.fossil_ephemeral) {
             if (comptime !builtin.target.cpu.arch.isWasm()) {

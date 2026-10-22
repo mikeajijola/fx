@@ -353,7 +353,7 @@ fn confirmLines(p: Projection, r: menu.Row, width: u16, out: *Confirm) []const C
     const q = switch (c) {
         .remove => std.mem.print(&out.question, "Remove {s} from {s}?", .{ name, p.fileOf(r) }),
         .approve => std.mem.print(&out.question, "Approve {s} for this project? It {s}:", .{ name, if (r.status.transport == .stdio) "runs" else "connects to" }),
-        .reject => std.mem.print(&out.question, "Reject {s}? fx won't start it in this project.", .{name}),
+        .reject => std.mem.print(&out.question, "Reject {s}? omniseedos won't start it in this project.", .{name}),
         .login, .logout => std.mem.print(&out.question, "{s} {s}?", .{ c.label(), name }),
     } catch "Are you sure?";
     out.lines[n] = .{ .text = q, .style = .question };
@@ -439,7 +439,7 @@ fn questionHints(p: Projection, buf: *HintBuf) []const []const u8 {
             std.mem.print(&buf.text[0], "Remove {s} and its login from {s}?     enter yes     esc no", .{ name, p.fileOf(r) })
         else
             std.mem.print(&buf.text[0], "Remove {s} from {s}?     enter yes     esc no", .{ name, p.fileOf(r) }),
-        else => std.mem.print(&buf.text[0], "Reject {s}? fx won't start it in this project.     enter yes     esc no", .{name}),
+        else => std.mem.print(&buf.text[0], "Reject {s}? omniseedos won't start it in this project.     enter yes     esc no", .{name}),
     } catch "enter yes     esc no";
     const short = std.mem.print(&buf.text[1], "{s} {s}?  enter yes  esc no", .{ c.label(), name }) catch "enter yes  esc no";
     buf.variants = .{ long, short, "enter yes  esc no" };

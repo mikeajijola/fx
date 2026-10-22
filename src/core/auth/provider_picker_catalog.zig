@@ -75,7 +75,7 @@ pub fn keySourceSlug(source: KeySource) []const u8 {
 pub fn keySourceAnnotation(source: KeySource, current: bool) []const u8 {
     return switch (source) {
         .env => if (current) "AI_GATEWAY_API_KEY · current" else "AI_GATEWAY_API_KEY",
-        .saved => if (current) "saved by fx · current" else "saved by fx",
+        .saved => if (current) "saved by omniseedos · current" else "saved by omniseedos",
         .new => "paste a key",
     };
 }

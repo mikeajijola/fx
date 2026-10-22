@@ -644,6 +644,7 @@ pub fn Runtime(comptime App: type) type {
         ) !command_admission.PermissionOutcome {
             var ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
             applyCredentialLease(app, &ctx, review_turn.credential, gateway_retry_count, gateway_chat_url);
+            try applyCrossProviderReviewer(app, arena, &ctx);
             ctx.permission_review_turn = review_turn;
             ctx.mcp_review_schema_json = mcp_review_schema_json;
             const admission = ctx.admissionInputWithLiveAuthority(live_authority);
@@ -700,6 +701,7 @@ pub fn Runtime(comptime App: type) type {
                 advertised_dynamic_tool_names,
             );
             applyCredentialLease(app, &ctx, review_turn.credential, gateway_retry_count, gateway_chat_url);
+            try applyCrossProviderReviewer(app, arena, &ctx);
             ctx.permission_review_turn = review_turn;
             const admission = ctx.admissionInputWithLiveAuthority(live_authority);
             return tool_admission.requestPreparedFileMutationPermissionOutcome(
@@ -783,6 +785,39 @@ pub fn Runtime(comptime App: type) type {
             ctx.advertised_dynamic_tool_names = request.advertised_dynamic_tool_names;
             ctx.max_tool_result_bytes = request.max_tool_result_bytes;
             return tool_runtime.executeToolCallAuthorized(ctx, request);
+        }
+
+        fn applyCrossProviderReviewer(
+            app: *App,
+            arena: Allocator,
+            ctx: *tool_runtime.Context,
+        ) !void {
+            if (comptime !@hasField(App, "review_model") or !@hasDecl(App, "providerSet")) return;
+            if (app.review_model.len == 0) return;
+            const sel = completion_review.resolveSelection(
+                app.review_model,
+                ctx.provider,
+                app.providerSet().definitions,
+                ctx.model,
+            );
+            ctx.reviewer_model = sel.model;
+            if (sel.provider.eql(ctx.provider)) return;
+            if (ctx.credential_source == .host_managed) {
+                ctx.permission_reviewer_provider = app.providerSet().select(sel.provider).permission_reviewer;
+                return;
+            }
+            const credential = (try auth_runtime.prepareCredential(
+                arena,
+                ctx.oauth_transport,
+                ctx.secret_store,
+                sel.provider,
+                null,
+            )) orelse return error.ReviewerCredentialUnavailable;
+            ctx.permission_reviewer_provider = app.providerSet().select(sel.provider).permission_reviewer;
+            ctx.api_key = credential.token;
+            ctx.credential_source = credential.source;
+            ctx.account_id = credential.accountId();
+            ctx.gateway_team = credential.gatewayTeam();
         }
 
         fn applyCredentialLease(
@@ -1062,7 +1097,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(App, "providerSet")) deps.agent_stream_provider = app.providerSet().select(job.provider).agent_stream_or_unavailable();
             deps.compaction_failure = failure_provenance;
             const semantic_presentation = app_callbacks.Bindings(App).semanticPresentationSink(app);
-            const config = buildQueuedPromptConfig(
+            var config = buildQueuedPromptConfig(
                 app,
                 job,
                 .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
@@ -1072,6 +1107,36 @@ pub fn Runtime(comptime App: type) type {
                 &tool_projection,
                 session_child_capability,
             );
+            var cross_review_credential: ?credentials.Credential = null;
+            defer if (cross_review_credential) |*cred| cred.deinit(std.heap.c_allocator);
+            if (comptime @hasField(App, "review_model") and @hasDecl(App, "providerSet")) {
+                const review_sel = completion_review.resolveSelection(
+                    app.review_model,
+                    job.provider,
+                    app.providerSet().definitions,
+                    job.model,
+                );
+                config.contract_review_model = review_sel.model;
+                config.contract_review_provider = review_sel.provider;
+                config.contract_review_stream_provider = app.providerSet().select(review_sel.provider).agent_stream_or_unavailable();
+                if (!review_sel.provider.eql(job.provider)) {
+                    cross_review_credential = auth_runtime.prepareCredential(
+                        std.heap.c_allocator,
+                        app.auth.oauthTransport(),
+                        if (comptime @hasDecl(@TypeOf(app.auth), "secretStore")) app.auth.secretStore() else host.unavailable_secret_store,
+                        review_sel.provider,
+                        null,
+                    ) catch null;
+                    if (cross_review_credential) |cred| {
+                        config.contract_review_credential = .{ .direct = .{
+                            .secret_bytes = cred.token,
+                            .source = cred.source,
+                            .account_id = cred.accountId(),
+                            .tenant_context = cred.gatewayTeam(),
+                        } };
+                    }
+                }
+            }
             const process_result = agent_runtime.processAgentPrompt(&app.session.agent, &deps, semantic_presentation, lifecycleContext(app), config, job);
             try process_result;
         }
@@ -1286,9 +1351,17 @@ pub fn Runtime(comptime App: type) type {
                 .fossil_ephemeral = completion_review.enabled() and app.session_persistence.writable == null,
 
                 .contract_review_model = if (comptime @hasField(App, "review_model") and @hasDecl(App, "providerSet"))
-                    completion_review.selectModel(app.review_model, job.provider, app.providerSet().definitions, job.model)
+                    completion_review.resolveSelection(app.review_model, job.provider, app.providerSet().definitions, job.model).model
                 else
                     job.model,
+                .contract_review_provider = if (comptime @hasField(App, "review_model") and @hasDecl(App, "providerSet"))
+                    completion_review.resolveSelection(app.review_model, job.provider, app.providerSet().definitions, job.model).provider
+                else
+                    job.provider,
+                .contract_review_stream_provider = if (comptime @hasField(App, "review_model") and @hasDecl(App, "providerSet"))
+                    app.providerSet().select(completion_review.resolveSelection(app.review_model, job.provider, app.providerSet().definitions, job.model).provider).agent_stream_or_unavailable()
+                else
+                    null,
                 .fast_mode = job.agent_settings.fast_mode,
                 .ultrafast_mode = job.agent_settings.ultrafast_mode,
                 .effort = job.agent_settings.effort,

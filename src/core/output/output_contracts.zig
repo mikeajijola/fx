@@ -3802,6 +3802,23 @@ pub const SlackSnapshot = struct {
 };
 
 /// Text and JSON project the same verified workspace snapshot.
+pub fn renderSchedules(alloc: std.mem.Allocator, snapshot: @import("../workspace/scheduling.zig").Snapshot, format: OutputFormat) ![]u8 {
+    if (format == .json) return std.json.Stringify.valueAlloc(alloc, snapshot, .{});
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.print("Work contract calendar: {s}\nRevision: {s}\n", .{ snapshot.workspace, snapshot.revision });
+    if (snapshot.schedules.len == 0) try out.writer.writeAll("No scheduled contracts.\n");
+    for (snapshot.schedules) |entry| {
+        const seconds: u64 = @intCast(@divFloor(@max(0, entry.at_ms), 1000));
+        const epoch: std.time.epoch.EpochSeconds = .{ .secs = seconds };
+        const date = epoch.getEpochDay().calculateYearDay().calculateMonthDay();
+        const time = epoch.getDaySeconds();
+        try out.writer.print("{s}  {s}  {d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z\n  Task: {s} (contract v{d})\n  {s}\n", .{ entry.id, @tagName(entry.state), epoch.getEpochDay().calculateYearDay().year, @backingInt(date.month), date.day_index + 1, time.getHoursIntoDay(), time.getMinutesIntoHour(), time.getSecondsIntoMinute(), entry.task, entry.contract_version, entry.objective });
+        if (entry.reason.len > 0) try out.writer.print("  {s}\n", .{entry.reason});
+    }
+    return out.toOwnedSlice();
+}
+
 pub fn renderFossilWorkspace(alloc: std.mem.Allocator, snapshot: @import("../workspace/fossil_workspace.zig").Snapshot, format: OutputFormat) ![]u8 {
     if (format == .json) return std.json.Stringify.valueAlloc(alloc, snapshot, .{});
     var out: std.Io.Writer.Allocating = .init(alloc);

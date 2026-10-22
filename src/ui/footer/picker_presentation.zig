@@ -347,7 +347,7 @@ fn prioritizedRowIndex(
     return source_row_count -| 1;
 }
 
-const onboarding_note = "   ⚠︎ Note: fx is experimental and defaults to auto mode.";
+const onboarding_note = "   ⚠︎ Note: omniseedos is experimental and defaults to auto mode.";
 const onboarding_note_link = onboarding_note ++ " \x1b]8;id=fx-onboarding;https://fx.sh/docs/stability\x1b\\\x1b[4mLearn more\x1b[24m\x1b]8;;\x1b\\";
 
 fn onboardingProjectedRowIndex(view: auth_runtime.PickerView, row_index: u16, row_count: u16) u16 {
@@ -404,9 +404,9 @@ fn composeOnboardingPickerRow(
 
     try row.appendSlice(alloc, ui_render.hint_style);
     const label = switch (source_row_index) {
-        0 => "   Welcome to fx",
+        0 => "   Welcome to omniseedos",
         1 => "",
-        2 => "   fx can access AI models with an account, subscription, or API key.",
+        2 => "   omniseedos can access AI models with an account, subscription, or API key.",
         3 => "   Choose a sign-in option below, or add your own API key.",
         4 => "",
         5 => "   You can change this anytime with /setup.",
@@ -2176,10 +2176,10 @@ test "auth onboarding composes the welcome copy and setup choices" {
         try screen.append(alloc, '\n');
     }
 
-    try std.testing.expect(std.mem.find(u8, screen.items, "Welcome to fx") != null);
-    try std.testing.expect(std.mem.find(u8, screen.items, "fx can access AI models with an account, subscription, or API key") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Welcome to omniseedos") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "omniseedos can access AI models with an account, subscription, or API key") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "You can change this anytime with /setup.") != null);
-    try std.testing.expect(std.mem.find(u8, screen.items, "⚠︎ Note: fx is experimental and defaults to auto mode. \x1b]8;id=fx-onboarding;https://fx.sh/docs/stability\x1b\\\x1b[4mLearn more\x1b[24m\x1b]8;;\x1b\\") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "⚠︎ Note: omniseedos is experimental and defaults to auto mode. \x1b]8;id=fx-onboarding;https://fx.sh/docs/stability\x1b\\\x1b[4mLearn more\x1b[24m\x1b]8;;\x1b\\") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Learn more: https://") == null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with Vercel") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Add an API key") != null);
@@ -2187,7 +2187,7 @@ test "auth onboarding composes the welcome copy and setup choices" {
 
     var body_row = try composeAuthPickerRow(alloc, view, 2, authPickerRowCount(view), 100);
     defer body_row.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, body_row.items, "fx can access AI models") != null);
+    try std.testing.expect(std.mem.find(u8, body_row.items, "omniseedos can access AI models") != null);
 
     var spacer_row = try composeAuthPickerRow(alloc, view, 6, authPickerRowCount(view), 100);
     defer spacer_row.deinit(alloc);
