@@ -4565,7 +4565,7 @@ test.skipIf(!tmuxAvailable())(
 
       expect(paneExitMatches(contender.paneStatus(), 1)).toBe(true);
       expect(readFileSync(contenderStderrPath, "utf8")).toBe(
-        "fx: another fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
+        "fx: another omniseedos process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
       );
       expect(owner.isPaneAlive()).toBe(true);
       const contenderScrollback = await contender.captureFullScrollback();
@@ -4688,7 +4688,7 @@ test.skipIf(!tmuxAvailable())(
       await contender.sendKeys("Enter");
       await contender.waitForPane(
         (pane) => stripAnsi(pane).includes(
-          "This session is open in another fx. Close it there, then press enter to retry.",
+          "This session is open in another omniseedos. Close it there, then press enter to retry.",
         ),
         1_000,
       );
@@ -4697,7 +4697,7 @@ test.skipIf(!tmuxAvailable())(
       const contendedPicker = stripAnsi(await contender.capturePane());
       expect(contendedPicker).toContain(savedTitle);
       expect(contendedPicker).toContain(
-        "This session is open in another fx. Close it there, then press enter to retry.",
+        "This session is open in another omniseedos. Close it there, then press enter to retry.",
       );
       expect(contendedPicker).not.toContain("SessionBusy");
       const contendedEntries = visibleSessionPickerEntries(
@@ -5729,7 +5729,7 @@ test.skipIf(!tmuxAvailable())(
       const version = (await runFx(["--version"])).stdout.trim();
       await active.sendHexBytes(["07"]);
 
-      const updatedNotice = `✓ fx has been updated to v${version} (notes)`;
+      const updatedNotice = `✓ omniseedos has been updated to v${version} (notes)`;
       await active.waitForText(updatedNotice, TIMEOUT);
       await active.waitForComposer(TIMEOUT);
       const postUpgradeTrace = readFileSync(tracePath, "utf8");
@@ -6751,7 +6751,7 @@ test.skipIf(!tmuxAvailable())(
       const currentPicker = stripAnsi(await active.capturePane());
       expect(currentPicker).toContain("Sessions 1");
       expect(currentPicker).toContain("[Current workspace]");
-      expect(currentPicker).toContain("𝒇x");
+      expect(currentPicker).toContain("omniseedos");
       expect(currentPicker).toContain("Save the workspace A transcript.");
       expect(currentPicker).not.toContain("Save the workspace B transcript.");
 
@@ -7305,7 +7305,7 @@ test.skipIf(!tmuxAvailable())(
         height: 40,
       });
       await active.waitForComposer(TIMEOUT);
-      await active.waitForText("What can fx do differently?", TIMEOUT);
+      await active.waitForText("What can omniseedos do differently?", TIMEOUT);
       const resumedGrid = await active.capturePaneGrid();
       const footer = findFooterBlocks(resumedGrid).at(-1);
       const cancelledRow = resumedGrid.findIndex((row) => row.includes("■ Cancelled"));
@@ -7585,13 +7585,13 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       const resumed = stripAnsi(await waitForScrollback(
         active,
-        "What can fx do differently?",
+        "What can omniseedos do differently?",
         timeout,
       ));
       const cancelledIndex = resumed.indexOf("Cancelled");
       expect(cancelledIndex).toBeGreaterThanOrEqual(0);
       expect(resumed).toContain("■ Cancelled");
-      expect(countOccurrences(resumed, "What can fx do differently?")).toBe(1);
+      expect(countOccurrences(resumed, "What can omniseedos do differently?")).toBe(1);
       expect(resumed).not.toContain("system: cancelled");
       expect(resumed).not.toContain("Cancelling");
       expect(resumed).not.toContain("Interrupted by user after completing");
@@ -8018,7 +8018,7 @@ test.skipIf(!tmuxAvailable())("remembered continuation restores the selected con
     other = await open(["--continue"], "busy");
     await other.waitForPane(() => other!.paneStatus().dead, TIMEOUT);
     expect(other.paneStatus().status).toBe(1);
-    expect(readFileSync(join(root, "busy.stderr"), "utf8")).toContain("another fx process");
+    expect(readFileSync(join(root, "busy.stderr"), "utf8")).toContain("another omniseedos process");
     await other.kill(); other = null;
     await active.sendText("/resume");
     await active.waitForText("enter resume", TIMEOUT);

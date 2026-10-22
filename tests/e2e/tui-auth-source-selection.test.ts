@@ -1340,7 +1340,7 @@ for (const provider of ["codex", "grok"] as const) {
         await Bun.sleep(20);
       }
       await session.sendKeys("C-c");
-      await session.waitForText("What can fx do differently?", TIMEOUT);
+      await session.waitForText("What can omniseedos do differently?", TIMEOUT);
       release();
       await openProviderPicker(session);
       await session.sendKeys("Down");
@@ -1542,7 +1542,7 @@ tmuxTest("provider recovery refuses active logout before deleting a busy subscri
   expect(outcome).toContain("Sign out is unavailable until active and queued work finishes.");
   expect(existsSync(authPath)).toBe(true);
   await session.sendKeys("C-c");
-  await session.waitForText("What can fx do differently?", TIMEOUT);
+  await session.waitForText("What can omniseedos do differently?", TIMEOUT);
   expect(readFileSync(stderrPath, "utf8")).toBe("");
 }, 60_000);
 
@@ -1570,7 +1570,7 @@ tmuxTest("provider recovery validates a Gateway team after a cancelled turn", as
       await Bun.sleep(20);
     }
     await session.sendKeys("C-c");
-    await session.waitForText("What can fx do differently?", TIMEOUT);
+    await session.waitForText("What can omniseedos do differently?", TIMEOUT);
     release();
     await selectFxLoginCredential(session);
     expect(gateway.modelRequests.some((request) =>
@@ -1818,7 +1818,7 @@ for (const scenario of [
 
       await session.sendKeys("C-u");
       await session.sendInterruptEscapePair(TIMEOUT);
-      await session.waitForText("What can fx do differently?", TIMEOUT);
+      await session.waitForText("What can omniseedos do differently?", TIMEOUT);
       await session.sendText(scenario.command.trim());
       await session.waitForPane(
         (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
@@ -2639,7 +2639,7 @@ tmuxTest(
     const cancelStarted = Date.now();
     await session.sendKeys("C-c");
     const cancelledPane = await session.waitForText(
-      "What can fx do differently?",
+      "What can omniseedos do differently?",
       TIMEOUT,
     );
     await session.waitForComposer(TIMEOUT);
@@ -2870,7 +2870,7 @@ tmuxTest(
       (pane) => pane.includes("env · AI_GATEWAY_API_KEY · current") && pane.includes("new · paste a key"),
       TIMEOUT,
     );
-    expect(keySources).not.toContain("saved · saved by fx");
+    expect(keySources).not.toContain("saved · saved by omniseedos");
 
     await session.sendKeys("Down");
     await session.sendKeys("Right");
@@ -2906,7 +2906,7 @@ tmuxTest(
       AI_GATEWAY_API_KEY: undefined,
       FX_SKIP_ONBOARDING: "0",
     });
-    await session.waitForText("Welcome to fx", TIMEOUT);
+    await session.waitForText("Welcome to omniseedos", TIMEOUT);
     await session.sendKeys("Enter");
     await session.waitForText("Vercel team · Search:", TIMEOUT);
     await session.sendKeys("Escape");
@@ -2915,7 +2915,7 @@ tmuxTest(
       TIMEOUT,
     );
     expect(setup).toMatch(/^› Vercel team\s+choose a team$/m);
-    expect(setup).not.toContain("Welcome to fx");
+    expect(setup).not.toContain("Welcome to omniseedos");
     expect(setup).not.toContain("sign in to manage");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
@@ -3231,7 +3231,7 @@ profileStoredKeyTmuxTest(
     await session.waitForText("Saved the API key to profile file and made it active", TIMEOUT);
     await session.sendText("/provider vercel api-key");
     const keyColumn = await session.waitForPane(
-      (pane) => pane.includes("saved · saved by fx · current"),
+      (pane) => pane.includes("saved · saved by omniseedos · current"),
       TIMEOUT,
     );
     expect(keyColumn).toContain("env · AI_GATEWAY_API_KEY");
@@ -6333,7 +6333,7 @@ tmuxTest(
         pane.includes("Image 1"),
       TIMEOUT,
     );
-    expect(blocked).not.toContain("Welcome to fx");
+    expect(blocked).not.toContain("Welcome to omniseedos");
     expect(blocked).not.toContain("Switch credential");
     expect(gateway.requests).toHaveLength(0);
     expect(session.isAlive()).toBe(true);
@@ -6550,7 +6550,7 @@ tmuxTest(
     const onboarding = await session.waitForPane(
       (pane) =>
         pane.includes(prompt) &&
-        pane.includes("Welcome to fx") &&
+        pane.includes("Welcome to omniseedos") &&
         pane.includes("Sign in with Vercel") &&
         pane.includes("Add an API key") &&
         pane.includes("esc to set up later"),

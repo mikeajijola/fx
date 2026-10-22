@@ -1128,7 +1128,7 @@ test.skipIf(!tmuxAvailable())(
       expect(result).toContain("Start a new terminal");
     }
     // The transcript shows why the terminal is gone.
-    expect(await resumed.captureFullScrollback()).toContain("ended when fx exited");
+    expect(await resumed.captureFullScrollback()).toContain("ended when omniseedos exited");
     expect(terminalRecord(fixture.home, sessionId).lifecycle).toBe("lost");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
@@ -1205,7 +1205,7 @@ test("TTY runs in the requested cwd on a real PTY and reports the exact exit", a
 }, TIMEOUT);
 
 test.skipIf(!tmuxAvailable())(
-  "another fx process can neither drive nor end a running owner's terminal",
+  "another omniseedos process can neither drive nor end a running owner's terminal",
   async () => {
     const fixture = createFixture("fx-shell-tty-owner-");
     let ownerTerminal = "";

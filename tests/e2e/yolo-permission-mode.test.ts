@@ -21,7 +21,7 @@ import {
 } from "./tmux-helpers";
 import { expectPermissionModeContext } from "./permission-mode-context";
 
-const WARNING = "Full access enabled: fx permission checks disabled";
+const WARNING = "Full access enabled: omniseedos permission checks disabled";
 const COMPACT_WARNING = "Full access";
 const QUIT_HINT = "press ctrl+c again to exit";
 const COMMAND_APPROVAL_PROMPT = "Would you like to run the following command?";
