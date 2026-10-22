@@ -6849,6 +6849,29 @@ noinline fn assessCompletionContract(
     summary: *runtime_telemetry.TurnSummaryAccumulator,
     input: ContractCandidate,
 ) !work_contract.Decision {
+    if (input.managed) |turn| {
+        const revision_id = try turn.manager.checkpoint(turn.task);
+        if (try turn.manager.uiChanged(turn.task.base_revision, revision_id) and !try turn.manager.hasUiReceipt(turn.task, revision_id)) {
+            try turn.manager.record(turn.task, "review_candidate", .{ .at_ms = io_mod.milliTimestamp(), .text = input.candidate });
+            const source_revision = try turn.manager.checkpoint(turn.task);
+            const ui = input.config.ui_host orelse {
+                try turn.manager.record(turn.task, "review_failure", .{ .at_ms = io_mod.milliTimestamp(), .reason = "Workspace UI source requires validation by its compatible external UI host.", .candidate_retained = true });
+                _ = try turn.manager.checkpoint(turn.task);
+                return error.ContractReviewPending;
+            };
+            const raw = ui.validateSource(arena, source_revision) catch {
+                try turn.manager.record(turn.task, "review_failure", .{ .at_ms = io_mod.milliTimestamp(), .reason = "Workspace UI validation is pending; source and candidate retained.", .candidate_retained = true });
+                _ = try turn.manager.checkpoint(turn.task);
+                return error.ContractReviewPending;
+            };
+            const receipt = try std.json.parseFromSliceLeaky(std.json.Value, arena, raw, .{});
+            if (!try turn.manager.validUiReceipt(try turn.manager.currentRevision(turn.task), receipt)) {
+                try turn.manager.record(turn.task, "ui_source_validation", receipt);
+                return .{ .disposition = .continue_work, .feedback = "The current workspace UI source did not pass host compilation. Inspect the retained UI validation result and repair the source before completion." };
+            }
+            try turn.manager.record(turn.task, "ui_source_validation", receipt);
+        }
+    }
     const policy = if (input.managed) |turn| if (turn.task.model_basis) |basis| basis.execution.review else @import("../../workspace/definition.zig").ReviewPolicy{} else @import("../../workspace/definition.zig").ReviewPolicy{};
     const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
     const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(policy.total_timeout_ms) });

@@ -19,7 +19,7 @@ var named_invocation = false;
 
 pub fn configureInvocation(program: []const u8) void {
     const name = std.Io.Dir.path.basename(program);
-    named_invocation = std.mem.eql(u8, name, "omos") or std.mem.eql(u8, name, "omo");
+    named_invocation = std.mem.eql(u8, name, "omos") or std.mem.eql(u8, name, "omo") or std.mem.eql(u8, name, "ui-host");
 }
 
 pub fn enabled() bool {

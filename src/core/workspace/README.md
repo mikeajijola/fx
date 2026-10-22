@@ -163,3 +163,7 @@ To inspect or restore an exported workspace, bind its verified clone with
 `omos fossil use PATH`. Profile credentials, browser sessions and opaque runtime
 checkpoints remain outside the portable repository. Migration and recovery do
 not replay completed external actions.
+
+### Workspace interface source
+
+The optional [workspace UI host](ui-host.md) stores its complete frontend under `ui/`. Native `ui-host --stdio` owns saved turns, approval boundaries, replay and source validation. Agent edits remain on their task branch until independent review and normal Fossil publication succeed. A fresh host compilation receipt covers the exact current UI files and pinned compiler; changed source cannot publish using stale validation. Interface builds and public delivery journals remain disposable cache and operational profile state respectively.

@@ -56,6 +56,7 @@ const allowlist: AllowRule[] = [
   rule("src/ui/ask_presentation.zig", "refreshGeometry", /fixed_descriptor/, "terminal_probe", "ask stdout geometry refresh"),
   rule("src/ui/ask_presentation.zig", "writeTerminalBytes", /stdio_write/, "initialization_teardown", "ask terminal prepare and restore control"),
   rule("src/ui/render.zig", "(?:setTerminalTitleLabel|clearTerminalTitleProvider)", /stdio_(?:acquisition|write)/, "title_control", "terminal title control"),
+  rule("src/core/cli/ui_host.zig", "output", /stdio_(?:acquisition|write)/, "subprocess_protocol_transport", "governed UI host NDJSON transport"),
   rule("src/acp/jsonrpc.zig", ".+", /stdio_(?:acquisition|write)/, "acp_protocol_transport", "ACP JSON-RPC transport"),
   rule("src/core/execution/command_runner.zig", "(?:runForegroundSessionBootstrap|writeForegroundSessionReplaceFailure)", /stdio_acquisition_write/, "subprocess_protocol_transport", "foreground command bootstrap protocol"),
   rule("src/core/terminal/native_session.zig", "(?:acceptMarker|runLauncher)", /fixed_descriptor/, "subprocess_protocol_transport", "private native launcher PTY and control descriptors"),

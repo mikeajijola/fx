@@ -27,6 +27,13 @@ pub const top_level_specs = [_]TopLevelSpec{
         .summary = "Show this help",
     },
     .{
+        .kind = .ui_host,
+        .token = "ui-host",
+        .usage = "ui-host --stdio",
+        .summary = "Serve governed browser sessions over the local host protocol",
+        .details = &.{"The external host owns sessions, permissions, contracts and publication. Editable workspace UI receives only typed capabilities."},
+    },
+    .{
         .kind = .ask,
         .token = "ask",
         .usage = "ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--sessions-v2] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>",
@@ -352,6 +359,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .fossil, .usage = "fossil" },
         .{ .kind = .upgrade, .usage = "upgrade", .summary = "Upgrade fx on the selected release channel" },
         .{ .kind = .acp, .usage = "acp" },
+        .{ .kind = .ui_host, .usage = "ui-host --stdio" },
         .{ .kind = .help, .usage = "help" },
     } },
 };
