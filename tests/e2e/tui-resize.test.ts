@@ -651,7 +651,7 @@ function expectSkillsMenuGrid(
   const text = grid.join("\n");
   expect(text).toContain(`Skills ${count}`);
   expect(text).toContain("[All]");
-  expect(text).toContain("fx");
+  expect(text).toContain("omniseedos");
   expect(text).not.toContain("[Fx]");
   expect(text).toContain("Workspace");
   expect(text).toContain("Codex");

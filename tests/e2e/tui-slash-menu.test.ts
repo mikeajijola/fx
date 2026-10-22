@@ -1950,7 +1950,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
       expect(pane).toContain("[All]");
-      expect(pane).toContain("fx");
+      expect(pane).toContain("omniseedos");
       expect(pane).not.toContain("[Fx]");
       expect(pane).toContain("Workspace");
       expect(pane).toContain("Claude");
