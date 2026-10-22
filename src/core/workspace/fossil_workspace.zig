@@ -9,6 +9,7 @@ const contract = @import("../agent/runtime/work_contract.zig");
 const model = @import("definition.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const record_json = @import("../shared/record_json.zig");
+const scheduling = @import("scheduling.zig");
 
 const Allocator = std.mem.Allocator;
 const max_bytes = 8 * 1024 * 1024;
@@ -38,6 +39,8 @@ pub const Task = struct {
     definition: contract.Definition,
     request_artifact: ?[]const u8 = null,
     amendments: []const []const u8 = &.{},
+    revision_pending: bool = false,
+    planned_amendments: usize = 0,
     dependencies: []const ReadDependency = &.{},
     model_basis: ?model.Basis = null,
     review_job: ?[]const u8 = null,
@@ -289,6 +292,15 @@ const Lease = struct {
     }
 };
 
+/// Kernel-owned actor exclusion; released automatically after a process crash.
+pub const ExecutionLease = struct {
+    file: std.Io.File,
+    pub fn release(self: ExecutionLease) void {
+        self.file.unlock(io_mod.getIo());
+        self.file.close(io_mod.getIo());
+    }
+};
+
 fn profile(alloc: Allocator) ![]const u8 {
     return join(alloc, io_mod.getenv("HOME") orelse return error.HomeUnavailable, ".fx");
 }
@@ -321,6 +333,257 @@ pub const Manager = struct {
 
     fn checkExpectedRevision(self: Manager, branch: []const u8) !void {
         if (self.expected_revision) |expected| if (!std.mem.eql(u8, expected, try self.revision(branch))) return error.WorkspaceRevisionChanged;
+    }
+
+    pub fn tryExecutionLease(self: Manager) !?ExecutionLease {
+        if (comptime builtin.target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
+        try mkdir(self.root);
+        const path = try join(self.alloc, self.root, "actor.lock");
+        const file = try std.Io.Dir.cwd().createFile(io_mod.getIo(), path, .{ .truncate = false, .permissions = .fromMode(0o600) });
+        errdefer file.close(io_mod.getIo());
+        if (!try file.tryLock(io_mod.getIo(), .exclusive)) {
+            file.close(io_mod.getIo());
+            return null;
+        }
+        return .{ .file = file };
+    }
+
+    // A separate portable branch keeps operational scheduling commits out of
+    // the source/evidence branch being independently reviewed and published.
+    const schedule_branch = "omos-schedules";
+    const schedule_path = "schedules/state.json";
+
+    fn scheduleBranchExists(self: Manager) !bool {
+        const branches = try self.run(null, &.{ "branch", "list", "--all", "-R", self.repository });
+        var lines = std.mem.splitScalar(u8, branches, '\n');
+        while (lines.next()) |line| if (std.mem.eql(u8, std.mem.trim(u8, line, " *\t\r"), schedule_branch)) return true;
+        return false;
+    }
+
+    fn scheduleRevision(self: Manager) ![]const u8 {
+        return self.revision(if (try self.scheduleBranchExists()) schedule_branch else "trunk");
+    }
+
+    fn loadSchedules(self: Manager) !scheduling.Store {
+        if (!try self.scheduleBranchExists()) return .{ .workspace = self.manifest.id };
+        // Branch creation and its first commit are separate Fossil operations.
+        // A crash between them leaves an empty, recoverable schedule branch.
+        var present = false;
+        for (try self.inventory(schedule_branch)) |path| if (std.mem.eql(u8, path, schedule_path)) {
+            present = true;
+            break;
+        };
+        if (!present) return .{ .workspace = self.manifest.id };
+        const store = try parse(self.alloc, scheduling.Store, try self.contentAt(schedule_path, schedule_branch));
+        if (!std.mem.eql(u8, store.version, "omos.schedule/v1") or !std.mem.eql(u8, store.workspace, self.manifest.id) or store.schedules.len > 1024) return error.InvalidScheduleStore;
+        for (store.schedules, 0..) |schedule, index| {
+            if (!safeId(schedule.id) or !safeId(schedule.task) or schedule.contract_version == 0) return error.InvalidScheduleStore;
+            for (store.schedules[0..index]) |previous| if (std.mem.eql(u8, previous.id, schedule.id)) return error.InvalidScheduleStore;
+        }
+        return store;
+    }
+
+    fn saveSchedules(self: Manager, store: scheduling.Store) !void {
+        if (!try self.scheduleBranchExists()) _ = try self.run(null, &.{ "branch", "new", schedule_branch, "trunk", "--nosign", "-R", self.repository });
+        const tree = try self.checkout(schedule_branch);
+        try atomicWrite(self.alloc, try join(self.alloc, tree, schedule_path), try json(self.alloc, store));
+        _ = try self.commit(tree, "Record work contract schedule transition");
+    }
+
+    fn scheduleEvent(self: Manager, value: *scheduling.Schedule, kind: []const u8, now: i64) !void {
+        const events = try self.alloc.alloc(scheduling.Event, value.history.len + 1);
+        @memcpy(events[0..value.history.len], value.history);
+        events[value.history.len] = .{ .at_ms = now, .kind = kind, .scheduled_ms = value.at_ms, .contract_version = value.contract_version, .reason = value.reason };
+        value.history = events;
+    }
+
+    pub fn scheduleSnapshot(self: Manager, request: scheduling.Request) !scheduling.Snapshot {
+        try scheduling.validate(request);
+        const lease = try Lease.acquire(self.alloc, self.root);
+        defer lease.release();
+        const before = try self.scheduleRevision();
+        if (request.revision) |expected| if (!std.mem.eql(u8, expected, before)) return error.WorkspaceRevisionChanged;
+        var store = try self.loadSchedules();
+        const now = io_mod.milliTimestamp();
+        const mutation = request.action == .add or request.action == .move or request.action == .cancel;
+        var selected_id = request.id;
+        if (request.action == .add) {
+            const task = try self.loadTask(request.task.?);
+            if (task.state == .accepted or task.state == .publication_pending or task.state == .conflict) return error.TaskIsReadOnly;
+            if (task.parent_task_id != null) return error.CannotScheduleChildTask;
+            if (store.schedules.len >= 1024) return error.ScheduleLimitReached;
+            try scheduling.requireAvailableTask(store.schedules, task.id, null);
+            var nonce: [16]u8 = undefined;
+            io_mod.getIo().random(&nonce);
+            const schedules = try self.alloc.alloc(scheduling.Schedule, store.schedules.len + 1);
+            @memcpy(schedules[0..store.schedules.len], store.schedules);
+            var value: scheduling.Schedule = .{ .id = try hash(self.alloc, &nonce), .task = task.id, .at_ms = try scheduling.parseTimestamp(request.at.?), .contract_version = task.definition.version };
+            try self.scheduleEvent(&value, "created", now);
+            schedules[store.schedules.len] = value;
+            store.schedules = schedules;
+            selected_id = value.id;
+        } else if (request.action == .move or request.action == .cancel) {
+            const schedules = try self.alloc.dupe(scheduling.Schedule, store.schedules);
+            const value = for (schedules) |*candidate| {
+                if (std.mem.eql(u8, candidate.id, request.id.?)) break candidate;
+            } else return error.ScheduleNotFound;
+            if (value.state == .running) return error.ScheduleIsRunning;
+            if (value.state == .completed or value.state == .cancelled) return error.ScheduleIsFinal;
+            if (request.action == .move) {
+                const task = try self.loadTask(value.task);
+                if (task.state == .accepted or task.state == .publication_pending or task.state == .conflict) return error.TaskIsReadOnly;
+                try scheduling.requireAvailableTask(store.schedules, task.id, value.id);
+                value.at_ms = try scheduling.parseTimestamp(request.at.?);
+                value.contract_version = task.definition.version;
+                value.state = .scheduled;
+                value.started_ms = null;
+                value.finished_ms = null;
+                value.reason = "";
+            } else {
+                value.state = .cancelled;
+                value.finished_ms = now;
+            }
+            try self.scheduleEvent(value, if (request.action == .move) "rescheduled" else "cancelled", now);
+            store.schedules = schedules;
+        }
+        if (mutation) try self.saveSchedules(store);
+        const from = if (request.from) |raw| try scheduling.parseTimestamp(raw) else std.math.minInt(i64);
+        const to = if (request.to) |raw| try scheduling.parseTimestamp(raw) else std.math.maxInt(i64);
+        var calendar_entries: std.ArrayList(scheduling.Entry) = .empty;
+        for (store.schedules) |schedule| {
+            if (selected_id) |id| if (!std.mem.eql(u8, id, schedule.id)) continue;
+            if (schedule.at_ms < from or schedule.at_ms >= to) continue;
+            const task = try self.loadTask(schedule.task);
+            const state: scheduling.State = if (schedule.state != .cancelled and task.state == .accepted and !try self.publicationPending(task)) .completed else if (schedule.state == .scheduled and schedule.at_ms <= now) .overdue else schedule.state;
+            try calendar_entries.append(self.alloc, .{
+                .id = schedule.id,
+                .task = schedule.task,
+                .at_ms = schedule.at_ms,
+                .state = state,
+                .contract_version = task.definition.version,
+                .execution_contract_version = schedule.contract_version,
+                .objective = task.definition.objective,
+                .task_state = @tagName(task.state),
+                .started_ms = schedule.started_ms,
+                .finished_ms = schedule.finished_ms,
+                .reason = schedule.reason,
+                .history = schedule.history,
+                .definition = task.definition,
+                .amendments = task.amendments,
+                .branch = task.branch,
+            });
+        }
+        if (selected_id != null and calendar_entries.items.len == 0) return error.ScheduleNotFound;
+        sort_utils.sort(scheduling.Entry, calendar_entries.items, {}, struct {
+            fn less(_: void, a: scheduling.Entry, b: scheduling.Entry) bool {
+                return if (a.at_ms == b.at_ms) std.mem.order(u8, a.id, b.id) == .lt else a.at_ms < b.at_ms;
+            }
+        }.less);
+        return .{ .workspace = self.manifest.id, .revision = try self.scheduleRevision(), .schedules = try calendar_entries.toOwnedSlice(self.alloc) };
+    }
+
+    pub fn hasDueSchedules(self: Manager) !bool {
+        const lease = try Lease.acquire(self.alloc, self.root);
+        defer lease.release();
+        const now = io_mod.milliTimestamp();
+        for ((try self.loadSchedules()).schedules) |schedule| {
+            if (schedule.state == .scheduled and schedule.at_ms <= now) return true;
+            if (schedule.state == .running and schedule.lease_expires_ms <= now) return true;
+        }
+        return false;
+    }
+
+    pub fn claimSchedule(self: Manager, owner: []const u8) !?scheduling.Schedule {
+        if (!scheduling.validOwner(owner)) return error.InvalidScheduleOwner;
+        const lease = try Lease.acquire(self.alloc, self.root);
+        defer lease.release();
+        var store = try self.loadSchedules();
+        const values = try self.alloc.dupe(scheduling.Schedule, store.schedules);
+        const now = io_mod.milliTimestamp();
+        var changed = false;
+        var next: ?*scheduling.Schedule = null;
+        for (values) |*value| {
+            if (value.state == .running and value.lease_expires_ms <= now) {
+                const task = try self.loadTask(value.task);
+                value.state = if (task.state == .accepted and !try self.publicationPending(task)) .completed else .waiting;
+                value.reason = if (value.state == .completed) "Verified publication recovered." else "Execution was interrupted. Resume the retained task or explicitly reschedule it after checking outstanding effects.";
+                value.finished_ms = now;
+                value.owner = "";
+                value.lease_expires_ms = 0;
+                try self.scheduleEvent(value, "recovered", now);
+                changed = true;
+            }
+            if (value.state != .scheduled or value.at_ms > now) continue;
+            if (next == null or value.at_ms < next.?.at_ms) next = value;
+        }
+        if (next) |value| {
+            const task = try self.loadTask(value.task);
+            value.contract_version = task.definition.version;
+            if (task.state == .accepted) {
+                value.state = if (try self.publicationPending(task)) .waiting else .completed;
+                value.reason = if (value.state == .waiting) "Publication recovery is pending." else "The contract was already fulfilled and published.";
+                value.finished_ms = now;
+            } else if (task.state == .conflict) {
+                value.state = .waiting;
+                value.reason = "Resolve the retained workspace conflict before rescheduling.";
+            } else {
+                value.state = .running;
+                value.owner = try self.alloc.dupe(u8, owner);
+                value.generation = try std.math.add(u64, value.generation, 1);
+                value.started_ms = now;
+                value.finished_ms = null;
+                value.lease_expires_ms = now + 30_000;
+                value.reason = "";
+            }
+            try self.scheduleEvent(value, @tagName(value.state), now);
+            changed = true;
+        }
+        if (changed) {
+            store.schedules = values;
+            try self.saveSchedules(store);
+        }
+        return if (next != null and next.?.state == .running) next.?.* else null;
+    }
+
+    pub fn renewSchedule(self: Manager, previous: scheduling.Schedule) !void {
+        const lease = try Lease.acquire(self.alloc, self.root);
+        defer lease.release();
+        var store = try self.loadSchedules();
+        const values = try self.alloc.dupe(scheduling.Schedule, store.schedules);
+        for (values) |*value| {
+            if (!std.mem.eql(u8, value.id, previous.id)) continue;
+            if (!scheduling.owns(value.*, previous) or value.lease_expires_ms <= io_mod.milliTimestamp()) return error.StaleScheduleLease;
+            value.lease_expires_ms = io_mod.milliTimestamp() + 30_000;
+            store.schedules = values;
+            try self.saveSchedules(store);
+            return;
+        }
+        return error.ScheduleNotFound;
+    }
+
+    pub fn finishSchedule(self: Manager, previous: scheduling.Schedule, state: scheduling.State, reason: []const u8) !void {
+        if (state != .waiting and state != .failed and state != .completed) return error.InvalidScheduleTransition;
+        const lease = try Lease.acquire(self.alloc, self.root);
+        defer lease.release();
+        var store = try self.loadSchedules();
+        const values = try self.alloc.dupe(scheduling.Schedule, store.schedules);
+        for (values) |*value| {
+            if (!std.mem.eql(u8, value.id, previous.id)) continue;
+            if (!scheduling.owns(value.*, previous) or value.lease_expires_ms <= io_mod.milliTimestamp()) return error.StaleScheduleLease;
+            const task = try self.loadTask(value.task);
+            if (state == .completed and (task.state != .accepted or try self.publicationPending(task))) return error.WorkspaceReviewRequired;
+            value.state = state;
+            value.contract_version = task.definition.version;
+            value.reason = try text_utils.maskSecrets(self.alloc, reason);
+            value.owner = "";
+            value.lease_expires_ms = 0;
+            value.finished_ms = io_mod.milliTimestamp();
+            try self.scheduleEvent(value, @tagName(state), value.finished_ms.?);
+            store.schedules = values;
+            try self.saveSchedules(store);
+            return;
+        }
+        return error.ScheduleNotFound;
     }
 
     fn jobPath(self: Manager, id: []const u8) ![]const u8 {
@@ -356,6 +619,7 @@ pub const Manager = struct {
         defer lease.release();
         var task = try self.loadTask(previous.id);
         try self.checkExpectedRevision(task.branch);
+        if (task.revision_pending) return error.TaskContractRevisionPending;
         if (task.state == .accepted or task.state == .publication_pending or task.state == .conflict) return error.TaskIsReadOnly;
         const definition_hash = if (task.model_basis) |basis| basis.definition_hash else "legacy-contract";
         const candidate = (try self.failedReviewCandidate(task)) orelse return error.NoRetainedReviewCandidate;
@@ -483,6 +747,7 @@ pub const Manager = struct {
     fn checkReviewFence(self: Manager, task: Task) !void {
         if (self.review_fence) |fence| {
             const job = try self.loadReviewJob(task, fence.job);
+            if (task.revision_pending or job.contract_version != task.definition.version) return error.StaleWorkContract;
             if (!@import("review_job.zig").owns(job, fence, io_mod.milliTimestamp())) return error.StaleReviewLease;
         }
     }
@@ -865,9 +1130,14 @@ pub const Manager = struct {
         @memcpy(amendments[0..task.amendments.len], task.amendments);
         amendments[task.amendments.len] = text;
         task.amendments = amendments;
+        const previous_definition = task.definition;
         task.definition.version = std.math.add(u32, task.definition.version, 1) catch return error.StaleWorkContract;
+        task.revision_pending = task.model_basis != null;
+        task.review_job = null;
         const tree = try self.checkout(task.branch);
+        const amendment = try json(self.alloc, .{ .kind = "contract_amendment", .task = task.id, .contract_version = task.definition.version, .value = .{ .origin = "user", .text = text, .previous_contract = previous_definition, .revision_pending = task.revision_pending } });
         try atomicWrite(self.alloc, try join(self.alloc, tree, try self.taskPath(task.id)), try json(self.alloc, task));
+        try atomicWrite(self.alloc, try join(self.alloc, tree, try self.alloc.print("history/{s}/{s}.json", .{ task.id, try hash(self.alloc, amendment) })), amendment);
         _ = try self.commit(tree, "Record authenticated task amendment");
         try self.saveTask(task);
         return task;
@@ -917,6 +1187,7 @@ pub const Manager = struct {
         try self.checkExpectedRevision(task.branch);
         const current = try self.loadTask(task.id);
         if (current.definition.version != task.definition.version) return error.StaleWorkContract;
+        if (current.revision_pending and std.mem.eql(u8, kind, "action_intent")) return error.TaskContractRevisionPending;
         try self.checkReviewFence(current);
         if (std.mem.eql(u8, kind, "action_intent")) if (current.review_job) |id| {
             const job = try self.loadReviewJob(current, id);
@@ -1112,6 +1383,8 @@ pub const Manager = struct {
                 amendments[task.amendments.len] = try self.alloc.print("Parent work contract changed. Reassess the delegated work against this authenticated parent task context: {s}", .{try json(self.alloc, .{ .contract = parent.definition, .amendments = parent.amendments })});
                 task.amendments = amendments;
                 task.definition.version = std.math.add(u32, task.definition.version, 1) catch return error.StaleWorkContract;
+                task.revision_pending = task.model_basis != null;
+                task.review_job = null;
                 task.parent_contract_version = parent.definition.version;
             }
         }
@@ -1587,7 +1860,7 @@ pub const Manager = struct {
         while (branch_lines.next()) |raw| {
             const branch = std.mem.trim(u8, raw, " *\r\t");
             if (branch.len == 0) continue;
-            if (!std.mem.eql(u8, branch, "trunk") and !(std.mem.startsWith(u8, branch, "task/") and safeId(branch[5..])) and !(std.mem.startsWith(u8, branch, "definition/") and safeId(branch[11..]))) return error.UnexpectedWorkspaceBranch;
+            if (!std.mem.eql(u8, branch, "trunk") and !std.mem.eql(u8, branch, schedule_branch) and !(std.mem.startsWith(u8, branch, "task/") and safeId(branch[5..])) and !(std.mem.startsWith(u8, branch, "definition/") and safeId(branch[11..]))) return error.UnexpectedWorkspaceBranch;
             const listing = try self.run(null, &.{ "ls", "-r", branch, "-R", self.repository });
             var files = std.mem.splitScalar(u8, listing, '\n');
             while (files.next()) |raw_path| {
@@ -1618,6 +1891,7 @@ pub const Manager = struct {
         const lease = try Lease.acquire(self.alloc, self.root);
         defer lease.release();
         const latest = try self.loadTask(task.id);
+        if (latest.revision_pending) return error.TaskContractRevisionPending;
         try self.checkReviewFence(latest);
         if (self.review_fence == null) if (latest.review_job) |id| {
             const job = try self.loadReviewJob(latest, id);
@@ -2069,12 +2343,25 @@ pub const Manager = struct {
     }
 
     pub fn setPlan(self: Manager, previous: Task, capability: []const u8, summary: []const u8, obligations: []const contract.Obligation, checks: []const []const u8) !Task {
+        return self.applyPlan(previous, capability, summary, obligations, checks, null);
+    }
+
+    pub fn revisePlan(self: Manager, previous: Task, capability: []const u8, summary: []const u8, obligations: []const contract.Obligation, checks: []const []const u8, superseded: []const []const u8) !Task {
+        return self.applyPlan(previous, capability, summary, obligations, checks, superseded);
+    }
+
+    fn applyPlan(self: Manager, previous: Task, capability: []const u8, summary: []const u8, obligations: []const contract.Obligation, checks: []const []const u8, superseded: ?[]const []const u8) !Task {
         const lease = try Lease.acquire(self.alloc, self.root);
         defer lease.release();
         var current = try self.loadTask(previous.id);
         if (current.definition.version != previous.definition.version or current.state != .active) return error.StaleWorkContract;
         if (current.model_basis == null) return error.WorkspaceMigrationRequired;
-        if (current.model_basis.?.capability != null) return current;
+        const previous_definition = current.definition;
+        const planned_amendments = current.planned_amendments;
+        const previous_capability = current.model_basis.?.capability;
+        if (superseded != null) {
+            if (!current.revision_pending or current.amendments.len <= current.planned_amendments or previous_capability == null) return error.UnauthorizedContractRevision;
+        } else if (previous_capability != null) return current;
         const declaration_value = try self.loadDeclaration(current.model_basis.?.revision);
         var found = false;
         for (model.items(model.spec(declaration_value.value), "capabilities")) |item| found = found or std.mem.eql(u8, model.text(item, "id"), capability);
@@ -2083,30 +2370,42 @@ pub const Manager = struct {
         const operation = if (std.mem.eql(u8, capability, "coding_task")) "change_code" else "complete_task";
         try model.validateOperation(self.alloc, declaration_value, operation, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .request = try self.originalRequest(current) }), .{})).value, .input);
         if (obligations.len > 32 or summary.len > 4096 or checks.len > 32) return error.InvalidTaskPlan;
+        const capability_changed = previous_capability != null and !std.mem.eql(u8, previous_capability.?, capability);
+        const recorded_summary = if (capability_changed) try self.alloc.print("Changed capability from {s} to {s} after an authenticated user update: {s}", .{ previous_capability.?, capability, summary }) else summary;
+        if (recorded_summary.len > 4096) return error.InvalidTaskPlan;
+        const withdraws_coding = superseded != null and capability_changed and std.mem.eql(u8, previous_capability.?, "coding_task") and std.mem.eql(u8, capability, "general_task");
+        const removed_host_obligations: []const []const u8 = if (withdraws_coding) &.{ "coding_validation", "coding_summary" } else &.{};
         var all: std.ArrayList(contract.Obligation) = .empty;
-        try all.appendSlice(self.alloc, current.definition.obligations);
-        for (obligations) |obligation| {
-            if (std.mem.startsWith(u8, obligation.id, "request_")) return error.InvalidTaskPlan;
+        for (try contract.revisedObligations(self.alloc, current.definition, obligations, superseded orelse &.{})) |obligation| {
+            // Only the host removes its native coding checks after an
+            // authenticated scope change. The planner cannot supersede them.
+            if (withdraws_coding and (std.mem.eql(u8, obligation.id, "coding_validation") or std.mem.eql(u8, obligation.id, "coding_summary"))) continue;
             try all.append(self.alloc, obligation);
         }
-        if (std.mem.eql(u8, capability, "coding_task")) {
+        if (std.mem.eql(u8, capability, "coding_task") and (previous_capability == null or !std.mem.eql(u8, previous_capability.?, "coding_task"))) {
             try all.append(self.alloc, .{ .id = "coding_validation", .description = "Run the applicable repository checks against the final changed source. Cite successful validation evidence and disclose any unavailable check or remaining failure." });
             try all.append(self.alloc, .{ .id = "coding_summary", .description = "Provide a final answer stating the requested behavior, files changed, checks actually run and material limitations, supported by host evidence." });
         }
-        if (all.items.len > current.definition.obligations.len) current.definition.version += 1;
+        if (superseded == null and all.items.len > current.definition.obligations.len) current.definition.version = std.math.add(u32, current.definition.version, 1) catch return error.StaleWorkContract;
         current.definition.obligations = all.items;
+        current.revision_pending = false;
+        current.planned_amendments = current.amendments.len;
         const encoded = try json(self.alloc, current.definition);
         _ = try contract.parse(self.alloc, encoded);
         current.model_basis.?.capability = capability;
         const tree = try self.checkout(current.branch);
-        const plan = try json(self.alloc, .{ .kind = "task_plan", .task = current.id, .contract_version = current.definition.version, .value = .{ .task = current.id, .summary = summary, .obligations = current.definition.obligations, .checks = checks, .basis = current.model_basis } });
+        const plan = try json(self.alloc, .{ .kind = "task_plan", .task = current.id, .contract_version = current.definition.version, .value = .{ .task = current.id, .summary = recorded_summary, .obligations = current.definition.obligations, .checks = checks, .basis = current.model_basis } });
         if (model.hasOperation(declaration_value, "omos_record_plan")) {
             const row = (try std.json.parseFromSlice(std.json.Value, self.alloc, plan, .{})).value;
             try model.validateOperation(self.alloc, declaration_value, "omos_record_plan", model.field(row, "value").?, .input);
         }
         try atomicWrite(self.alloc, try join(self.alloc, tree, try self.taskPath(current.id)), try json(self.alloc, current));
         try atomicWrite(self.alloc, try join(self.alloc, tree, try self.alloc.print("history/{s}/{s}.json", .{ current.id, try hash(self.alloc, plan) })), plan);
-        _ = try self.commit(tree, "Pin task plan and preserve original acceptance criteria");
+        if (superseded) |ids| {
+            const revision_record = try json(self.alloc, .{ .kind = "contract_revision", .task = current.id, .contract_version = current.definition.version, .value = .{ .previous_contract = previous_definition, .contract = current.definition, .previous_capability = previous_capability, .capability = capability, .superseded = ids, .removed_host_obligations = removed_host_obligations, .summary = recorded_summary, .amendments = current.amendments[planned_amendments..], .origin = "authenticated_user_amendment" } });
+            try atomicWrite(self.alloc, try join(self.alloc, tree, try self.alloc.print("history/{s}/{s}.json", .{ current.id, try hash(self.alloc, revision_record) })), revision_record);
+        }
+        _ = try self.commit(tree, if (superseded == null) "Pin task plan and preserve original acceptance criteria" else "Revise requirements from authenticated user amendments");
         try self.saveTask(current);
         return current;
     }
@@ -2388,7 +2687,7 @@ fn allowedPath(path: []const u8) bool {
     while (parts.next()) |part| {
         if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..") or part[0] == '.') return false;
     }
-    for ([_][]const u8{ "memory/", "skills/", "artifacts/", "ui/", "history/", "tasks/", "imports/", "acceptances/", "omniform/", "execution/", "records/", "proposals/", "activations/", "jobs/" }) |prefix| {
+    for ([_][]const u8{ "memory/", "skills/", "artifacts/", "ui/", "history/", "tasks/", "imports/", "acceptances/", "omniform/", "execution/", "records/", "proposals/", "activations/", "jobs/", "schedules/" }) |prefix| {
         if (std.mem.startsWith(u8, path, prefix)) return true;
     }
     return std.mem.eql(u8, path, manifest_path);

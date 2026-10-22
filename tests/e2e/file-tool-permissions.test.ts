@@ -123,7 +123,7 @@ describe("external file permissions", () => {
         );
 
         expect(result.stderr).toContain(
-          "Full access enabled: fx permission checks disabled",
+          "Full access enabled: omniseedos permission checks disabled",
         );
         const output = parseFxJson(result);
         expect(

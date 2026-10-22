@@ -94,6 +94,7 @@ pub const Command = union(enum) {
     replay: []const [:0]const u8,
     workspace: []const [:0]const u8,
     fossil: []const [:0]const u8,
+    schedule: []const [:0]const u8,
     unknown: []const u8,
 };
 
@@ -632,6 +633,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
             if (command_specs.matchesTopLevel(command_catalog, command, .replay)) return .{ .replay = args[1..] };
         },
         's' => {
+            if (command_specs.matchesTopLevel(command_catalog, command, .schedule)) return .{ .schedule = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .setup)) return .{ .setup = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .status)) return .{ .status = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .sessions)) return .{ .sessions = args[1..] };
@@ -1145,7 +1147,10 @@ fn runNonInteractiveWithDeps(
                 config: Config,
                 fn prompt(raw: *anyopaque, args: []const [:0]const u8, ui: *@import("../workspace/ui_session.zig").Host) !u8 {
                     const self: *@This() = @ptrCast(@alignCast(raw));
-                    return cli_ask.runUi(std.heap.c_allocator, args, workflowConfig(self.config), self.config.context_registry, self.config.tool_set, ui);
+                    var config = workflowConfig(self.config);
+                    config.workspace_root_override = ui.project_root;
+                    config.fossil_execution_lease_held = ui.execution_lease_held;
+                    return cli_ask.runUi(std.heap.c_allocator, args, config, self.config.context_registry, self.config.tool_set, ui);
                 }
                 fn snapshot(raw: *anyopaque, arena: Allocator, args: []const [:0]const u8) ![]const u8 {
                     const self: *@This() = @ptrCast(@alignCast(raw));
@@ -1823,23 +1828,58 @@ fn runNonInteractiveWithDeps(
                         if (startup.model_requests_blocked) return error.ModelRequestsBlocked;
                         var providers = self.config.provider_set;
                         providers.definitions = startup.configured_providers.definitions;
-                        const credential: types.CredentialLease = if (startup.auth_mode == .host_managed) .host_managed else .{ .direct = .{
+                        const review_override = io_mod.getenv("FX_CONTRACT_REVIEW_MODEL") orelse startup.review_model;
+                        const review_selection = @import("../agent/runtime/completion_review.zig").resolveSelection(review_override, startup.provider, startup.configured_providers.definitions, startup.selected_model);
+                        var cross_credential: ?credentials.Credential = null;
+                        defer if (cross_credential) |*cred| cred.deinit(worker_manager.alloc);
+                        if (!review_selection.provider.eql(startup.provider)) {
+                            cross_credential = auth_runtime.prepareCredential(worker_manager.alloc, self.config.gateway_provider.oauth_transport, self.config.secret_store, review_selection.provider, null) catch null;
+                        }
+                        const actor_credential: types.CredentialLease = if (startup.auth_mode == .host_managed) .host_managed else .{ .direct = .{
                             .secret_bytes = if (startup.credential) |value| value.token else "",
                             .source = if (startup.credential) |value| value.source else null,
                             .account_id = if (startup.credential) |value| value.account_id else null,
                             .tenant_context = startup.gatewayTeam(),
                         } };
+                        const credential = try @import("../agent/runtime/completion_review.zig").reviewerCredential(startup.provider, review_selection.provider, actor_credential, if (cross_credential) |cred| .{ .direct = .{
+                            .secret_bytes = cred.token,
+                            .source = cred.source,
+                            .account_id = cred.accountId(),
+                            .tenant_context = cred.gatewayTeam(),
+                        } } else null);
                         try @import("../workspace/review_worker.zig").perform(worker_manager, job, .{
-                            .provider = providers.select(startup.provider).agent_stream_or_unavailable(),
-                            .provider_id = startup.provider,
+                            .provider = providers.select(review_selection.provider).agent_stream_or_unavailable(),
+                            .provider_id = review_selection.provider,
                             .credential = credential,
-                            .model = @import("../agent/runtime/completion_review.zig").selectModel(io_mod.getenv("FX_CONTRACT_REVIEW_MODEL") orelse "", startup.provider, startup.configured_providers.definitions, startup.selected_model),
+                            .model = review_selection.model,
                             .cancel = cancel,
                         });
                     }
+                    fn scheduledTask(raw: *anyopaque, worker_manager: @import("../workspace/fossil_workspace.zig").Manager, schedule: @import("../workspace/scheduling.zig").Schedule, cancel: *std.atomic.Value(bool)) !void {
+                        const self: *@This() = @ptrCast(@alignCast(raw));
+                        const worker = @import("../workspace/schedule_worker.zig");
+                        const invocation = try worker.prepare(worker_manager, schedule);
+                        const args = try worker.promptArgs(worker_manager.alloc, invocation.session);
+                        var scheduled_ui: worker.Headless = .{ .alloc = worker_manager.alloc };
+                        scheduled_ui.init(invocation.task.project_root);
+                        defer scheduled_ui.ui.deinit();
+                        var cancellation: worker.Cancellation = .{ .ui = &scheduled_ui.ui, .source = cancel };
+                        const monitor = try std.Thread.spawn(.{}, worker.Cancellation.loop, .{&cancellation});
+                        defer {
+                            cancellation.finished.store(true, .release);
+                            monitor.join();
+                        }
+                        var config = workflowConfig(self.config);
+                        config.workspace_root_override = invocation.task.project_root;
+                        config.fossil_execution_lease_held = true;
+                        const exit_code = try cli_ask.runUi(worker_manager.alloc, args, config, self.config.context_registry, self.config.tool_set, &scheduled_ui.ui);
+                        if (scheduled_ui.blocked.load(.acquire)) return error.ScheduledInputRequired;
+                        if (cancel.load(.acquire)) return error.Cancelled;
+                        if (exit_code != 0) return worker.errorFromCode(scheduled_ui.error_code);
+                    }
                 };
                 var ready: Ready = .{ .deps = deps, .config = cfg };
-                @import("../workspace/workspace_server.zig").run(manager, if (options.path) |port| try std.fmt.parseInt(u16, port, 10) else 8765, options.writable, &ready, Ready.emit, if (options.writable) .{ .context = &ready, .run = Ready.reviewJob } else null) catch |err| {
+                @import("../workspace/workspace_server.zig").run(manager, if (options.path) |port| try std.fmt.parseInt(u16, port, 10) else 8765, options.writable, &ready, Ready.emit, if (options.writable) .{ .context = &ready, .run = Ready.reviewJob } else null, if (options.writable) .{ .context = &ready, .run = Ready.scheduledTask } else null) catch |err| {
                     try writeLookupFailure(alloc, deps, "fossil", err, if (options.json) .json else .text);
                     return .handled_failure;
                 };
@@ -1853,6 +1893,28 @@ fn runNonInteractiveWithDeps(
             const output = try output_contracts.renderFossilWorkspace(alloc, snapshot, format);
             defer alloc.free(output);
             try writeFormattedOutput(deps, output, format);
+            return .handled_success;
+        },
+        .schedule => |rest| {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const scheduling = @import("../workspace/scheduling.zig");
+            const options = scheduling.parseArgs(rest) catch |err| {
+                try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .schedule, "schedule", err, rest);
+                return .handled_failure;
+            };
+            const format: output_contracts.OutputFormat = if (options.json) .json else .text;
+            const manager = (try @import("../workspace/fossil_workspace.zig").Manager.bound(arena.allocator())) orelse {
+                try writeLookupFailure(alloc, deps, "schedule", error.NoFossilWorkspace, format);
+                return .handled_failure;
+            };
+            const snapshot = manager.scheduleSnapshot(options.request) catch |err| {
+                try writeLookupFailure(alloc, deps, "schedule", err, format);
+                return .handled_failure;
+            };
+            const rendered = try output_contracts.renderSchedules(alloc, snapshot, format);
+            defer alloc.free(rendered);
+            try writeFormattedOutput(deps, rendered, format);
             return .handled_success;
         },
         .workspace => |rest| {
@@ -5337,7 +5399,7 @@ test "runIfRequested help writes top-level help" {
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("help")}, testConfig(), capture.deps());
     try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇x v0.0.0\nFast, native coding agent for the terminal."));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "omniseedos v0.0.0\nFast, native coding agent for the terminal."));
     try std.testing.expect(std.mem.find(u8, capture.stdout.written(), testConfig().version) != null);
     try std.testing.expectEqualStrings("", capture.stderr.written());
 }
@@ -5741,7 +5803,7 @@ test "runNoConfigIfRequested handles help without config" {
         testCommandCatalog(),
         capture.deps(),
     ));
-    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇x v0.0.0\nFast, native coding agent for the terminal."));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "omniseedos v0.0.0\nFast, native coding agent for the terminal."));
     try std.testing.expectEqualStrings("", capture.stderr.written());
 
     try std.testing.expect(!try runNoConfigIfRequestedWithDeps(
@@ -6038,7 +6100,7 @@ test "runIfRequested unknown command writes header and help" {
         error.UnknownCliCommand,
         runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("wat")}, testConfig(), capture.deps()),
     );
-    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: wat\n\n𝒇x v0.0.0\nFast, native coding agent for the terminal.\n"));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: wat\n\nomniseedos v0.0.0\nFast, native coding agent for the terminal.\n"));
 }
 
 test "runIfRequested bare version subcommand remains unknown" {
@@ -6049,7 +6111,7 @@ test "runIfRequested bare version subcommand remains unknown" {
         error.UnknownCliCommand,
         runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("version")}, testConfig(), capture.deps()),
     );
-    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: version\n\n𝒇x v0.0.0\nFast, native coding agent for the terminal.\n"));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: version\n\nomniseedos v0.0.0\nFast, native coding agent for the terminal.\n"));
 }
 
 test "runIfRequested model fetch failure is handled" {

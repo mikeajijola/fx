@@ -61,6 +61,7 @@ pub const ModelPickerQuery = struct {
     stage: ModelPickerStage,
     query: []const u8,
     token_start: usize,
+    is_review: bool = false,
 };
 
 pub const ProviderPickerQuery = struct {
@@ -291,6 +292,24 @@ pub const State = struct {
         const items = editor.input.items;
         const trim_start = leadingWhitespaceLen(items);
         const trimmed = items[trim_start..];
+        const review_prefix = "/review-model ";
+        if (trimmed.len >= review_prefix.len and std.ascii.eqlIgnoreCase(trimmed[0..review_prefix.len], review_prefix)) {
+            return .{
+                .stage = .model,
+                .query = trimmed[review_prefix.len..],
+                .token_start = trim_start + review_prefix.len,
+                .is_review = true,
+            };
+        }
+        const reviewer_prefix = "/reviewer ";
+        if (trimmed.len >= reviewer_prefix.len and std.ascii.eqlIgnoreCase(trimmed[0..reviewer_prefix.len], reviewer_prefix)) {
+            return .{
+                .stage = .model,
+                .query = trimmed[reviewer_prefix.len..],
+                .token_start = trim_start + reviewer_prefix.len,
+                .is_review = true,
+            };
+        }
         const prefix = "/model ";
         if (trimmed.len < prefix.len or !std.ascii.eqlIgnoreCase(trimmed[0..prefix.len], prefix)) return null;
 
@@ -422,7 +441,9 @@ pub const State = struct {
     }
 
     pub fn isModelShapedInput(self: *const State, editor: *const editor_state.State) bool {
-        return isBareModelCommandAtCursor(editor) or self.rawModelPickerQuery(editor) != null;
+        return isBareModelCommandAtCursor(editor) or
+            isBareReviewModelCommandAtCursor(editor) or
+            self.rawModelPickerQuery(editor) != null;
     }
 
     fn resetActiveModelPickerIndex(self: *State) void {
@@ -517,6 +538,12 @@ pub fn isBareModelCommandAtCursor(editor: *const editor_state.State) bool {
     if (editor.cursor != editor.input.items.len) return false;
     const trimmed = std.mem.trimStart(u8, editor.input.items, " \t");
     return std.ascii.eqlIgnoreCase(trimmed, "/model");
+}
+
+pub fn isBareReviewModelCommandAtCursor(editor: *const editor_state.State) bool {
+    if (editor.cursor != editor.input.items.len) return false;
+    const trimmed = std.mem.trimStart(u8, editor.input.items, " \t");
+    return std.ascii.eqlIgnoreCase(trimmed, "/review-model") or std.ascii.eqlIgnoreCase(trimmed, "/reviewer");
 }
 
 pub fn filterCompletionLabels(query: []const u8, options: []const []const u8, out: [][]const u8) usize {

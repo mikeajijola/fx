@@ -1137,6 +1137,12 @@ pub fn CompletionRuntime(comptime App: type) type {
 
         pub fn autocompleteModelPickerSelection(app: *App) !void {
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return;
+            if (query.is_review) {
+                const model = selectedModelCompletion(app) orelse return;
+                try setModelComposerText(app, "/review-model {s}", .{model});
+                app.shell.render_requests.request(.footer);
+                return;
+            }
             switch (query.stage) {
                 .model => {
                     const model = selectedModelCompletion(app) orelse return;
@@ -1173,6 +1179,7 @@ pub fn CompletionRuntime(comptime App: type) type {
 
         pub fn advanceModelPickerOnSpace(app: *App) !bool {
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return false;
+            if (query.is_review) return false;
             if (app.input_runtime.edit_state.cursor != app.input_runtime.edit_state.input.items.len) return false;
 
             switch (query.stage) {
@@ -1210,6 +1217,31 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn submitModelPicker(app: *App) !bool {
+            if (app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state)) |active_query| {
+                if (active_query.is_review) {
+                    const trimmed_query = std.mem.trim(u8, active_query.query, " \t");
+                    if (app.isModelCacheLoading() and trimmed_query.len == 0) {
+                        app.shell.render_requests.request(.footer);
+                        return true;
+                    }
+                    const chosen = if (trimmed_query.len > 0 and
+                        (std.ascii.eqlIgnoreCase(trimmed_query, "reset") or
+                            std.ascii.eqlIgnoreCase(trimmed_query, "default") or
+                            std.ascii.eqlIgnoreCase(trimmed_query, "clear") or
+                            std.ascii.eqlIgnoreCase(trimmed_query, "off") or
+                            std.ascii.eqlIgnoreCase(trimmed_query, "status") or
+                            std.mem.indexOfAny(u8, trimmed_query, ": \t") != null))
+                        trimmed_query
+                    else
+                        selectedModelCompletion(app) orelse trimmed_query;
+                    const chosen_copy = try app.alloc.dupe(u8, chosen);
+                    defer app.alloc.free(chosen_copy);
+                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                    try session_commands.Commands(App).handleReviewModel(app, chosen_copy);
+                    app.shell.render_requests.request(.footer);
+                    return true;
+                }
+            }
             switch (app.input_runtime.picker.model_picker_stage) {
                 .model => {
                     if (app.isModelCacheLoading()) {
@@ -1271,6 +1303,12 @@ pub fn CompletionRuntime(comptime App: type) type {
 
         pub fn openCurrentModelPicker(app: *App) !void {
             try app.input_runtime.textReplacementState().replace(app.alloc, "/model ");
+            app.input_runtime.picker.model_completion_anchor_current = true;
+            app.shell.render_requests.request(.footer);
+        }
+
+        pub fn openCurrentReviewModelPicker(app: *App) !void {
+            try app.input_runtime.textReplacementState().replace(app.alloc, "/review-model ");
             app.input_runtime.picker.model_completion_anchor_current = true;
             app.shell.render_requests.request(.footer);
         }

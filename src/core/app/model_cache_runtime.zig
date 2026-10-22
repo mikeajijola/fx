@@ -126,8 +126,14 @@ pub const ModelMenuItem = struct {
     }
 };
 
+pub const ModelMenuTarget = enum {
+    main,
+    review,
+};
+
 pub const ModelMenu = struct {
     active: bool = false,
+    target: ModelMenuTarget = .main,
     load_state: ModelMenuLoadState = .loading,
     catalog_state: ModelMenuCatalogState = .{},
     items: std.ArrayList(ModelMenuItem) = .empty,
@@ -528,15 +534,36 @@ pub const Runtime = struct {
     }
 
     pub fn openMenu(self: *Self) !void {
+        try self.openMenuForTarget(.main);
+    }
+
+    pub fn openMenuForTarget(self: *Self, target: ModelMenuTarget) !void {
         self.finishThreadIfDone();
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
 
-        var next: ModelMenu = .{ .active = true };
+        var next: ModelMenu = .{ .active = true, .target = target };
         errdefer next.deinit(self.alloc);
         try self.refreshMenuLocked(&next);
         self.menu.deinit(self.alloc);
         self.menu = next;
+    }
+
+    pub fn appendExtraMenuItem(self: *Self, id: []const u8, capabilities: model_capabilities.Capabilities) !void {
+        if (!self.menu.active) return;
+        for (self.menu.items.items) |existing| {
+            if (std.ascii.eqlIgnoreCase(existing.id, id)) return;
+        }
+        const duped_id = try self.alloc.dupe(u8, id);
+        errdefer self.alloc.free(duped_id);
+        try self.menu.items.append(self.alloc, .{
+            .id = duped_id,
+            .provider = modelProvider(duped_id),
+            .capabilities = capabilities,
+        });
+        if (self.menu.load_state != .ready) {
+            self.menu.load_state = .ready;
+        }
     }
 
     pub fn closeMenu(self: *Self) void {

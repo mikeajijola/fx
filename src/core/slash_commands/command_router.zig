@@ -19,6 +19,7 @@ pub const ParsedCommand = union(enum) {
     image: []const u8,
     images: []const u8,
     model: []const u8,
+    review_model: []const u8,
     permissions: []const u8,
     allowlist: []const u8,
     stats,
@@ -60,6 +61,7 @@ pub const CommandHandlers = struct {
     attach_image: *const fn (ctx: *anyopaque, path: []const u8) anyerror!void,
     manage_images: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_model: *const fn (ctx: *anyopaque, query: []const u8) anyerror!void,
+    handle_review_model: *const fn (ctx: *anyopaque, query: []const u8) anyerror!void = unavailableReviewModel,
     handle_permissions: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_allowlist: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_stats: *const fn (ctx: *anyopaque) anyerror!void,
@@ -107,6 +109,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .images => .{ .images = payload },
         .image => .{ .image = payload },
         .model => .{ .model = payload },
+        .review_model => .{ .review_model = payload },
         .permissions => .{ .permissions = payload },
         .allowlist => .{ .allowlist = payload },
         .stats => .stats,
@@ -162,6 +165,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .image => |path| try handlers.attach_image(handlers.ctx, path),
         .images => |rest| try handlers.manage_images(handlers.ctx, rest),
         .model => |query| try handlers.handle_model(handlers.ctx, query),
+        .review_model => |query| try handlers.handle_review_model(handlers.ctx, query),
         .permissions => |rest| try handlers.handle_permissions(handlers.ctx, rest),
         .allowlist => |rest| try handlers.handle_allowlist(handlers.ctx, rest),
         .stats => try handlers.show_stats(handlers.ctx),
@@ -622,4 +626,8 @@ test "route propagates callback errors" {
 
 fn unavailableTask(_: *anyopaque, _: []const u8) !void {
     return error.TaskCommandUnavailable;
+}
+
+fn unavailableReviewModel(_: *anyopaque, _: []const u8) !void {
+    return error.ReviewModelCommandUnavailable;
 }

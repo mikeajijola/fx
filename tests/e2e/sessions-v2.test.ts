@@ -1231,10 +1231,10 @@ test.skipIf(!tmuxAvailable())("the picker lists v2 sessions, /rename sticks, and
   }
 }, TIMEOUT * 6);
 
-test.skipIf(!tmuxAvailable())("the picker shows a session open in another fx as busy at once, and opens it once the owner quits", async () => {
+test.skipIf(!tmuxAvailable())("the picker shows a session open in another omniseedos as busy at once, and opens it once the owner quits", async () => {
   const fixture = createFixture("fx-v2-app-picker-busy-");
   const gateway = replyToLatest([["Hold this session open.", "PICKER_BUSY_SAVED"]]);
-  const busy = "This session is open in another fx. Close it there, then press enter to retry.";
+  const busy = "This session is open in another omniseedos. Close it there, then press enter to retry.";
   let contender: TmuxSession | null = null;
   try {
     const owner = await startApp(fixture, gateway, []);
@@ -3148,7 +3148,7 @@ test.skipIf(!tmuxAvailable())("the app refuses a damaged session, a busy one and
     const owner = await startApp(fixture, gateway, ["--resume", id]);
     const busy = await appExit(fixture, gateway, ["--resume", id]);
     expect(busy.status).toBe(1);
-    expect(busy.stderr).toContain("another fx process may be using this session");
+    expect(busy.stderr).toContain("another omniseedos process may be using this session");
     await quitApp(owner);
     expect(gateway.requests.length).toBe(requests);
     expectWholeLog(fixture, id);
@@ -3693,7 +3693,7 @@ const REAL_FULL_DISK = process.platform === "darwin";
 const GRID_SAYS: Record<"damaged" | "denied" | "busy" | "full", Record<GridHost, RegExp>> = {
   damaged: { ask: /InvalidSessionFormat/, app: /saved session is unreadable/, acp: /^Session could not be loaded$/ },
   denied: { ask: /AccessDenied/, app: /cannot be opened for writing: permission denied|AccessDenied/, acp: /permission denied/ },
-  busy: { ask: /SessionBusy/, app: /another fx process may be using this session/, acp: /^Session is busy$/ },
+  busy: { ask: /SessionBusy/, app: /another omniseedos process may be using this session/, acp: /^Session is busy$/ },
   full: REAL_FULL_DISK
     ? { ask: /NoSpaceLeft/, app: /NoSpaceLeft|the disk is full/, acp: /the disk is full/ }
     : { ask: /FileTooBig/, app: /FileTooBig|a file-size limit was reached/, acp: /a file-size limit was reached/ },

@@ -99,7 +99,7 @@ async function systemTextsWith(workspace, label, { turns = 1, respond = () => nu
     }
   };
   try {
-    await waitFor(() => grid().includes("𝒇x"), "startup");
+    await waitFor(() => grid().includes("omniseedos"), "startup");
     for (let turn = 1; turn <= turns; turn += 1) {
       runtime.write(`${label} prompt ${turn}\r`);
       await waitFor(() => grid().includes(`${label} answered ${turn}`), `turn ${turn}`);

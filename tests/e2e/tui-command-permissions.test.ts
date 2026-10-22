@@ -810,7 +810,7 @@ function normalizeVolatileStatusRows(grid: string[]): string[] {
     /^• Streaming \([^)]*\)$/.test(line) ||
       isVolatileTokenStatusRow(line)
       ? "<status>"
-      : line.replace(/\s+Full access enabled: fx permission checks disabled$/, "")
+      : line.replace(/\s+Full access enabled: omniseedos permission checks disabled$/, "")
   );
 }
 
@@ -818,7 +818,7 @@ test("volatile token status rows normalize before transcript grid comparison", (
   expect(normalizeVolatileStatusRows(["  (↑10 ↓5)"])).toEqual(["<status>"]);
   expect(normalizeVolatileStatusRows(["  0s (↑10 ↓5)"])).toEqual(["<status>"]);
   expect(normalizeVolatileStatusRows([
-    "full access · gpt-5                 Full access enabled: fx permission checks disabled",
+    "full access · gpt-5                 Full access enabled: omniseedos permission checks disabled",
   ])).toEqual(["full access · gpt-5"]);
 });
 
@@ -857,7 +857,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendText("Run the prepared two-command history fixture.");
       await activeSession.waitForText(COMMAND_APPROVAL_PROMPT, TIMEOUT);
       await activeSession.sendKeys("Tab");
-      await activeSession.waitForText("Yes, and tell fx what to do next", TIMEOUT);
+      await activeSession.waitForText("Yes, and tell omniseedos what to do next", TIMEOUT);
       await activeSession.sendLiteralText(feedback);
       await activeSession.waitForText(`Yes, ${feedback}`, TIMEOUT);
       await activeSession.sendKeys("Enter");

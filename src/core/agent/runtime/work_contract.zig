@@ -46,6 +46,37 @@ pub fn parse(alloc: std.mem.Allocator, raw: []const u8) !std.json.Parsed(Definit
     return parsed;
 }
 
+/// The caller owns the returned slice; strings borrow current and replacements.
+/// Only the host calls this after retaining an authenticated amendment; model
+/// output alone cannot authorize a revision.
+pub fn revisedObligations(alloc: std.mem.Allocator, current: Definition, replacements: []const Obligation, superseded: []const []const u8) ![]const Obligation {
+    if (replacements.len > 32 or superseded.len > 100) return error.InvalidContractRevision;
+    for (superseded, 0..) |id, index| {
+        if (std.mem.startsWith(u8, id, "request_") or std.mem.startsWith(u8, id, "coding_")) return error.InvalidContractRevision;
+        for (superseded[0..index]) |previous| if (std.mem.eql(u8, id, previous)) return error.InvalidContractRevision;
+        const exists = for (current.obligations) |obligation| {
+            if (std.mem.eql(u8, id, obligation.id)) break true;
+        } else false;
+        if (!exists) return error.InvalidContractRevision;
+    }
+    var result: std.ArrayList(Obligation) = .empty;
+    errdefer result.deinit(alloc);
+    for (current.obligations) |obligation| {
+        const replaced = for (superseded) |id| {
+            if (std.mem.eql(u8, id, obligation.id)) break true;
+        } else false;
+        if (!replaced) try result.append(alloc, obligation);
+    }
+    for (replacements) |obligation| {
+        if (std.mem.startsWith(u8, obligation.id, "request_") or std.mem.startsWith(u8, obligation.id, "coding_")) return error.InvalidContractRevision;
+        if (!bounded(obligation.id, 128) or !bounded(obligation.description, 4096)) return error.InvalidContractRevision;
+        for (result.items) |previous| if (std.mem.eql(u8, obligation.id, previous.id)) return error.InvalidContractRevision;
+        try result.append(alloc, obligation);
+    }
+    if (result.items.len == 0 or result.items.len > 100) return error.InvalidContractRevision;
+    return result.toOwnedSlice(alloc);
+}
+
 /// The caller owns feedback. An incomplete, stale, or malformed report never
 /// permits completion. Evidence resolution and truth remain host responsibilities.
 pub fn assess(alloc: std.mem.Allocator, definition: Definition, raw: []const u8) !Decision {
@@ -139,4 +170,29 @@ test "pending work continues alongside blockers and each obligation must appear 
         \\{"contractId":"task","version":1,"obligations":[{"id":"a","status":"pending","note":"A"},{"id":"unknown","status":"pending","note":"Unknown"}]}
         ,
     }) |raw| try std.testing.expectError(error.InvalidContractAssessment, assess(alloc, definition, raw));
+}
+
+test "work contract revision preserves unaffected obligations and host requirements" {
+    const alloc = std.testing.allocator;
+    const definition: Definition = .{ .id = "task", .version = 2, .objective = "Produce a report", .obligations = &.{
+        .{ .id = "request_complete", .description = "Fulfil the current request" },
+        .{ .id = "format", .description = "Export PDF" },
+        .{ .id = "sources", .description = "Cite the original sources" },
+        .{ .id = "coding_validation", .description = "Validate source changes" },
+    } };
+    const revised = try revisedObligations(alloc, definition, &.{.{ .id = "format", .description = "Export HTML" }}, &.{"format"});
+    defer alloc.free(revised);
+    try std.testing.expectEqual(@as(usize, 4), revised.len);
+    try std.testing.expectEqualStrings("request_complete", revised[0].id);
+    try std.testing.expectEqualStrings("Cite the original sources", revised[1].description);
+    try std.testing.expectEqualStrings("coding_validation", revised[2].id);
+    try std.testing.expectEqualStrings("Export HTML", revised[3].description);
+    const withdrawn = try revisedObligations(alloc, definition, &.{}, &.{"format"});
+    defer alloc.free(withdrawn);
+    try std.testing.expectEqual(@as(usize, 3), withdrawn.len);
+    try std.testing.expectEqualStrings("sources", withdrawn[1].id);
+    for ([_][]const []const u8{ &.{"request_complete"}, &.{"coding_validation"}, &.{"missing"}, &.{ "format", "format" } }) |ids|
+        try std.testing.expectError(error.InvalidContractRevision, revisedObligations(alloc, definition, &.{}, ids));
+    try std.testing.expectError(error.InvalidContractRevision, revisedObligations(alloc, definition, &.{.{ .id = "sources", .description = "Changed without superseding" }}, &.{}));
+    try std.testing.expectError(error.InvalidContractRevision, revisedObligations(alloc, definition, &.{.{ .id = "coding_summary", .description = "Model cannot create host requirements" }}, &.{}));
 }

@@ -234,6 +234,8 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
 
 pub const Config = struct {
     auth_mode: credentials.AuthMode = .local,
+    workspace_root_override: ?[]const u8 = null,
+    fossil_execution_lease_held: bool = false,
     command_usage: []const u8,
     default_model: []const u8,
     default_agent_step_limit: usize,
@@ -588,6 +590,7 @@ const AskContext = struct {
     /// Resolved review-model override borrowed from the startup state for the
     /// duration of the run. Empty keeps the reviewer's compiled default.
     reviewer_model: []const u8 = "",
+    reviewer_credential: ?types.CredentialLease = null,
     agent_step_limit: usize = 0,
     max_tool_result_bytes: usize = 64 * 1024,
     auto_compact_percent: u8 = compactor.default_percent,
@@ -1272,15 +1275,24 @@ const AskContext = struct {
 
     fn admissionAutoClassifier(self: *AskContext) permission_auto_classifier.Classifier {
         if (self.auto_classifier.enabled()) return self.auto_classifier;
-        const provider = self.cfg.provider_set.select(self.provider).permission_reviewer orelse
+        const selection = completion_review.resolveSelection(self.reviewer_model, self.provider, self.cfg.provider_set.definitions, self.model);
+        const actor: types.CredentialLease = if (self.cfg.auth_mode == .host_managed) .host_managed else .{ .direct = .{
+            .secret_bytes = self.api_key,
+            .source = self.credential_source,
+            .account_id = self.account_id,
+            .tenant_context = self.gateway_team,
+        } };
+        const credential = completion_review.reviewerCredential(self.provider, selection.provider, actor, self.reviewer_credential) catch
+            return permission_auto_classifier.Classifier.disabled();
+        const provider = self.cfg.provider_set.select(selection.provider).permission_reviewer orelse
             return permission_auto_classifier.Classifier.disabled();
         return permission_auto_classifier.Classifier.withProvider(provider, .{
-            .credential = self.api_key,
-            .credential_source = self.credential_source,
-            .account_id = self.account_id,
-            .tenant = self.gateway_team,
+            .credential = credential.secret() orelse "",
+            .credential_source = credential.credentialSource(),
+            .account_id = credential.accountId(),
+            .tenant = credential.tenant(),
             .endpoint = self.cfg.gateway_chat_url,
-            .reviewer_model = self.reviewer_model,
+            .reviewer_model = if (self.reviewer_model.len > 0) selection.model else "",
             .cancel_flag = self.cancelFlag(),
         });
     }
@@ -1693,7 +1705,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer alloc.free(owned_prompt);
 
     try checkHeadlessCancellation(options.deps);
-    var startup = if (cfg.auth_mode == .host_managed)
+    var startup = if (cfg.workspace_root_override) |project|
+        try app_lifecycle.loadStartupStateForRunInWorkspace(alloc, cfg.gateway_provider.oauth_transport, cfg.secret_store, project, cfg.default_model, cfg.default_agent_step_limit, cfg.auth_mode, options.model_override)
+    else if (cfg.auth_mode == .host_managed)
         try options.deps.load_startup_state_with_auth_mode(
             alloc,
             cfg.gateway_provider.oauth_transport,
@@ -2112,6 +2126,24 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             recovery_checkpoint == null
     else
         false;
+    const review_selection = completion_review.resolveSelection(ctx.reviewer_model, ctx.provider, cfg.provider_set.definitions, ctx.model);
+    var cross_review_credential: ?credentials.Credential = null;
+    defer if (cross_review_credential) |*cred| cred.deinit(alloc);
+    if (!review_selection.provider.eql(ctx.provider)) {
+        cross_review_credential = auth_runtime.prepareCredential(
+            alloc,
+            cfg.gateway_provider.oauth_transport,
+            cfg.secret_store,
+            review_selection.provider,
+            null,
+        ) catch null;
+    }
+    ctx.reviewer_credential = if (cross_review_credential) |cred| .{ .direct = .{
+        .secret_bytes = cred.token,
+        .source = cred.source,
+        .account_id = cred.accountId(),
+        .tenant_context = cred.gatewayTeam(),
+    } } else null;
     options.deps.process_queued_prompt(&ctx.session.agent, &deps, semantic_presentation, ctx.lifecycleContext(), .{
         .system_prompt = cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
@@ -2130,8 +2162,17 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .ui_host = ctx.deps.ui_host,
         .fossil_session_id = if (completion_review.enabled()) ctx.activeSessionId() else null,
         .fossil_ephemeral = completion_review.enabled() and ctx.writable == null,
+        .fossil_execution_lease_held = cfg.fossil_execution_lease_held,
 
-        .contract_review_model = completion_review.selectModel(ctx.reviewer_model, ctx.provider, cfg.provider_set.definitions, ctx.model),
+        .contract_review_model = review_selection.model,
+        .contract_review_provider = review_selection.provider,
+        .contract_review_stream_provider = cfg.provider_set.select(review_selection.provider).agent_stream_or_unavailable(),
+        .contract_review_credential = if (cross_review_credential) |cred| .{ .direct = .{
+            .secret_bytes = cred.token,
+            .source = cred.source,
+            .account_id = cred.accountId(),
+            .tenant_context = cred.gatewayTeam(),
+        } } else null,
         .fast_mode = ctx.fast_mode,
         .ultrafast_mode = ctx.ultrafast_mode,
         .effort = ctx.effort,
@@ -2900,6 +2941,7 @@ fn cliPermissionPromptAllowed(
 }
 
 fn cliContextPermissionPromptAllowed(ctx: *const AskContext) bool {
+    if (ctx.deps.ui_host != null) return true;
     return cliPermissionPromptAllowed(
         ctx.output_mode,
         ctx.prompt_permissions,
@@ -5692,6 +5734,38 @@ test "fx ask publishes a complete refreshed credential before later consumers" {
     );
 }
 
+test "cross-provider reviewer CLI permission route keeps actor credential isolated" {
+    const Fake = struct {
+        fn review(_: ?*anyopaque, _: Allocator, _: permission_auto_classifier.ProviderInput, _: permission_auto_classifier.ReviewRequest) anyerror!permission_auto_classifier.ParseOutcome {
+            return .{ .invalid = .provider_failed };
+        }
+    };
+    var gateway_tag: u8 = 0;
+    var codex_tag: u8 = 0;
+    var config = testConfig();
+    config.provider_set.gateway.permission_reviewer = .{ .context = &gateway_tag, .review_fn = Fake.review };
+    config.provider_set.codex.permission_reviewer = .{ .context = &codex_tag, .review_fn = Fake.review };
+    var stdout_capture = TestCapture{};
+    defer stdout_capture.deinit(std.testing.allocator);
+    var stderr_capture = TestCapture{};
+    defer stderr_capture.deinit(std.testing.allocator);
+    var ctx = AskContext.init(std.testing.allocator, config, testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup), "/tmp/workspace");
+    defer ctx.deinit();
+    ctx.api_key = "actor-key";
+    ctx.credential_source = .ai_gateway_api_key;
+    ctx.reviewer_model = "codex:gpt-review";
+    try std.testing.expect(!ctx.admissionAutoClassifier().enabled());
+    ctx.reviewer_credential = .{ .direct = .{ .secret_bytes = "reviewer-key", .source = .chatgpt_subscription, .account_id = "reviewer-account" } };
+    const classifier = ctx.admissionAutoClassifier();
+    try std.testing.expect(classifier.provider.?.context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
+    try std.testing.expectEqualStrings("reviewer-key", classifier.provider_input.credential);
+    try std.testing.expectEqualStrings("gpt-review", classifier.provider_input.reviewer_model);
+    try std.testing.expectEqualStrings("reviewer-account", classifier.provider_input.account_id.?);
+    try std.testing.expectEqualStrings("actor-key", ctx.api_key);
+    ctx.reviewer_credential = .{ .direct = .{ .secret_bytes = "actor-key", .source = .ai_gateway_api_key } };
+    try std.testing.expect(!ctx.admissionAutoClassifier().enabled());
+}
+
 test "fx ask ChatGPT route disables Gateway-backed auxiliary providers" {
     const alloc = std.testing.allocator;
     var stdout_capture = TestCapture{};
@@ -7239,6 +7313,37 @@ test "fx ask permission prompt policy requires explicit captured-mode opt in and
             ),
         );
     }
+}
+
+test "fx ask native approval transport does not require terminal stdin" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup);
+    deps.stdin_is_tty = TestTty.no;
+    var ctx = AskContext.init(alloc, testConfig(), deps, "/Users/example/workspace");
+    defer ctx.deinit();
+    var headless: @import("../workspace/schedule_worker.zig").Headless = .{ .alloc = alloc };
+    headless.init("/Users/example/workspace");
+    defer headless.ui.deinit();
+
+    for ([_]OutputMode{ .json, .quiet }) |mode| {
+        ctx.output_mode = mode;
+        ctx.prompt_permissions = true;
+        try std.testing.expect(!cliContextPermissionPromptAllowed(&ctx));
+        try std.testing.expect(cliAdmissionContext(&ctx, &.{}, null).permission_prompter == null);
+        ctx.deps.ui_host = &headless.ui;
+        try std.testing.expect(cliContextPermissionPromptAllowed(&ctx));
+        try std.testing.expect(cliAdmissionContext(&ctx, &.{}, null).permission_prompter != null);
+        ctx.deps.ui_host = null;
+    }
+    ctx.deps.ui_host = &headless.ui;
+    try std.testing.expectEqual(PermissionApprovalPromptResult.deny, try promptCliPermissionApproval(&ctx, "Write the retained report"));
+    try std.testing.expect(headless.blocked.load(.acquire));
+    try std.testing.expect(headless.ui.cancel.load(.acquire));
+    try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 }
 
 test "fx ask captured permission prompt opt in uses the existing prompter" {

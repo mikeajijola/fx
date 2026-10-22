@@ -255,7 +255,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       writeFileSync(stderrPath, "");
 
       const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
-      const banner = `𝒇x v${version} · Run /help for commands`;
+      const banner = `omniseedos v${version} · Run /help for commands`;
 
       try {
         session = await TmuxSession.create({
@@ -315,7 +315,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       mkdirSync(home, { recursive: true });
       writeFileSync(stderrPath, "");
       const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
-      const banner = `𝒇x v${version} · Run /help for commands`;
+      const banner = `omniseedos v${version} · Run /help for commands`;
 
       try {
         session = await TmuxSession.create({
@@ -375,7 +375,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       writeFileSync(stderrPath, "");
       const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("FIXTURE_REPLY_OK"));
       const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
-      const banner = `𝒇x v${version} · Run /help for commands`;
+      const banner = `omniseedos v${version} · Run /help for commands`;
 
       try {
         session = await TmuxSession.create({
@@ -431,7 +431,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       mkdirSync(home, { recursive: true });
       writeFileSync(stderrPath, "");
       const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
-      const banner = `𝒇x v${version} · Run /help for commands`;
+      const banner = `omniseedos v${version} · Run /help for commands`;
 
       try {
         session = await TmuxSession.create({
@@ -680,7 +680,7 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
 
       session = await TmuxSession.create({ env });
 
-      const initial = await session.waitForText("Welcome to fx", TIMEOUT);
+      const initial = await session.waitForText("Welcome to omniseedos", TIMEOUT);
       expect(initial).toContain("Sign in with Vercel");
       expect(initial).toContain("Add an API key");
       expect(initial).toContain("esc to set up later");
@@ -690,14 +690,14 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
 
       await session.sendKeys("Escape");
       const skipped = await session.waitForPane(
-        (pane) => !pane.includes("Welcome to fx") && !pane.includes("Sign in with Vercel"),
+        (pane) => !pane.includes("Welcome to omniseedos") && !pane.includes("Sign in with Vercel"),
         TIMEOUT,
       );
       expect(skipped).not.toContain("Add an API key");
 
       await session.kill();
       session = await TmuxSession.create({ env });
-      const restarted = await session.waitForText("Welcome to fx", TIMEOUT);
+      const restarted = await session.waitForText("Welcome to omniseedos", TIMEOUT);
       expect(restarted).toContain("Sign in with Vercel");
       expect(restarted).toContain("Add an API key");
     },

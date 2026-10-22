@@ -5,6 +5,8 @@ const io = @import("../shared/io.zig");
 const records = @import("../shared/record_json.zig");
 const workspace = @import("../workspace/fossil_workspace.zig");
 const interaction = @import("../workspace/ui_session.zig");
+const schedule_worker = @import("../workspace/schedule_worker.zig");
+const scheduling = @import("../workspace/scheduling.zig");
 const version = "omos.ui-host/v1";
 const alloc = std.heap.c_allocator;
 
@@ -21,6 +23,9 @@ const Job = struct {
     args: []const [:0]const u8,
     ui: interaction.Host,
     finished: std.atomic.Value(bool) = .init(false),
+    exit_code: u8 = 0,
+    error_code: ?[]const u8 = null,
+    execution_lease: ?workspace.ExecutionLease = null,
     journal: std.Io.File,
     position: u64 = 0,
     cursor: usize = 0,
@@ -31,6 +36,13 @@ const Job = struct {
         defer self.server.output_mutex.unlock(io.getIo());
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
         defer parsed.deinit();
+        const model = @import("../workspace/definition.zig");
+        if (std.mem.eql(u8, model.text(parsed.value, "type"), "result")) {
+            if (model.field(parsed.value, "data")) |result| {
+                const code = model.text(result, "error");
+                if (code.len > 0) self.error_code = try alloc.dupe(u8, code);
+            }
+        }
         const line = try std.json.Stringify.valueAlloc(alloc, .{ .version = version, .type = "event", .turn = self.id, .cursor = self.cursor + 1, .data = parsed.value }, .{});
         defer alloc.free(line);
         var buffer: [4096]u8 = undefined;
@@ -58,10 +70,20 @@ const Job = struct {
 
     fn run(self: *Job) void {
         defer self.finished.store(true, .release);
+        self.perform();
+    }
+
+    fn perform(self: *Job) void {
+        defer if (self.execution_lease) |lease| {
+            lease.release();
+            self.execution_lease = null;
+        };
         const exit = self.server.runner.prompt(self.server.runner.context, self.args, &self.ui) catch |err| blk: {
+            self.error_code = alloc.dupe(u8, @errorName(err)) catch null;
             self.ui.emit(.{ .type = "error", .code = @errorName(err) }) catch {};
             break :blk @as(u8, 1);
         };
+        self.exit_code = exit;
         self.ui.emit(.{ .type = "turn_end", .exit_code = exit }) catch {};
     }
 
@@ -72,12 +94,15 @@ const Job = struct {
         alloc.free(self.args);
         alloc.free(self.id);
         alloc.free(self.request_hash);
+        if (self.error_code) |code| alloc.free(code);
+        if (self.execution_lease) |lease| lease.release();
         alloc.destroy(self);
     }
 };
 
 const Server = struct {
     runner: Runner,
+    state_mutex: std.Io.Mutex = .init,
     output_mutex: std.Io.Mutex = .init,
     job: ?*Job = null,
     thread: ?std.Thread = null,
@@ -95,7 +120,7 @@ const Server = struct {
 
     fn reap(self: *Server) void {
         if (self.job) |job| if (job.finished.load(.acquire)) {
-            self.thread.?.join();
+            if (self.thread) |thread| thread.join();
             job.destroy();
             self.job = null;
             self.thread = null;
@@ -103,6 +128,8 @@ const Server = struct {
     }
 
     fn dispatch(self: *Server, arena: std.mem.Allocator, raw: []const u8) !void {
+        self.state_mutex.lockUncancelable(io.getIo());
+        defer self.state_mutex.unlock(io.getIo());
         const Request = struct { version: []const u8, id: []const u8, method: []const u8, params: std.json.Value = .null };
         const request = try records.decode(Request, arena, raw, .{});
         if (!std.mem.eql(u8, request.version, version) or !safeId(request.id)) return error.InvalidUiRequest;
@@ -131,7 +158,7 @@ const Server = struct {
             }
         }
         if (std.mem.eql(u8, method, "initialize")) return value(arena, .{ .version = version, .project = try io.realpathAlloc(arena, "."), .workspace = self.workspace_id, .active_turn = if (self.job) |job| job.id else null });
-        if (std.mem.eql(u8, method, "prompt")) return self.start(arena, id, params);
+        if (std.mem.eql(u8, method, "prompt")) return self.start(arena, id, params, null);
         if (std.mem.eql(u8, method, "events")) return self.events(arena, params);
         if (std.mem.eql(u8, method, "session.events")) {
             const query = try std.json.parseFromValueLeaky(struct { session: []const u8, offset: u64 = 0 }, arena, params, .{});
@@ -158,12 +185,19 @@ const Server = struct {
             return parse(arena, try self.runner.snapshot(self.runner.context, arena, args));
         }
         const manager = (try workspace.Manager.bound(arena)) orelse return error.NoFossilWorkspace;
+        if (std.mem.eql(u8, method, "schedule")) {
+            const request = try std.json.parseFromValueLeaky(scheduling.Request, arena, params, .{});
+            if (request.action == .add or request.action == .move or request.action == .cancel) {
+                if (request.revision == null) return error.WorkspaceRevisionRequired;
+            }
+            return value(arena, try manager.scheduleSnapshot(request));
+        }
         if (std.mem.eql(u8, method, "workspace")) return parse(arena, try @import("../workspace/workspace_service.zig").execute(manager, try std.json.Stringify.valueAlloc(arena, params, .{}), false));
         if (std.mem.startsWith(u8, method, "ui.") or std.mem.eql(u8, method, "task.resume")) return parse(arena, try @import("../workspace/ui_artifact.zig").execute(manager, method, params));
         return error.UnsupportedUiMethod;
     }
 
-    fn start(self: *Server, arena: std.mem.Allocator, id: []const u8, params: std.json.Value) !std.json.Value {
+    fn start(self: *Server, arena: std.mem.Allocator, id: []const u8, params: std.json.Value, scheduled: ?schedule_worker.Invocation) !std.json.Value {
         const Prompt = struct { text: []const u8 = "", session: ?[]const u8 = null, model: ?[]const u8 = null, effort: ?[]const u8 = null, continue_recovery: bool = false, images: []const []const u8 = &.{} };
         const request = try std.json.parseFromValueLeaky(Prompt, arena, params, .{});
         if (request.text.len > 1024 * 1024 or !std.unicode.utf8ValidateSlice(request.text) or std.mem.findScalar(u8, request.text, 0) != null) return error.InvalidPrompt;
@@ -232,16 +266,71 @@ const Server = struct {
             alloc.free(owned_args);
         }
         const acknowledgement = try value(arena, .{ .turn = id, .already_accepted = false });
+        const execution_lease: ?workspace.ExecutionLease = if (scheduled == null) blk: {
+            const manager = (try workspace.Manager.bound(arena)) orelse return error.NoFossilWorkspace;
+            break :blk (try manager.tryExecutionLease()) orelse return error.WorkspaceExecutionBusy;
+        } else null;
+        errdefer if (execution_lease) |lease| lease.release();
         const job = try alloc.create(Job);
         errdefer alloc.destroy(job);
-        job.* = .{ .server = self, .id = owned_id, .request_hash = owned_hash, .args = owned_args, .ui = .{ .context = job, .emit_fn = Job.emit }, .journal = journal };
+        job.* = .{ .server = self, .id = owned_id, .request_hash = owned_hash, .args = owned_args, .ui = .{ .context = job, .emit_fn = Job.emit, .execution_lease_held = execution_lease != null }, .journal = journal, .execution_lease = execution_lease };
+        if (scheduled) |invocation| {
+            job.ui.project_root = invocation.task.project_root;
+            job.ui.execution_lease_held = true;
+        }
         try job.ui.emit(.{ .type = "turn_start", .request_hash = request_hash });
         self.job = job;
-        self.thread = std.Thread.spawn(.{}, Job.run, .{job}) catch |err| {
+        if (scheduled == null) self.thread = std.Thread.spawn(.{}, Job.run, .{job}) catch |err| {
             self.job = null;
             return err;
         };
         return acknowledgement;
+    }
+
+    fn available(raw: *anyopaque) bool {
+        const self: *Server = @ptrCast(@alignCast(raw));
+        self.state_mutex.lockUncancelable(io.getIo());
+        defer self.state_mutex.unlock(io.getIo());
+        self.reap();
+        return self.job == null;
+    }
+
+    fn scheduledTask(raw: *anyopaque, manager: workspace.Manager, schedule: scheduling.Schedule, cancel: *std.atomic.Value(bool)) !void {
+        const self: *Server = @ptrCast(@alignCast(raw));
+        const job = blk: {
+            self.state_mutex.lockUncancelable(io.getIo());
+            defer self.state_mutex.unlock(io.getIo());
+            self.reap();
+            if (self.job != null) return error.WorkspaceExecutionBusy;
+            const invocation = try schedule_worker.prepare(manager, schedule);
+            const id = try manager.alloc.print("schedule-{s}-{d}", .{ schedule.id, schedule.generation });
+            if (!safeId(id)) return error.InvalidTurnId;
+            const accepted = try self.start(manager.alloc, id, try value(manager.alloc, .{ .text = "continue", .session = invocation.session }), invocation);
+            if (@import("../workspace/definition.zig").field(accepted, "already_accepted")) |retained| {
+                if (retained == .bool and retained.bool) return error.ScheduledTurnAcceptanceUncertain;
+            }
+            const started = self.job orelse return error.ScheduledTurnAcceptanceUncertain;
+            started.ui.emit(.{ .type = "scheduled_task", .schedule = schedule.id, .task = schedule.task, .turn = id }) catch |err| {
+                started.finished.store(true, .release);
+                return err;
+            };
+            break :blk started;
+        };
+        var cancellation: schedule_worker.Cancellation = .{ .ui = &job.ui, .source = cancel };
+        const monitor = std.Thread.spawn(.{}, schedule_worker.Cancellation.loop, .{&cancellation}) catch |err| {
+            job.finished.store(true, .release);
+            return err;
+        };
+        // The worker owns this invocation; controls and replay use the same job
+        // that ordinary prompts expose through the host.
+        job.perform();
+        cancellation.finished.store(true, .release);
+        monitor.join();
+        const exit_code = job.exit_code;
+        const failure = schedule_worker.errorFromCode(job.error_code);
+        job.finished.store(true, .release);
+        if (cancel.load(.acquire)) return error.Cancelled;
+        if (exit_code != 0) return failure;
     }
 
     fn events(self: *Server, arena: std.mem.Allocator, params: std.json.Value) !std.json.Value {
@@ -335,11 +424,19 @@ pub fn run(runner: Runner) !void {
     defer alloc.free(directory);
     try std.Io.Dir.cwd().createDirPath(io.getIo(), directory);
     var server: Server = .{ .runner = runner, .journal_dir = directory, .repository = binding.repository, .workspace_id = binding.manifest.id };
-    defer if (server.job) |job| {
-        job.ui.stop();
-        server.thread.?.join();
-        job.destroy();
-    };
+    var scheduler: schedule_worker.Scheduler = .{ .manager = binding, .executor = .{ .context = &server, .run = Server.scheduledTask, .available = Server.available } };
+    const scheduler_thread = try std.Thread.spawn(.{}, schedule_worker.Scheduler.loop, .{&scheduler});
+    defer {
+        scheduler.stopping.store(true, .release);
+        server.state_mutex.lockUncancelable(io.getIo());
+        if (server.job) |job| job.ui.stop();
+        server.state_mutex.unlock(io.getIo());
+        scheduler_thread.join();
+        if (server.job) |job| {
+            if (server.thread) |thread| thread.join();
+            job.destroy();
+        }
+    }
     const buffer = try alloc.alloc(u8, 12 * 1024 * 1024);
     defer alloc.free(buffer);
     var reader = std.Io.File.stdin().reader(io.getIo(), buffer);

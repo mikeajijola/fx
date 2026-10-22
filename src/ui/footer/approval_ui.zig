@@ -1238,12 +1238,12 @@ fn appendFileApprovalAmendmentLabel(
             0 => {
                 try out.appendSlice(alloc, fileApprovalVerb(request));
                 try out.appendSlice(alloc, " once, ");
-                try appendApprovalPlaceholder(alloc, out, "and tell fx what to do next");
+                try appendApprovalPlaceholder(alloc, out, "and tell omniseedos what to do next");
             },
             2 => {
                 try appendFileApprovalDenialLabel(alloc, out, request);
                 try out.appendSlice(alloc, ", ");
-                try appendApprovalPlaceholder(alloc, out, "and tell fx what to do differently");
+                try appendApprovalPlaceholder(alloc, out, "and tell omniseedos what to do differently");
             },
             else => {},
         }
@@ -1710,16 +1710,16 @@ fn approvalChoiceLabel(approval: ApprovalProjection, choice: u8) []const u8 {
 
 fn approvalAmendmentLabel(choice: u8) []const u8 {
     return switch (choice) {
-        0 => "1. Yes, and tell fx what to do next",
-        2 => "3. No, and tell fx what to do differently",
+        0 => "1. Yes, and tell omniseedos what to do next",
+        2 => "3. No, and tell omniseedos what to do differently",
         else => "",
     };
 }
 
 fn approvalAmendmentPlaceholder(choice: u8) []const u8 {
     return switch (choice) {
-        0 => "and tell fx what to do next",
-        2 => "and tell fx what to do differently",
+        0 => "and tell omniseedos what to do next",
+        2 => "and tell omniseedos what to do differently",
         else => "",
     };
 }
@@ -1901,7 +1901,7 @@ fn approvalReasonLine(
     if (dynamic_mcp) {
         return std.mem.print(
             buf,
-            "  {s}Reason:{s} This MCP tool needs approval before fx can send the request.",
+            "  {s}Reason:{s} This MCP tool needs approval before omniseedos can send the request.",
             .{ dim, r },
         ) catch "  Reason: MCP tool approval required";
     }
@@ -1916,7 +1916,7 @@ fn approvalReasonLine(
     {
         return std.mem.print(buf, "  {s}Reason:{s} This action changes files in your workspace.", .{ dim, r }) catch "  Reason: file change requires approval";
     }
-    return std.mem.print(buf, "  {s}Reason:{s} This action needs approval before fx can continue.", .{ dim, r }) catch "  Reason: permission required";
+    return std.mem.print(buf, "  {s}Reason:{s} This action needs approval before omniseedos can continue.", .{ dim, r }) catch "  Reason: permission required";
 }
 
 fn approvalActionLine(buf: []u8, label: []const u8, target: []const u8) []const u8 {
@@ -2699,7 +2699,7 @@ test "approval panel amendment starts with a dim placeholder and cursor" {
     defer row.deinit(std.testing.allocator);
 
     const cursor_start = std.mem.find(u8, row.items, "\x1b[7ma") orelse return error.TestExpectedEqual;
-    const placeholder_remainder = std.mem.find(u8, row.items, "nd tell fx what to do next") orelse return error.TestExpectedEqual;
+    const placeholder_remainder = std.mem.find(u8, row.items, "nd tell omniseedos what to do next") orelse return error.TestExpectedEqual;
     try std.testing.expect(cursor_start < placeholder_remainder);
     try std.testing.expect(std.mem.find(u8, row.items, ui_render.statusline_style) != null);
 }

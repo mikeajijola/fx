@@ -36,6 +36,7 @@ pub const TopLevelKind = enum {
     replay,
     workspace,
     fossil,
+    schedule,
 };
 
 pub const SlashKind = enum {
@@ -53,6 +54,7 @@ pub const SlashKind = enum {
     image,
     images,
     model,
+    review_model,
     permissions,
     allowlist,
     stats,
@@ -301,7 +303,7 @@ pub fn renderTopLevelHelpWithStyle(alloc: Allocator, registry: TopLevelRegistry,
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
-    try writeStyled(&out.writer, style, .brand, "𝒇x");
+    try writeStyled(&out.writer, style, .brand, "omniseedos");
     try out.writer.writeByte(' ');
     try writeStyleStart(&out.writer, style, .muted);
     try out.writer.writeByte('v');
@@ -1611,8 +1613,8 @@ test "rendered top-level help is a complete CLI navigation page" {
     const text = try testTopLevelHelpText(std.testing.allocator);
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.startsWith(u8, text, "𝒇x v9.8.7\nFast, native coding agent for the terminal."));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "𝒇x"));
+    try std.testing.expect(std.mem.startsWith(u8, text, "omniseedos v9.8.7\nFast, native coding agent for the terminal."));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "omniseedos"));
     try std.testing.expect(std.mem.find(u8, text, "fx starts an interactive session by default.") != null);
     try std.testing.expect(std.mem.find(u8, text, "fx <command> [...flags] [...args]") != null);
     try std.testing.expect(std.mem.find(u8, text, "Commands:") != null);
@@ -1677,7 +1679,7 @@ test "terminal top-level help adds styling without changing visible content" {
     defer std.testing.allocator.free(stripped);
 
     try std.testing.expect(std.mem.find(u8, plain, "\x1b[") == null);
-    try std.testing.expect(std.mem.startsWith(u8, terminal, "\x1b[1m𝒇x\x1b[0m"));
+    try std.testing.expect(std.mem.startsWith(u8, terminal, "\x1b[1momniseedos\x1b[0m"));
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[1mUsage:\x1b[0m") != null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[39mask <prompt>\x1b[0m") != null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;243mFast, native coding agent") != null);
@@ -1831,7 +1833,7 @@ test "slash completion categories follow canonical entries" {
 test "help catalog groups visible commands and searches all command metadata" {
     const registry = testSlashRegistry();
 
-    try std.testing.expectEqual(@as(usize, 37), helpCatalogCount(registry, ""));
+    try std.testing.expectEqual(@as(usize, 38), helpCatalogCount(registry, ""));
     try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
     try std.testing.expectEqual(@as(usize, 5), helpCatalogCategoryCount(registry, "", .general));
     try std.testing.expectEqual(@as(usize, 3), helpCatalogCount(registry, "appearance"));
@@ -2141,12 +2143,13 @@ test "slash completion labels strip argument prefixes" {
 }
 
 test "slash completion descriptions follow completion matches" {
-    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/mo"));
+    try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(testSlashRegistry(), "/mo"));
     try std.testing.expectEqualStrings("/model", nthSlashCompletion(testSlashRegistry(), "/mo", 0).?);
+    try std.testing.expectEqualStrings("/review-model", nthSlashCompletion(testSlashRegistry(), "/mo", 1).?);
     try std.testing.expectEqualStrings("choose what model and reasoning effort to use", nthSlashCompletionDescription(testSlashRegistry(), "/mo", 0).?);
     try std.testing.expectEqualStrings("start a fresh conversation while keeping managed processes", nthSlashCompletionDescription(testSlashRegistry(), "/cl", 0).?);
     try std.testing.expectEqualStrings("undo the latest tracked file operation", nthSlashCompletionDescription(testSlashRegistry(), "/un", 0).?);
-    try std.testing.expectEqualStrings("open the fx feedback form", nthSlashCompletionDescription(testSlashRegistry(), "/fee", 0).?);
+    try std.testing.expectEqualStrings("open the omniseedos feedback form", nthSlashCompletionDescription(testSlashRegistry(), "/fee", 0).?);
     try std.testing.expectEqualStrings("copy a private diagnostic trace", nthSlashCompletionDescription(testSlashRegistry(), "/tr", 0).?);
     try std.testing.expectEqualStrings("summarize context into a fresh window", nthSlashCompletionDescription(testSlashRegistry(), "/comp", 0).?);
     try std.testing.expectEqualStrings("show alias availability", nthSlashCompletionDescription(testSlashRegistry(), "/ali", 0).?);

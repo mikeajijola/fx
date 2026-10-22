@@ -1,11 +1,12 @@
 import {afterEach,expect,test} from 'bun:test';
 import {resolve,join} from 'node:path';
-import {mkdirSync} from 'node:fs';
+import {existsSync,mkdirSync} from 'node:fs';
 import {execFileSync} from 'node:child_process';
 import {NativeClient} from './workspace-ui-client.mjs';
 import {cleanupFixtures,fixture,model} from './fossil-workspace-helpers';
 const clients:NativeClient[]=[];
-afterEach(async()=>{for(const client of clients.splice(0))await client.close();cleanupFixtures()});
+const services:ReturnType<typeof Bun.spawn>[]=[];
+afterEach(async()=>{for(const client of clients.splice(0))await client.close();for(const service of services.splice(0)){service.kill();await service.exited}cleanupFixtures()});
 function host(f:ReturnType<typeof fixture>){const native=new NativeClient({binary:resolve(import.meta.dir,'../../zig-out/bin/fx'),project:f.cwd,env:{...process.env,...f.env}});clients.push(native);return native}
 async function terminal(native:NativeClient,turn:string){return await new Promise<any>((resolve,reject)=>{const timer=setTimeout(()=>{native.off('event',listener);reject(Error('UI invocation did not stop'))},90000);const listener=(event:any)=>{if(event.turn===turn&&event.data.type==='turn_end'){clearTimeout(timer);native.off('event',listener);resolve(event)}};native.on('event',listener)})}
 test('native UI host saves governed turns and replays public events without repeating actions',async()=>{
@@ -60,3 +61,89 @@ test('workspace content is natively authorized in auto mode without an auxiliary
  const tool=seen.find(e=>e.data.type==='tool_start'&&e.data.call_id==='write');expect(tool.data.path).toBe('memory/native-owner.md');expect(tool.data.action).toBe('write');expect(tool.data.content).toBeUndefined();
  const state=await native.request('snapshot',{action:'fossil.status'});expect(state.files.includes('memory/native-owner.md')).toBe(true);expect(state.tasks[0].state).toBe('accepted');expect(native.stderr).toBe('');
 },90000);
+
+function nextEvent(native: NativeClient, matches: (event: any) => boolean) {
+ return new Promise<any>((resolve,reject)=>{
+  const timer=setTimeout(()=>{native.off('event',listener);reject(Error('Scheduled invocation did not expose its input'))},45000);
+  const listener=(event:any)=>{if(matches(event)){clearTimeout(timer);native.off('event',listener);resolve(event)}};
+  native.on('event',listener);
+ });
+}
+
+async function scheduledState(read:()=>Promise<any>, wanted:string) {
+ const deadline=Date.now()+45000;let latest:any;
+ do{latest=await read();if(latest.schedules[0]?.state===wanted)return latest;await Bun.sleep(100)}while(Date.now()<deadline);
+ throw Error(`Schedule did not become ${wanted}: ${JSON.stringify(latest)}`);
+}
+
+function questionCall() {
+ return {tool_calls:[{index:0,id:'scheduled-choice',type:'function',function:{name:'ask_user_question',arguments:JSON.stringify({questions:[{question:'Which presentation should the retained report use?',options:[{label:'Brief'},{label:'Detailed'}]}]})}}]};
+}
+
+test('scheduled UI work exposes its active native turn and accepts a user answer',async()=>{
+ const f=fixture();let phase='initial';
+ const provider=model(f,()=>phase==='question'?questionCall():{content:phase==='initial'?'The report needs a presentation choice.':'The retained report uses the requested brief presentation.'},()=>phase==='initial'?'blocked':phase==='question'?'pending':'met');
+ expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ expect((await f.run(['ask','Prepare a report after I choose its presentation','--json'])).code).toBe(1);
+ const task=JSON.parse((await f.run(['fossil','tasks','--json'])).stdout).tasks[0];
+ const native=host(f);const before=await native.request('schedule',{action:'list'});
+ const input=nextEvent(native,event=>event.data.type==='input_required'&&event.data.kind==='question');
+ phase='question';
+ const created=await native.request('schedule',{action:'add',task:task.id,at:'2020-01-01T09:00:00Z',revision:before.revision});
+ const required=await input.catch(async(error)=>{throw Error(`${error.message}: ${JSON.stringify(await native.request('schedule',{action:'show',id:created.schedules[0].id}))} ${native.stderr}`)});
+ expect(required.turn).toStartWith('schedule-');
+ expect((await native.request('initialize')).active_turn).toBe(required.turn);
+ const actors=provider.counts().actors;const secondHost=host(f);
+ const running=await secondHost.request('schedule',{action:'show',id:created.schedules[0].id});
+ expect(running.schedules[0].state).toBe('running');
+ expect(provider.counts().actors).toBe(actors);
+ phase='answered';
+ await native.request('input',{turn:required.turn,request_id:required.data.request_id,answers:['Brief']});
+ const final=await scheduledState(()=>native.request('schedule',{action:'show',id:created.schedules[0].id}),'completed');
+ expect(final.schedules[0].task_state).toBe('accepted');
+ expect(final.schedules[0].contract_version).toBe(task.definition.version);
+ expect(final.schedules[0].history.filter((event:any)=>event.kind==='running')).toHaveLength(1);
+ expect(native.stderr).toBe('');
+},120000);
+
+async function workspaceService(f:ReturnType<typeof fixture>) {
+ const token='scheduled-workspace-service-fixture-token';
+ const child=Bun.spawn([resolve(import.meta.dir,'../../zig-out/bin/fx'),'fossil','serve','0','--write','--json'],{cwd:f.cwd,env:{...process.env,...f.env,OMOS_WORKSPACE_TOKEN:token},stdout:'pipe',stderr:'pipe'});
+ services.push(child);const reader=(child.stdout as ReadableStream<Uint8Array>).getReader();let bytes='';
+ try{
+  while(!bytes.includes('\n')){
+   const result=await Promise.race([reader.read(),Bun.sleep(15000).then(()=>{throw Error('Scheduled HTTP host did not become ready')})]);
+   if(result.done)throw Error('Scheduled HTTP host exited before readiness');bytes+=new TextDecoder().decode(result.value);
+  }
+ }finally{reader.releaseLock()}
+ const ready=JSON.parse(bytes.split('\n')[0]);
+ return {child,ready,request:(body:object,authorized=true)=>fetch(`http://127.0.0.1:${ready.port}/v1/schedules`,{method:'POST',headers:{authorization:`Bearer ${authorized?token:'wrong-token'}`,'content-type':'application/json'},body:JSON.stringify({version:'omos.schedule/v1',workspace:ready.workspace,...body})})};
+}
+
+test.each(['question','approval'])('scheduled HTTP work retains %s without waiting for terminal input',async(kind)=>{
+ const f=fixture();let scheduled=false;
+ const provider=model(f,()=>scheduled?(kind==='question'?questionCall():{tool_calls:[{index:0,id:'scheduled-write',type:'function',function:{name:'shell',arguments:JSON.stringify({request:{action:'run',command:'printf scheduled-permission > permission-held.txt',timeout_ms:10000}})}}]}):{content:'A presentation choice is still required.'},()=>scheduled?'pending':'blocked');
+ expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ expect((await f.run(['ask','Prepare the report after its presentation is chosen','--json'])).code).toBe(1);
+ const task=JSON.parse((await f.run(['fossil','tasks','--json'])).stdout).tasks[0];
+ const isolated=kind==='approval'?{...f,env:{...f.env,FX_PERMISSION_MODE:'ask'}}:f;
+ const service=await workspaceService(isolated);
+ expect((await service.request({action:'list'},false)).status).toBe(401);
+ const list=await(await service.request({action:'list'})).json();
+ expect((await service.request({action:'add',task:task.id,at:'2020-01-01T09:00:00Z'})).status).toBe(400);
+ scheduled=true;
+ const create=await service.request({action:'add',task:task.id,at:'2020-01-01T09:00:00Z',revision:list.revision});
+ expect(create.status).toBe(200);const created=await create.json();
+ const final=await scheduledState(async()=>(await service.request({action:'show',id:created.schedules[0].id})).json(),'waiting');
+ expect(final.schedules[0].reason).toBe('ScheduledInputRequired');
+ expect(final.schedules[0].task_state).not.toBe('accepted');
+ if(kind==='approval')expect(existsSync(join(f.cwd,'permission-held.txt'))).toBe(false);
+ expect(final.schedules[0].history.filter((event:any)=>event.kind==='running')).toHaveLength(1);
+ const actors=provider.counts().actors;
+ service.child.kill();await service.child.exited;services.splice(services.indexOf(service.child),1);
+ expect(await new Response(service.child.stderr).text()).toBe('');
+ const restarted=await workspaceService(isolated);
+ const retained=await(await restarted.request({action:'show',id:created.schedules[0].id})).json();
+ expect(retained.schedules[0].state).toBe('waiting');
+ expect(provider.counts().actors).toBe(actors);
+},120000);

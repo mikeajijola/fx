@@ -432,6 +432,20 @@ pub fn loadStartupStateForRun(
     return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .refresh_if_needed, null, model_override);
 }
 
+pub fn loadStartupStateForRunInWorkspace(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    workspace_root: []const u8,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+    auth_mode: credentials.AuthMode,
+    model_override: ?[]const u8,
+) !StartupState {
+    const owned_workspace = try io_mod.realpathAlloc(alloc, workspace_root);
+    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, owned_workspace, default_model, default_agent_step_limit, auth_mode, null, .refresh_if_needed, null, model_override);
+}
+
 pub fn loadStartupStateWithoutCredentials(alloc: Allocator, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_agent_step_limit, .local, null, null, null, null);
