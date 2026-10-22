@@ -44,3 +44,19 @@ test('a live UI host cannot silently retarget a changed workspace binding',async
  await expect(native.request('snapshot',{action:'fossil.status'})).rejects.toThrow('WorkspaceBindingChanged');
  await expect(native.request('prompt',{text:'This request must not run in another repository.'},{id:'changed-binding-request'})).rejects.toThrow('WorkspaceBindingChanged');
 },90000);
+
+test('workspace content is natively authorized in auto mode without an auxiliary safety reviewer', async()=>{
+ const f=fixture();let stage=0;const calls:any[]=[];
+ model(f,(body)=>{calls.push(body);stage++;
+  if(stage===1)return {tool_calls:[{index:0,id:'status',type:'function',function:{name:'fossil_workspace',arguments:JSON.stringify({action:'status'})}}]};
+  if(stage===2)return {tool_calls:[{index:0,id:'write',type:'function',function:{name:'fossil_workspace',arguments:JSON.stringify({action:'write',path:'memory/native-owner.md',content:'Workspace ownership checked by the native host.'})}}]};
+  return {content:'Saved the workspace note.'};
+ });
+ expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ const native=host({...f,env:{...f.env,FX_PERMISSION_MODE:'auto'}});const seen:any[]=[];native.on('event',(event:any)=>seen.push(event));
+ const ending=terminal(native,'native-workspace-authority');await native.request('prompt',{text:'Save a note in this workspace.'},{id:'native-workspace-authority'});await ending;
+ expect(calls.length).toBe(3);
+ expect(calls[0].messages.some((m:any)=>m.role==='system'&&m.content.includes('Fossil ui/ tree'))).toBe(true);
+ const tool=seen.find(e=>e.data.type==='tool_start'&&e.data.call_id==='write');expect(tool.data.path).toBe('memory/native-owner.md');expect(tool.data.action).toBe('write');expect(tool.data.content).toBeUndefined();
+ const state=await native.request('snapshot',{action:'fossil.status'});expect(state.files.includes('memory/native-owner.md')).toBe(true);expect(state.tasks[0].state).toBe('accepted');expect(native.stderr).toBe('');
+},90000);

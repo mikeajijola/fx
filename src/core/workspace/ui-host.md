@@ -29,3 +29,7 @@ Complete frontend source belongs under `ui/`. Its manifest pins `omos.ui-source/
 The native completion path retains the candidate before requesting validation. A source change invalidates earlier validation. Compilation failure requires further work; unavailable validation retains a review failure for later verification. Independent contract review still decides whether obligations are met. Publication checks the source receipt again before writing its durable publication operation.
 
 Compilation receipts establish compilation, not visual correctness or external-action success. The compatible external renderer must provide isolation, preview recovery, browser verification and a way to rebuild its disposable cache from saved Fossil source.
+
+Native UI turns identify the Fossil `ui/` tree as the running interface source. Tool-start events expose only bounded `path` and workspace `action` presentation fields, not file content or arbitrary arguments. Tool outcomes preserve their native kind and summary so the interface can show a held or denied action.
+
+The `fossil_workspace` tool uses native workspace ownership and protected-path checks without a second model safety review. Configured permission rules still apply. A saved task is required for mutations; ephemeral sessions remain read-only. The tool cannot overwrite host-owned evidence, assessments or publication receipts. Completion still requires independent verification and native publication.

@@ -863,7 +863,7 @@ pub const fossil_workspace = ToolSpec{
     },
     .executor_kind = .fossil_workspace,
     .activity_kind = .read,
-    .requires_approval = true,
+    .requires_approval = false,
     .action_label = "Accessing workspace",
     .completed_action_label = "Accessed workspace",
     .decode = fossil_workspace_impl.decode,

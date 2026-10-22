@@ -1386,7 +1386,14 @@ pub fn runUi(alloc: Allocator, args: []const [:0]const u8, cfg: Config, context_
         stopping.store(true, .release);
         monitor.join();
     }
-    return runWithDeps(alloc, args, cfg, .{
+    var ui_cfg = cfg;
+    const ui_system = try alloc.print("{s}\n\n{s}", .{
+        cfg.prompt_policy.system_prompt,
+        "This turn is hosted by the workspace UI. Its running source is the Fossil ui/ tree, not a Git starter template or legacy ui directory. For interface requests, first use fossil_workspace status, then read the exact ui/ source paths from its inventory and write changes with fossil_workspace on the saved task branch. Do not edit omos-ui/template or archived prototypes to change the running interface. Workspace content operations are authorized by the native workspace owner; protected records, permissions, validation and publication remain host-owned. Give concise progress commentary and surface failed tools instead of silently searching unrelated repositories.",
+    });
+    defer alloc.free(ui_system);
+    ui_cfg.prompt_policy.system_prompt = ui_system;
+    return runWithDeps(alloc, args, ui_cfg, .{
         .ui_host = ui,
         .stdout_ctx = ui,
         .stderr_ctx = ui,
@@ -3548,10 +3555,35 @@ fn writeRawAssistantBytes(ctx: *AskContext, text: []const u8) !void {
         @intCast(@min(trailing, 2));
 }
 
+const UiToolTarget = struct { path: ?[]const u8 = null, action: ?[]const u8 = null };
+
+fn uiToolTarget(arena: Allocator, name: []const u8, arguments: ?[]const u8) UiToolTarget {
+    if (!std.mem.eql(u8, name, "fossil_workspace") and !std.mem.eql(u8, name, "read_file") and !std.mem.eql(u8, name, "write_file") and !std.mem.eql(u8, name, "edit_file")) return .{};
+    const args = std.json.parseFromSliceLeaky(std.json.Value, arena, arguments orelse return .{}, .{}) catch return .{};
+    if (args != .object) return .{};
+    var target: UiToolTarget = .{};
+    if (args.object.get("path")) |path| {
+        if (path == .string and path.string.len <= 4096) target.path = path.string;
+    }
+    if (std.mem.eql(u8, name, "fossil_workspace")) {
+        if (args.object.get("action")) |action| {
+            if (action == .string and action.string.len <= 64) target.action = action.string;
+        }
+    }
+    return target;
+}
+
 fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (ctx.deps.ui_host) |ui| switch (event) {
-        .authoritative_started => |value| try ui.emit(.{ .type = "tool_start", .call_id = value.id.call_id, .name = value.tool_name }),
+        .authoritative_started => |value| {
+            // Only presentation targets leave the native host, never file contents,
+            // command arguments, credentials or provider replay data.
+            var arena = std.heap.ArenaAllocator.init(ctx.alloc);
+            defer arena.deinit();
+            const target = uiToolTarget(arena.allocator(), value.tool_name, value.arguments_json);
+            try ui.emit(.{ .type = "tool_start", .call_id = value.id.call_id, .name = value.tool_name, .path = target.path, .action = target.action });
+        },
         .progress => |value| try ui.emit(.{ .type = "tool_progress", .call_id = value.id.call_id, .text = value.text }),
         .terminal => |value| try ui.emit(.{ .type = "tool_end", .call_id = value.id.call_id, .outcome = value.outcome }),
         else => {},
