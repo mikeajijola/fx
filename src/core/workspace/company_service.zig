@@ -211,7 +211,8 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
         const project = try std.Io.Dir.path.join(alloc, &.{ manager.root, "company-workers", id });
         const previous = try manager.active(session);
         if (previous == null and (request.revision == null or !std.mem.eql(u8, request.revision.?, revision_id))) return error.WorkspaceRevisionChanged;
-        const task = try manager.bindCompanyTask(if (previous) |value| value else try manager.start(session, project, objective, null), .{ .actor = grant.actor, .grant = grant.id });
+        const binding: authority.Binding = .{ .actor = grant.actor, .grant = grant.id };
+        const task = if (previous) |value| try manager.bindCompanyTask(value, binding) else try manager.startCompany(session, project, objective, binding);
         const view: View = .{ .id = id, .actor = grant.actor, .grant = grant.id, .task = task.id, .base = task.base_revision };
         _ = try manager.companyWrite(try manager.companyRevision(), &.{.{ .path = try alloc.print("company/views/{s}.json", .{id}), .content = try encode(alloc, view) }});
         return encode(alloc, .{ .view = id, .revision = try manager.currentRevision(task), .base = task.base_revision, .contract = task.definition, .basis = task.model_basis });

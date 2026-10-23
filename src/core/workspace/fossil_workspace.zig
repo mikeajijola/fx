@@ -1030,6 +1030,12 @@ pub const Manager = struct {
     }
 
     fn checkout(self: Manager, branch: []const u8) ![]const u8 {
+        // Company actors use the scoped content API, never this host scratch
+        // directory. The enclosing writer lease serializes branch switches.
+        if (std.mem.startsWith(u8, branch, "task/") and safeId(branch[5..])) {
+            const task = self.loadTask(branch[5..]) catch null;
+            if (task != null and task.?.authority != null) return self.checkoutAt("company-content", branch);
+        }
         return self.checkoutAt(branch, branch);
     }
 
@@ -1184,6 +1190,15 @@ pub const Manager = struct {
     /// Starts from an exact parent revision. Each task owns a separate Fossil
     /// checkout; branch changes never affect Git's checkout or another task.
     pub fn start(self: Manager, session: []const u8, project: []const u8, goal: []const u8, parent: ?Task) !Task {
+        return self.startBound(session, project, goal, parent, null);
+    }
+
+    pub fn startCompany(self: Manager, session: []const u8, project: []const u8, goal: []const u8, authority: @import("company_authority.zig").Binding) !Task {
+        if (!self.company_operation_held) return error.CompanyOperationLeaseRequired;
+        return self.startBound(session, project, goal, null, authority);
+    }
+
+    fn startBound(self: Manager, session: []const u8, project: []const u8, goal: []const u8, parent: ?Task, authority: ?@import("company_authority.zig").Binding) !Task {
         if (goal.len > max_bytes or !std.unicode.utf8ValidateSlice(goal)) return error.WorkspaceGoalTooLarge;
         const lease = try Lease.acquire(self.alloc, self.root);
         defer lease.release();
@@ -1215,6 +1230,7 @@ pub const Manager = struct {
             .parent_contract_version = if (parent) |p| p.definition.version else null,
             .base_revision = base,
             .project_root = project,
+            .authority = authority,
             .request_artifact = request_artifact,
             .model_basis = if (parent) |p| blk: {
                 var basis = p.model_basis;
@@ -1228,7 +1244,7 @@ pub const Manager = struct {
                 .obligations = &.{.{ .id = "request_complete", .description = "Fulfil every requested outcome and acceptance criterion, using successful host evidence for actions." }},
             },
         };
-        const tree = try self.checkout(branch);
+        const tree = if (authority != null) try self.checkoutAt("company-content", branch) else try self.checkout(branch);
         if (request_artifact) |path| try atomicWrite(self.alloc, try join(self.alloc, tree, path), request_text);
         try atomicWrite(self.alloc, try join(self.alloc, tree, try self.taskPath(id)), try json(self.alloc, task));
         _ = try self.commit(tree, "Record task contract");
@@ -2325,7 +2341,7 @@ pub const Manager = struct {
             if (!std.mem.eql(u8, try self.revision(publication.task.branch), publication.source)) return error.WorkspaceRevisionChanged;
             var nonce: [16]u8 = undefined;
             io_mod.getIo().random(&nonce);
-            const key = try self.alloc.print("publication/{s}/{s}", .{ publication.operation, std.fmt.bytesToHex(&nonce, .lower) });
+            const key = if (publication.task.authority != null) "company-integration" else try self.alloc.print("publication/{s}/{s}", .{ publication.operation, std.fmt.bytesToHex(&nonce, .lower) });
             const tree = try self.checkoutAt(key, try self.revision(publication.target));
             // The lease protects this manager's writers; Fossil's no-fork commit
             // also fences external processes that advance the target branch.

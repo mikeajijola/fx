@@ -84,8 +84,10 @@ advances the epoch and revokes old grants. Re-enroll actors deliberately. On the
 same host, recovery refuses a stale copy and fences the previous repository after
 successful activation. These local locks do not provide cross-host consensus.
 
-Task workspaces still use full native checkouts. Set capacity expectations from
-measured repository size, active view count, review duration, and storage growth.
-Sparse projections, bounded shared caches, and continuous concurrent
+Company views reuse host mutation and integration checkouts while retaining
+separate canonical branches. Personal tasks still use their own native checkouts.
+Measure repository size, host checkout size, active view count, review duration,
+and storage growth when setting capacity expectations. Sparse projections,
+bounded shared caches, and continuous concurrent
 reconciliation remain required before treating this deployment as the complete
 large-company model.

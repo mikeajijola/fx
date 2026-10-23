@@ -135,6 +135,61 @@ describe("portable Fossil workspace recovery", () => {
     }
   }, 120000);
 
+  test("keeps company drafts isolated without copying the company files for every view", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const document = "shared company document\n".repeat(3000);
+    const documentPath = "documents/team/shared.txt";
+    const documentHash = createHash("sha256").update(document).digest("hex");
+    model(f, (_body, count) => {
+      if (count === 1) return { tool_calls: [
+        { path: documentPath, content: document },
+        { path: "memory/company-seed.json", content: JSON.stringify({ files: [{ path: documentPath, sha256: documentHash, bytes: Buffer.byteLength(document) }] }) },
+      ].map((value, index) => ({ index, id: `company-seed-${index}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", ...value }) } })) };
+      if (count === 2) return { tool_calls: [{ index: 0, id: "verify-company-seed", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "verify_manifest", path: "memory/company-seed.json" }) } }] };
+      return { content: "The shared document and its complete host manifest verification are saved." };
+    });
+    const seeded = await f.run(["ask", "Save the shared company document and verify its exact bytes", "--json"]);
+    expect(seeded.code, seeded.stderr).toBe(0);
+    const admin = async (body: object) => {
+      const file = join(f.home, "operator.json");
+      writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+      const result = await f.run(["fossil", "company", file, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    const company = await admin({ action: "initialize" });
+    const key = generateKeyPairSync("ed25519");
+    await admin({ action: "grant", revision: company.revision, grant: { id: "draft-worker", actor: "worker", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["documents/team/"], actions: ["create_view", "checkpoint", "read"], expires_ms: Date.now() + 3600000 } });
+    const repository = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout).repository;
+    const checkouts = join(f.home, ".fx/fossil", createHash("sha256").update(repository).digest("hex"), "checkouts");
+    const copies = () => readdirSync(checkouts, { withFileTypes: true }).filter(entry => entry.isDirectory() && existsSync(join(checkouts, entry.name, documentPath))).length;
+    const before = copies();
+    const service = await startWorkspaceService(f, true);
+    try {
+      const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+      const send = async (action: string, params: object) => {
+        const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "worker", grant: "draft-worker", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action, ...params });
+        const response = await fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", connection: "close" }, body: JSON.stringify({ payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") }) });
+        const result = await response.json() as any;
+        expect(response.status, JSON.stringify(result)).toBe(200);
+        return JSON.parse(result.payload).result;
+      };
+      const views = [];
+      for (let index = 0; index < 8; index++) views.push(await send("create_view", { revision: boot.revision, objective: `Prepare private company draft ${index}` }));
+      expect(copies() - before).toBeLessThanOrEqual(1);
+      await send("checkpoint", { view: views[0].view, revision: views[0].revision, path: documentPath, previous_hash: documentHash, content: "First private draft" });
+      await send("checkpoint", { view: views[1].view, revision: views[1].revision, path: documentPath, previous_hash: documentHash, content: "Second private draft" });
+      for (const [view, expected] of [[views[0], "First private draft"], [views[1], "Second private draft"], [views[7], document]] as const) {
+        const read = await send("read", { view: view.view, path: documentPath, limit: 16 });
+        expect(read.sha256).toBe(createHash("sha256").update(expected).digest("hex"));
+      }
+      expect(copies() - before).toBeLessThanOrEqual(1);
+    } finally {
+      service.child.kill(); await service.child.exited;
+    }
+  }, 180000);
+
   test("publishes issuer keys atomically and recovers interrupted company initialization", async () => {
     for (const stage of ["issuer-key-prepared", "issuer-binding-published"]) {
       const f = fixture();

@@ -288,6 +288,15 @@ own view. Content reads use bounded base64 byte ranges and SHA-256 hashes.
 Scoped export currently returns a paginated content manifest for those reads;
 it does not clone the company repository or export issuer authority.
 
+Each company view retains its own task branch, base revision, contract, and
+private changes. Unchanged files reuse Fossil content objects. Scoped actors
+retrieve content through the service; they receive no access to the host's
+scratch directories. The host serializes mutations through one reusable company
+checkout and uses one integration checkout for publication. Creating more views
+does not create another complete filesystem copy for each actor. These host
+checkouts can still materialize a complete revision; sparse client files and a
+bounded shared cache require further implementation.
+
 Mutations retain a request hash and pending outcome before effects. Completed
 retries return the saved result after a fresh authority check. Reusing an
 operation ID for different bytes is rejected. Checkpoint receipts commit with
