@@ -1,17 +1,17 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync, sign, verify, createPublicKey } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { cleanupFixtures, fixture, model, writeMemory } from "./fossil-workspace-helpers";
 
 afterEach(cleanupFixtures);
 
-async function startWorkspaceService(f: ReturnType<typeof fixture>, writable = false) {
+async function startWorkspaceService(f: ReturnType<typeof fixture>, writable = false, extra: Record<string, string | undefined> = {}) {
   const token = "isolated-workspace-service-token-for-fixtures";
   const child = Bun.spawn([join(import.meta.dir, "../../zig-out/bin/fx"), "fossil", "serve", "0", "--json", ...(writable ? ["--write"] : [])], {
-    cwd: f.cwd, env: { ...process.env, ...f.env, OMOS_WORKSPACE_TOKEN: token }, stdout: "pipe", stderr: "pipe",
+    cwd: f.cwd, env: { ...process.env, ...f.env, ...extra, OMOS_WORKSPACE_TOKEN: token }, stdout: "pipe", stderr: "pipe",
   });
   const reader = child.stdout.getReader();
   let output = "";
@@ -46,6 +46,363 @@ async function startWorkspaceService(f: ReturnType<typeof fixture>, writable = f
 
 // These fault, boundary, migration, and authority cases qualify the candidate without training it.
 describe("portable Fossil workspace recovery", () => {
+  test("authenticates scoped company views, fences concurrent checkpoints, retains outcomes and revokes access", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const admin = async (request: object) => {
+      const file = join(f.home, "company-admin.json");
+      writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...request }));
+      const result = await f.run(["fossil", "company", file, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    const initialized = await admin({ action: "initialize" });
+    const key = generateKeyPairSync("ed25519");
+    const publicKey = key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex");
+    let control = await admin({ action: "grant", revision: initialized.revision, grant: {
+      id: "alice-team", actor: "alice", public_key: publicKey, paths: ["documents/team/"],
+      actions: ["discover", "read", "create_view", "checkpoint", "submit", "status", "export_scope"], expires_ms: Date.now() + 3600000,
+    } });
+    let service = await startWorkspaceService(f, true);
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const envelope = (action: string, params: object = {}, operation = crypto.randomUUID()) => {
+      const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "alice", grant: "alice-team", operation, expires_ms: Date.now() + 120000, action, ...params });
+      return { payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") };
+    };
+    const post = async (body: object, headers = {}) => {
+      try { return await fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", connection: "close", ...headers }, body: JSON.stringify(body) }); }
+      catch (error) {
+        service.child.kill(); await service.child.exited;
+        throw Error(`${error}\n${await new Response(service.child.stderr).text()}\n${existsSync(f.env.FX_TRACE_LOG) ? readFileSync(f.env.FX_TRACE_LOG, "utf8").slice(-12000) : ""}`);
+      }
+    };
+    const unpack = async (response: Response) => {
+      const result = await response.json() as any;
+      expect(response.status, JSON.stringify(result)).toBe(200);
+      const issuer = createPublicKey({ key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(result.issuer, "hex")]), format: "der", type: "spki" });
+      expect(result.issuer).toBe(boot.issuer);
+      expect(verify(null, Buffer.from(result.payload), issuer, Buffer.from(result.signature, "hex"))).toBe(true);
+      return JSON.parse(result.payload).result;
+    };
+    try {
+      const invalid = envelope("discover");
+      invalid.signature = "00".repeat(64);
+      expect((await post(invalid)).status).toBe(403);
+      expect((await post(envelope("discover"), { origin: "https://untrusted.invalid" })).status).toBe(401);
+      const create = envelope("create_view", { objective: "Prepare a portable team report", revision: boot.revision });
+      const view = await unpack(await post(create));
+      expect((await unpack(await post(create))).view).toBe(view.view);
+      const a = envelope("checkpoint", { view: view.view, revision: view.revision, path: "documents/team/report.md", content: "Team report", previous_hash: null });
+      const b = envelope("checkpoint", { view: view.view, revision: view.revision, path: "documents/team/other.md", content: "Other report", previous_hash: null });
+      const replies = await Promise.all([post(a), post(b)]);
+      expect(replies.map(reply => reply.status).sort()).toEqual([200, 409]);
+      const firstIndex = replies[0].status === 200 ? 0 : 1;
+      const successful = await unpack(replies[firstIndex]);
+      const acceptedRequest = firstIndex === 0 ? a : b;
+      expect(await unpack(await post(acceptedRequest))).toEqual(successful);
+      expect(await unpack(await post({ signature: acceptedRequest.signature.toUpperCase(), payload: acceptedRequest.payload }))).toEqual(successful);
+      const changed = JSON.parse(acceptedRequest.payload);
+      const changedRequest = envelope("checkpoint", { ...changed, content: "Changed operation" }, changed.operation);
+      expect((await post(changedRequest)).status).toBe(409);
+      const denied = envelope("checkpoint", { view: view.view, revision: successful.revision, path: "documents/private/report.md", content: "leak" });
+      expect((await post(denied)).status).toBe(403);
+      const inventory = await unpack(await post(envelope("export_scope", { view: view.view, revision: successful.revision })));
+      expect(inventory.files).toHaveLength(1);
+      expect(inventory.files[0].path.startsWith("documents/team/")).toBe(true);
+      expect(inventory.authority).toBe("content_only");
+      const read = await unpack(await post(envelope("read", { view: view.view, revision: successful.revision, path: inventory.files[0].path, limit: 4 })));
+      expect(read.next_offset).toBe(4);
+      expect(Buffer.from(read.content, "base64").length).toBe(4);
+      const otherKey = generateKeyPairSync("ed25519");
+      control = await admin({ action: "status" });
+      control = await admin({ action: "grant", revision: control.revision, grant: {
+        id: "bob-team", actor: "bob", public_key: otherKey.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["documents/team/"], actions: ["read"], expires_ms: Date.now() + 3600000,
+      } });
+      const stolenPayload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "bob", grant: "bob-team", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action: "read", path: inventory.files[0].path, revision: successful.revision });
+      expect((await post({ payload: stolenPayload, signature: sign(null, Buffer.from(stolenPayload), otherKey.privateKey).toString("hex") })).status).toBe(403);
+      service.child.kill();
+      await service.child.exited;
+      service = await startWorkspaceService(f, true);
+      expect(await unpack(await post(acceptedRequest))).toEqual(successful);
+      // Administrative revisions include operations as well as grants.
+      control = await admin({ action: "status" });
+      await admin({ action: "revoke", revision: control.revision, id: "alice-team" });
+      expect((await post(acceptedRequest)).status).toBe(403);
+      expect((await post(envelope("read", { view: view.view, revision: successful.revision, path: inventory.files[0].path }))).status).toBe(403);
+    } finally {
+      service.child.kill();
+      await service.child.exited;
+    }
+  }, 120000);
+
+  test("publishes independently reviewed company proposals and fences revocation during assessment", async () => {
+    for (const revoked of [false, true]) {
+      const f = fixture();
+      let release: (() => void) | undefined;
+      let reviewing = false;
+      const wait = new Promise<void>(resolve => { release = resolve; });
+      const modelServer = model(f, () => { throw Error("Company verification must never run actor tools"); }, async () => {
+        reviewing = true;
+        if (revoked) await wait;
+        return "met";
+      });
+      const initialized = await f.run(["fossil", "init"]);
+      expect(initialized.code, initialized.stderr).toBe(0);
+      const admin = async (body: object) => {
+        const file = join(f.home, "operator.json");
+        writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+        const result = await f.run(["fossil", "company", file, "--json"]);
+        expect(result.code, result.stderr).toBe(0);
+        return JSON.parse(result.stdout).model_data;
+      };
+      const company = await admin({ action: "initialize" });
+      const key = generateKeyPairSync("ed25519");
+      await admin({ action: "grant", revision: company.revision, grant: { id: "reviewed-worker", actor: "worker", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["documents/"], actions: ["create_view", "checkpoint", "submit", "status"], expires_ms: Date.now() + 3600000 } });
+      const service = await startWorkspaceService(f, true);
+      const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+      const send = async (action: string, params: object = {}) => {
+        const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "worker", grant: "reviewed-worker", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action, ...params });
+        const response = await fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", connection: "close" }, body: JSON.stringify({ payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") }) });
+        const result = await response.json() as any;
+        expect(response.status, JSON.stringify(result)).toBe(200);
+        return JSON.parse(result.payload).result;
+      };
+      try {
+        const view = await send("create_view", { revision: boot.revision, objective: "Save documents/report.md containing Reviewed report" });
+        const saved = await send("checkpoint", { view: view.view, revision: view.revision, path: "documents/report.md", content: "Reviewed report", previous_hash: null });
+        const submitted = await send("submit", { view: view.view, revision: saved.revision, candidate: "Saved documents/report.md containing Reviewed report." });
+        const deadline = Date.now() + 60000;
+        while (!reviewing && Date.now() < deadline) await Bun.sleep(20);
+        expect(reviewing).toBe(true);
+        if (revoked) {
+          const current = await admin({ action: "status" });
+          await admin({ action: "revoke", revision: current.revision, id: "reviewed-worker" });
+          release!();
+        }
+        let job: any;
+        while (Date.now() < deadline) {
+          const tasks = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks;
+          const task = tasks.find((task: any) => task.review_job === submitted.job);
+          job = JSON.parse(f.fossil("cat", `jobs/${submitted.job}.json`, "-r", task.state === "accepted" ? task.parent : task.branch));
+          if (!["queued", "running"].includes(job.state)) break;
+          await Bun.sleep(20);
+        }
+        expect(job.state, JSON.stringify({ job, model: modelServer.counts() }) + "\n" + readFileSync(f.env.FX_TRACE_LOG, "utf8").slice(-6000)).toBe(revoked ? "failed" : "published");
+        if (revoked) expect(f.fossil("ls", "-r", "trunk")).not.toContain("documents/report.md");
+        else expect(f.fossil("cat", "documents/report.md", "-r", "trunk")).toBe("Reviewed report");
+        expect(modelServer.counts().actors).toBe(0);
+      } finally {
+        release!(); service.child.kill(); await service.child.exited;
+      }
+    }
+  }, 180000);
+
+  test("reconciles a committed company checkpoint after losing its acknowledgement", async () => {
+    const f = fixture();
+    const initialized = await f.run(["fossil", "init"]);
+    expect(initialized.code, initialized.stderr).toBe(0);
+    const admin = async (body: object) => {
+      const file = join(f.home, "admin.json");
+      writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+      const result = await f.run(["fossil", "company", file, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    const company = await admin({ action: "initialize" });
+    const key = generateKeyPairSync("ed25519");
+    await admin({ action: "grant", revision: company.revision, grant: { id: "worker", actor: "worker", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["documents/"], actions: ["create_view", "checkpoint", "status", "discover"], expires_ms: Date.now() + 3600000 } });
+    const service = await startWorkspaceService(f, true, { FX_E2E_FOSSIL_FAULT: "company-checkpoint-committed" });
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const seal = (action: string, params: object = {}) => {
+      const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "worker", grant: "worker", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action, ...params });
+      return { payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") };
+    };
+    const send = (request: object) => fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", connection: "close" }, body: JSON.stringify(request) });
+    const data = async (response: Response) => {
+      const result = await response.json() as any;
+      expect(response.status, JSON.stringify(result)).toBe(200);
+      return JSON.parse(result.payload).result;
+    };
+    try {
+      const view = await data(await send(seal("create_view", { revision: boot.revision, objective: "Save an interrupted report" })));
+      const original = seal("checkpoint", { view: view.view, revision: view.revision, path: "documents/report.md", content: "Saved once", previous_hash: null });
+      const failure = await send(original);
+      expect(failure.status).toBe(400);
+      expect((await failure.json() as any).error).toBe("WorkspaceInjectedFailure");
+      const operation = JSON.parse(original.payload).operation;
+      const pending = await data(await send(seal("status", { outcome: operation })));
+      expect(pending.state).toBe("uncertain");
+      const blocked = await send(seal("checkpoint", { view: view.view, revision: view.revision, path: "documents/other.md", content: "Must wait" }));
+      expect((await blocked.json() as any).error).toBe("CompanyOperationRecoveryRequired");
+      const resumed = await data(await send(original));
+      expect(resumed.state).toBe("checkpointed");
+      expect(await data(await send(original))).toEqual(resumed);
+      const completed = await data(await send(seal("status", { outcome: operation })));
+      expect(completed.state).toBe("completed");
+      const snapshot = await data(await send(seal("discover", { view: view.view, revision: resumed.revision })));
+      expect(snapshot.files).toHaveLength(1);
+      expect(snapshot.files[0].sha256).toBe(createHash("sha256").update("Saved once").digest("hex"));
+      expect(f.fossil("ls", "-r", resumed.revision).split("\n").filter(path => path.startsWith("company/checkpoints/"))).toHaveLength(1);
+    } finally {
+      service.child.kill(); await service.child.exited;
+    }
+  }, 90000);
+
+  test("does not initialize personal persistence for an unsaved turn", async () => {
+    const f = fixture();
+    model(f, () => ({ content: "Hello." }));
+    const result = await f.run(["ask", "Say hello", "--no-save", "--json"]);
+    expect(result.code, result.stderr).toBe(0);
+    expect(existsSync(join(f.home, ".fx/omos-workspace.json"))).toBe(false);
+    expect(existsSync(join(f.home, ".fx/instances/personal.fossil"))).toBe(false);
+  }, 60000);
+
+  test("installs a verified Fossil helper and rejects changes before executing it", async () => {
+    const f = fixture();
+    const script = join(import.meta.dir, "../../scripts/install-omos.sh");
+    const installed = spawnSync("sh", [script], { cwd: f.cwd, env: { ...process.env, ...f.env, XDG_BIN_HOME: join(f.home, ".local/bin") }, encoding: "utf8", timeout: 60000 });
+    expect(installed.status, installed.stderr).toBe(0);
+    const manifest = JSON.parse(readFileSync(join(f.home, ".fx/libexec/fossil.json"), "utf8"));
+    const helper = join(f.home, ".fx/libexec", manifest.file);
+    expect(createHash("sha256").update(readFileSync(helper)).digest("hex")).toBe(manifest.sha256);
+    const status = await f.run(["fossil", "status", "--json"], { PATH: "/nonexistent" });
+    expect(status.code, status.stderr).toBe(0);
+    expect(JSON.parse(status.stdout).tasks).toEqual([]);
+    for (const command of ["omos", "omo"]) {
+      const alias = spawnSync(join(f.home, ".local/bin", command), ["fossil", "status", "--json"], { cwd: f.cwd, env: { ...process.env, ...f.env }, encoding: "utf8" });
+      expect(alias.status, alias.stderr).toBe(0);
+      expect(JSON.parse(alias.stdout).workspace_id).toBe(JSON.parse(status.stdout).workspace_id);
+    }
+    appendFileSync(helper, "changed");
+    const changed = await f.run(["fossil", "status", "--json"]);
+    expect(changed.code).toBe(1);
+    expect(changed.stderr).toContain("FossilExecutableChanged");
+  }, 90000);
+
+  test("creates one empty personal instance automatically without importing existing sessions", async () => {
+    const f = fixture();
+    mkdirSync(join(f.home, ".fx", "sessions", "legacy"), { recursive: true });
+    writeFileSync(join(f.home, ".fx", "sessions", "legacy", "session.json"), JSON.stringify({ private: "legacy-session-must-not-be-imported" }));
+    const attempts = await Promise.all([f.run(["fossil", "ensure", "--json"]), f.run(["fossil", "ensure", "--json"])]);
+    for (const attempt of attempts) expect(attempt.code, attempt.stderr).toBe(0);
+    const first = JSON.parse(attempts[0].stdout);
+    const second = JSON.parse(attempts[1].stdout);
+    expect(first.workspace_id).toBe(second.workspace_id);
+    expect(first.repository).toBe(join(f.home, ".fx", "instances", "personal.fossil"));
+    expect(first.tasks).toEqual([]);
+    expect(first.files).toContain("omniform/company.json");
+    expect(first.files).toContain("execution/omos.json");
+    expect(first.files.some((path: string) => /^(imports|history|skills|memory)\//.test(path))).toBe(false);
+    expect(readFileSync(join(f.home, ".fx", "sessions", "legacy", "session.json"), "utf8")).toContain("legacy-session");
+    const other = fixture();
+    const otherInstance = JSON.parse((await other.run(["fossil", "ensure", "--json"])).stdout);
+    expect(otherInstance.workspace_id).not.toBe(first.workspace_id);
+  }, 60000);
+
+  test("keeps the explicitly bound repository when ensuring a personal instance", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const result = await f.run(["fossil", "ensure", "--json"]);
+    expect(result.code, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout).repository).toBe(join(f.cwd, "omos.fossil"));
+    expect(existsSync(join(f.home, ".fx", "instances", "personal.fossil"))).toBe(false);
+  }, 60000);
+
+  test("restores a complete versioned skill package and prefers it over a legacy copy", async () => {
+    const f = fixture();
+    const instructions = "---\nname: portable-skill\ndescription: Read the fixture dataset using the included script\n---\nCanonical portable skill.\n" + "Retained package instructions. ".repeat(180);
+    const program = 'import fs from "node:fs"; console.log(JSON.parse(fs.readFileSync(new URL("./data/input.json", import.meta.url))).name);';
+    const makeLegacy = (home: string) => {
+      mkdirSync(join(home, "project/.fx/skills/portable-skill"), { recursive: true });
+      writeFileSync(join(home, "project/.fx/skills/portable-skill/SKILL.md"), "---\nname: portable-skill\ndescription: A stale compatibility copy\n---\nLegacy instructions must not shadow the versioned package.");
+    };
+    makeLegacy(f.home);
+    model(f, (body, count) => {
+      const text = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
+      const match = text.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/);
+      expect(match).not.toBeNull();
+      const root = JSON.parse(match![1]);
+      if (count === 1) return { tool_calls: [
+        { path: "skills/portable-skill/SKILL.md", content: instructions },
+        { path: "skills/portable-skill/run.mjs", content: program },
+        { path: "skills/portable-skill/data/input.json", content: JSON.stringify({ name: "fixture-package-data" }) },
+      ].map((file, index) => ({ index, id: `package-${index}`, type: "function", function: { name: "write_file", arguments: JSON.stringify({ ...file, path: join(root, file.path) }) } })) };
+      if (count === 2) return { tool_calls: [{ index: 0, id: "load-package", type: "function", function: { name: "skill", arguments: JSON.stringify({ name: "portable-skill" }) } }] };
+      if (count === 3) {
+        expect(body.messages.some((message: any) => message.role === "tool" && typeof message.content === "string" && message.content.includes("Canonical portable skill."))).toBe(true);
+        return { tool_calls: [{ index: 0, id: "run-package", type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", command: `node '${root}/skills/portable-skill/run.mjs'`, timeout_ms: 10000 } }) } }] };
+      }
+      expect(body.messages.some((message: any) => message.role === "tool" && typeof message.content === "string" && message.content.includes("fixture-package-data"))).toBe(true);
+      return { content: "The complete portable skill package loaded and its executable read the included dataset." };
+    });
+    const initial = await f.run(["ask", "Save and exercise a complete portable skill package", "--json"]);
+    expect(initial.code, initial.stderr).toBe(0);
+    const exported = join(f.home, "skill-package.fossil");
+    expect((await f.run(["fossil", "export", exported])).code).toBe(0);
+    const clean = fixture();
+    makeLegacy(clean.home);
+    expect((await clean.run(["fossil", "use", exported])).code).toBe(0);
+    model(clean, (body, count) => {
+      const text = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
+      const root = JSON.parse(text.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/)![1]);
+      expect(readFileSync(join(root, "skills/portable-skill/SKILL.md"), "utf8")).toBe(instructions);
+      expect(readFileSync(join(root, "skills/portable-skill/run.mjs"), "utf8")).toBe(program);
+      if (count === 1) return { tool_calls: [{ index: 0, id: "find-restored", type: "function", function: { name: "capability_search", arguments: JSON.stringify({ query: "portable skill" }) } }] };
+      if (count === 2) return { tool_calls: [{ index: 0, id: "load-restored", type: "function", function: { name: "skill", arguments: JSON.stringify({ name: "portable-skill" }) } }] };
+      if (count === 3) {
+        expect(body.messages.some((message: any) => message.role === "tool" && typeof message.content === "string" && message.content.includes("Canonical portable skill."))).toBe(true);
+        return { tool_calls: [{ index: 0, id: "execute-restored", type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", command: `node '${root}/skills/portable-skill/run.mjs'`, timeout_ms: 10000 } }) } }] };
+      }
+      expect(body.messages.some((message: any) => message.role === "tool" && typeof message.content === "string" && message.content.includes("fixture-package-data"))).toBe(true);
+      return { content: "The restored skill and dataset work without the previous profile." };
+    });
+    const restored = await clean.run(["ask", "Discover and run the restored skill", "--json"]);
+    expect(restored.code, restored.stderr).toBe(0);
+  }, 120000);
+
+  test("checkpoints ordinary file and shell changes and rebuilds the view from an exported repository", async () => {
+    const f = fixture();
+    let workingDirectory = "";
+    model(f, (body, count) => {
+      const context = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
+      const match = context.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/);
+      expect(match).not.toBeNull();
+      workingDirectory = JSON.parse(match![1]);
+      if (count <= 2) return { tool_calls: [{ index: 0, id: `ordinary-${count}`, type: "function", function: {
+        name: count === 1 ? "write_file" : "shell",
+        arguments: JSON.stringify(count === 1 ? { path: join(workingDirectory, "memory", "portable.md"), content: "Portable memory from the ordinary file tool." } : { request: { action: "run", command: `mkdir -p '${workingDirectory}/documents'; printf 'Report from shell' > '${workingDirectory}/documents/report.txt'`, timeout_ms: 10000 } }),
+      } }] };
+      return { content: "Saved the memory and report in the workspace." };
+    });
+    const result = await f.run(["ask", "Save a memory and a report using ordinary file and shell tools", "--json"]);
+    expect(result.code, result.stderr).toBe(0);
+    const saved = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout);
+    const fossil = (...args: string[]) => {
+      const command = spawnSync("fossil", [...args, "-R", saved.repository], { env: { ...process.env, HOME: f.home }, encoding: "utf8" });
+      expect(command.status, command.stderr).toBe(0);
+      return command.stdout;
+    };
+    expect(fossil("cat", "memory/portable.md", "-r", "trunk")).toContain("ordinary file tool");
+    expect(fossil("cat", "documents/report.txt", "-r", "trunk")).toBe("Report from shell");
+    const exported = join(f.home, "portable.fossil");
+    expect((await f.run(["fossil", "export", exported])).code).toBe(0);
+    const clean = fixture();
+    expect((await clean.run(["fossil", "use", exported])).code).toBe(0);
+    model(clean, (body, count) => {
+      const context = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
+      const match = context.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/);
+      expect(match).not.toBeNull();
+      const rebuilt = JSON.parse(match![1]);
+      expect(rebuilt).not.toBe(workingDirectory);
+      expect(readFileSync(join(rebuilt, "memory", "portable.md"), "utf8")).toContain("ordinary file tool");
+      expect(readFileSync(join(rebuilt, "documents", "report.txt"), "utf8")).toBe("Report from shell");
+      if (count === 1) return { tool_calls: [{ index: 0, id: "inspect-portable", type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: join(rebuilt, "documents", "report.txt") }) } }] };
+      return { content: "The report was restored from the portable workspace." };
+    });
+    const restored = await clean.run(["ask", "Read the portable report", "--json"]);
+    expect(restored.code, restored.stderr).toBe(0);
+  }, 120000);
+
   test("accepts current coding validation through a compact host receipt and preserves its proof chain", async () => {
     const f = fixture();
     writeFileSync(join(f.cwd, ".gitignore"), "omos.fossil\n");
@@ -425,6 +782,7 @@ describe("portable Fossil workspace recovery", () => {
     const sharedSemantic = await import(pathToFileURL(semanticPath).href);
     const variants: Array<{ change: (v: any) => void; valid: boolean; upstreamValid?: boolean }> = [
       { change() {}, valid: true },
+      { change(v) { v.spec.operations[0].input.properties.request = { type: ["string", "null"] }; }, valid: true },
       { change(v) { v.apiVersion = "wrong/v1"; }, valid: false },
       { change(v) { v.spec.unknown = true; }, valid: false },
       { change(v) { v.metadata.id = "9_invalid"; }, valid: false },

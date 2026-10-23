@@ -120,27 +120,32 @@ fn dispatch(manager: workspace.Manager, request: *std.http.Server.Request, token
         }
         if (std.ascii.eqlIgnoreCase(header.name, "origin")) origin = true;
     }
-    if (origin or !authenticated(authorization, token)) {
+    const company = std.mem.eql(u8, request.head.target, "/v1/company");
+    if (origin or (!company and !authenticated(authorization, token))) {
         keep_alive.* = false;
         return request.respond("{\"error\":\"Unauthorized\"}", .{ .status = .unauthorized, .keep_alive = false });
+    }
+    if (company and request.head.method == .GET) {
+        const response = @import("company_service.zig").bootstrap(manager) catch return request.respond("{\"error\":\"CompanyNotInitialized\"}", .{ .status = .not_found, .keep_alive = keep_alive.* });
+        return request.respond(response, .{ .keep_alive = keep_alive.*, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
     }
     if (request.head.method == .GET and std.mem.eql(u8, request.head.target, "/v1/definition")) {
         const snapshot = try manager.definitionSnapshot(null);
         return request.respond(try std.json.Stringify.valueAlloc(manager.alloc, .{ .workspace = manager.manifest.id, .definition = snapshot, .revision = (try manager.snapshot("")).trunk_revision }, .{}), .{ .keep_alive = keep_alive.*, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
     }
     const schedules = std.mem.eql(u8, request.head.target, "/v1/schedules");
-    if (request.head.method != .POST or (!schedules and !std.mem.eql(u8, request.head.target, "/v1/workspace"))) return request.respond("{\"error\":\"NotFound\"}", .{ .status = .not_found, .keep_alive = keep_alive.* });
+    if (request.head.method != .POST or (!company and !schedules and !std.mem.eql(u8, request.head.target, "/v1/workspace"))) return request.respond("{\"error\":\"NotFound\"}", .{ .status = .not_found, .keep_alive = keep_alive.* });
     if (request.head.content_length) |length| if (length > 1024 * 1024) {
         keep_alive.* = false;
         return request.respond("{\"error\":\"RequestTooLarge\"}", .{ .status = .payload_too_large, .keep_alive = false });
     };
     const body_reader = try request.readerExpectContinue(&.{});
     const raw = try body_reader.allocRemaining(manager.alloc, .limited(1024 * 1024));
-    const response = (if (schedules) service.executeSchedule(manager, raw, writable) else service.execute(manager, raw, writable)) catch |err| {
+    const response = (if (company) @import("company_service.zig").execute(manager, raw, writable) else if (schedules) service.executeSchedule(manager, raw, writable) else service.execute(manager, raw, writable)) catch |err| {
         @import("../shared/debug_trace.zig").logf("workspace", "workspace service rejected error={s}", .{@errorName(err)});
         const status: std.http.Status = switch (err) {
-            error.WorkspaceIdentityMismatch, error.ServiceReadOnly, error.HostOwnedEntity, error.WorkspacePathDenied => .forbidden,
-            error.WorkspaceRevisionChanged, error.StaleWorkspaceDefinition, error.StaleWorkContract => .conflict,
+            error.CompanyAccessDenied, error.CompanyAccessRevoked, error.CompanySignatureRejected, error.CompanyRequestExpired, error.CompanyDelegationDenied, error.WorkspaceIdentityMismatch, error.ServiceReadOnly, error.HostOwnedEntity, error.WorkspacePathDenied => .forbidden,
+            error.CompanyOperationConflict, error.WorkspaceProjectionConflict, error.WorkspaceRevisionChanged, error.StaleWorkspaceDefinition, error.StaleWorkContract => .conflict,
             else => .bad_request,
         };
         return request.respond(try std.json.Stringify.valueAlloc(manager.alloc, .{ .@"error" = @errorName(err) }, .{}), .{ .status = status, .keep_alive = keep_alive.* });

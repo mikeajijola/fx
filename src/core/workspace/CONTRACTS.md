@@ -183,11 +183,11 @@ local repository. Omitting the request file fetches the definition. HTTP is
 restricted to loopback; other endpoints require HTTPS. Redirects are refused.
 The client does not automatically retry a mutation after an uncertain outcome.
 
-The current service uses the existing Fossil-backed manager. It supports a
-single workspace and host credential, with durable review scheduling. Multi-user
-authorization, an independently distributed record backend, sparse source
-delivery and server execution of actor sessions require additional profiles and
-implementations. They are not implied by the workspace API.
+The owner service uses the existing Fossil-backed manager and a single host
+credential, with durable review scheduling. The scoped company service below
+adds actor signatures and delegated path grants. Distributed storage, remote
+filesystem mounting, and hosted company actor sessions require additional
+implementations.
 
 ## Audit and migration
 
@@ -209,3 +209,110 @@ export, verified-copy restoration and migration retain their ownership. A
 future server cutover must preserve record identities, content hashes, review
 progress and publication receipts, use a single authoritative writer, and
 reconcile any records created after cutover before rollback.
+
+## Personal instance and filesystem views
+
+`omos fossil ensure` creates an empty personal instance under
+`~/.fx/instances/personal.fossil` when no repository is bound. Saved native turns
+and the UI host use the same bootstrap. Existing bindings remain unchanged.
+Each fresh instance receives a unique workspace identity, a declaration, and an
+execution policy. Unlike `fossil init`, bootstrap never imports old sessions.
+Initialization publishes the verified repository before publishing its binding.
+
+The installation script copies its packaged Fossil helper, or an existing
+Fossil executable for a source install, into protected `~/.fx/libexec/` storage.
+A content-addressed filename and atomic integrity manifest identify the helper.
+The native host verifies its bytes and rechecks file identity before reusing a
+process-local verification cache. `OMOS_FOSSIL_BIN` can select an absolute helper
+path for host-managed deployments. Development checkouts without an installed
+helper retain the existing `PATH` lookup. A bare CLI binary does not contain a
+statically linked Fossil engine.
+
+A task receives a filesystem view under
+`<project>/.fx/workspaces/<workspace-id>/<task-id>/`. Ordinary file tools and
+shell programs can edit `memory/`, `skills/`, `documents/`, `artifacts/`, and
+`ui/` there. The host hashes changes and checkpoints them automatically at tool
+batch boundaries and before review. Git project files retain their existing
+ownership. Files written elsewhere are not automatically workspace content.
+
+The view is not the host's Fossil checkout and contains no editable contracts,
+assessments, or publication records. A separate baseline records canonical
+hashes. Materialization compares the baseline, current files, and the selected
+revision before changing a view. Divergent changes stop with
+`WorkspaceProjectionConflict`; local drafts remain available. Deletions require
+a known baseline. A view with uncheckpointed edits must not be discarded as
+cache garbage. The current implementation materializes the mutable file tree;
+it does not provide a transparent remote filesystem.
+
+Task context lists bounded memory and skill inventories independently of body
+previews. Oversized files remain discoverable through `omos_memory` and
+`omos_skill` query pages. Managed skill calls prefer complete versioned packages
+over compatibility copies with the same name. Skill installation in a saved
+turn targets the task view. Runtime executables and system dependencies still
+require a compatible host environment.
+
+The native `profile.read` and `profile.update` methods store the local owner's
+photo as an `omos_profile` record and a content-addressed image. The UI imports
+an existing local photo only when no canonical profile record exists. Removing
+a canonical photo does not re-import the old file. Original local files remain
+available during migration. Profile updates require the profile entity in the
+current declaration; existing installations must update their contracts first.
+
+## Scoped company service
+
+The local operator can initialize company authority using
+`omos fossil company REQUEST.json --json`. Administrative requests use
+`omos.company-admin/v1`; actions are `initialize`, `status`, `grant`, `revoke`,
+and `rotate`. Mutations require the control revision returned by `status`.
+Root grant enrollment requires local operator access. Definitions cannot grant
+server authority.
+
+Authority, view bindings, and operation outcomes live on the protected
+`omos-company` branch in the same repository. Grants bind an actor's Ed25519
+public key, allowed actions, exact paths or directory prefixes, expiry, and an
+optional parent grant. Delegation can only narrow a parent's scope, operations,
+expiry, and approval conditions. Ancestor revocation invalidates descendants.
+
+`GET /v1/company` returns public instance discovery. `POST /v1/company` accepts
+an envelope with `payload` and `signature`. The signature is hex-encoded Ed25519
+over the exact UTF-8 payload bytes. The payload uses `omos.company/v1` and binds
+the workspace, actor, grant, unique operation ID, expiry, action, and action
+parameters. Requests expire within five minutes. Browser-origin requests are
+rejected; the existing shared bearer token remains a local-owner interface.
+The company transport and operation shapes are declared in OmniForm.
+
+Supported actions are `discover`, `read`, `create_view`, `checkpoint`, `submit`,
+`status`, `export_scope`, and `delegate`. Reads and inventories enforce the live
+grant and restrict historical revisions to accepted ancestry or the caller's
+own view. Content reads use bounded base64 byte ranges and SHA-256 hashes.
+Scoped export currently returns a paginated content manifest for those reads;
+it does not clone the company repository or export issuer authority.
+
+Mutations retain a request hash and pending outcome before effects. Completed
+retries return the saved result after a fresh authority check. Reusing an
+operation ID for different bytes is rejected. Checkpoint receipts commit with
+the changed files, allowing a retry to reconcile a lost response. An uncertain
+operation retains ownership of its view until reconciled. `status` can inspect
+an outcome using its original operation ID. Receipts identify the actor, grant,
+operation, authority epoch, and result, and are signed by the server issuer.
+
+Issuer seeds remain in protected profile storage under `~/.fx/authority/`,
+outside the repository and disposable checkout caches. Copying a repository
+alone does not restore issuer power. Recovery requires the protected key or
+explicit operator rotation; rotation advances the epoch and revokes existing
+grants. Issuer backup and single-writer deployment remain operator duties.
+
+Submission retains an immutable proposal, integrates compatible accepted
+changes, and queues independent review. Candidate files and host checkpoint
+receipts enter the assessor's evidence manifest. Publication checks live
+authority and the evaluated parent revision again. An advanced parent requires
+reconciliation and another assessment. Grants requiring human approval cannot
+publish automatically. Hosted company actor execution is rejected until an
+isolated execution backend is supplied; external runtimes can use scoped views.
+
+This service currently supports path scopes and file or record conflict
+boundaries. Field-level record merges, query absence dependencies, dependency
+closure packaging, remote filesystem mounting, hosted actor isolation, human
+approval resolution, and continuous reconciliation retries require further
+implementation. They are not implied by signed requests or a successful
+checkpoint.

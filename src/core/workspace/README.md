@@ -2,7 +2,10 @@
 
 Git owns project source. The bound Fossil repository owns saved task contracts,
 memory, skills, artifacts, execution evidence, and publication receipts. Native
-`omos` and `omo` turns use the same workspace binding.
+`omos` and `omo` turns use the same workspace binding. Saved turns initialize
+an empty personal instance automatically when no repository is bound.
+`omos fossil ensure --json` performs the same bootstrap without importing
+existing sessions.
 
 Completion review receives a bounded evidence manifest. Larger records remain
 available through the assessor's read-only `omos_review_evidence` interface.

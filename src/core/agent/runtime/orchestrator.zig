@@ -7144,9 +7144,8 @@ fn processQueuedPromptLoop(
     defer if (execution_lease) |lease| lease.release();
     if (comptime !builtin.target.cpu.arch.isWasm()) {
         if (config.origin == .root and config.fossil_session_id != null and !config.fossil_ephemeral and !config.fossil_execution_lease_held) {
-            if (try @import("../../workspace/fossil_workspace.zig").Manager.bound(arena)) |manager| {
-                execution_lease = (try manager.tryExecutionLease()) orelse return error.WorkspaceExecutionBusy;
-            }
+            const manager = try @import("../../workspace/fossil_workspace.zig").Manager.ensureBound(arena);
+            execution_lease = (try manager.tryExecutionLease()) orelse return error.WorkspaceExecutionBusy;
         }
     }
     var managed: ?managed_task.Turn = if (comptime builtin.target.cpu.arch.isWasm()) null else if (config.fossil_session_id != null and !config.fossil_ephemeral)

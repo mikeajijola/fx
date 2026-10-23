@@ -2,7 +2,7 @@ const std = @import("std");
 const workspace = @import("fossil_workspace.zig");
 
 pub const Options = struct {
-    action: enum { init, use, status, tasks, diff, history, verify, recover, migrate, definition, query, audit, serve, remote, @"export" } = .status,
+    action: enum { init, ensure, company, use, status, tasks, diff, history, verify, recover, migrate, definition, query, audit, serve, remote, @"export" } = .status,
     path: ?[]const u8 = null,
     definition_action: enum { show, validate, propose } = .show,
     execution_path: ?[]const u8 = null,
@@ -59,6 +59,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
             .show => if (options.path != null) return error.UnexpectedArgument,
             .validate, .propose => if (options.path == null) return error.MissingPath,
         },
+        .company => if (options.path == null) return error.MissingPath,
         .init, .diff, .query, .serve => {},
         else => if (options.path != null) return error.UnexpectedArgument,
     }
@@ -77,12 +78,15 @@ pub fn execute(alloc: std.mem.Allocator, options: Options) !workspace.Snapshot {
     }
     const manager = switch (options.action) {
         .init => try workspace.Manager.init(alloc, options.path orelse "omos.fossil"),
+        .ensure => try workspace.Manager.ensureBound(alloc),
         .use => try workspace.Manager.open(alloc, options.path.?),
         else => (try workspace.Manager.bound(alloc)) orelse return error.NoFossilWorkspace,
     };
     var detail: []const u8 = "";
     var model_data: ?std.json.Value = null;
     switch (options.action) {
+        .company => model_data = (try std.json.parseFromSlice(std.json.Value, alloc, try @import("company_service.zig").administer(manager, try readDefinition(alloc, options.path.?)), .{})).value,
+        .ensure => detail = "Personal instance initialized or existing workspace retained.",
         .init => {
             try manager.use();
             const result = try manager.importHistory();

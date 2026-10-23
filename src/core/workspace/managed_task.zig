@@ -19,11 +19,13 @@ pub const Turn = struct {
     recorded_evidence: std.ArrayList([]const u8) = .empty,
     invocation_id: ?[]const u8 = null,
     assessment_record: ?[]const u8 = null,
+    filesystem_view: bool = false,
 
     pub fn begin(alloc: std.mem.Allocator, session: []const u8, parent_session: ?[]const u8, project: []const u8, prompt: []const u8) !?Turn {
-        const manager = (try workspace.Manager.bound(alloc)) orelse return null;
+        const manager = try workspace.Manager.ensureBound(alloc);
         const parent = if (parent_session) |id| try manager.active(id) else null;
         var task = if (try manager.active(session)) |active| active else try manager.start(session, project, prompt, parent);
+        if (task.authority != null) return error.CompanyExecutionIsolationRequired;
         if (!std.mem.eql(u8, project, task.project_root)) return error.TaskProjectMismatch;
         try manager.validateTaskBasis(task);
         var turn: Turn = .{ .manager = manager, .task = task };
@@ -56,6 +58,8 @@ pub const Turn = struct {
         }
         try manager.record(turn.task, "user_request", .{ .text = prompt, .origin = if (parent_session == null) "user" else "delegation" });
         _ = try manager.checkpoint(turn.task);
+        try @import("filesystem_projection.zig").prepare(manager, turn.task);
+        turn.filesystem_view = true;
         return turn;
     }
 
@@ -64,6 +68,14 @@ pub const Turn = struct {
         const latest = try self.manager.loadTask(self.task.id);
         if (latest.definition.version != self.task.definition.version) self.invalidateAssessment();
         self.task = latest;
+        if (self.filesystem_view) {
+            var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer scratch.deinit();
+            var projection_manager = self.manager;
+            projection_manager.alloc = scratch.allocator();
+            if (try @import("filesystem_projection.zig").checkpoint(projection_manager, self.task)) self.invalidateAssessment();
+            try @import("filesystem_projection.zig").prepare(projection_manager, self.task);
+        }
         const evidence = try review.collectToolEvidence(alloc, messages);
         const coding = if (self.task.model_basis) |basis| if (basis.capability) |id| std.mem.eql(u8, id, "coding_task") else false else false;
         const source = if (coding) try @import("source_state.zig").fingerprint(alloc, self.task.project_root, self.manager.repository) else null;
@@ -98,6 +110,7 @@ pub const Turn = struct {
                 }
             }
         }
+        _ = try self.manager.checkpoint(self.task);
     }
 
     fn invalidateAssessment(self: *Turn) void {
@@ -117,6 +130,14 @@ pub const Turn = struct {
         var evidence: std.ArrayList(review.Evidence) = .empty;
         var pages: std.ArrayList([]const u8) = .empty;
         var checkpoints: std.ArrayList([]const u8) = .empty;
+        if (self.task.authority != null) {
+            const prefix = try alloc.print("company/checkpoints/{s}/", .{self.task.id});
+            for (try self.manager.inventory(self.reviewed_revision.?)) |path| {
+                if (!std.mem.startsWith(u8, path, prefix)) continue;
+                const bytes = try self.manager.contentAt(path, self.reviewed_revision.?);
+                try evidence.append(alloc, .{ .id = try alloc.print("workspace-checkpoint:{s}", .{try workspace.hash(alloc, bytes)}), .kind = .verification, .status = .success, .content = bytes });
+            }
+        }
         for (try self.manager.taskHistory(self.task, self.reviewed_revision.?)) |bytes| {
             const Entry = struct { kind: []const u8, task: []const u8, contract_version: u32, value: std.json.Value };
             const entry = (try std.json.parseFromSlice(Entry, alloc, bytes, .{ .ignore_unknown_fields = true })).value;
@@ -258,6 +279,9 @@ pub const Turn = struct {
     pub fn retain(self: *Turn) !void {
         const current = try self.manager.loadTask(self.task.id);
         if (current.state == .active) self.task = try self.manager.setState(current.id, .paused);
-        if (current.state != .accepted) _ = try self.manager.checkpoint(self.task);
+        if (current.state != .accepted and current.state != .publication_pending) {
+            if (self.filesystem_view) _ = try @import("filesystem_projection.zig").checkpoint(self.manager, current);
+            _ = try self.manager.checkpoint(self.task);
+        }
     }
 };

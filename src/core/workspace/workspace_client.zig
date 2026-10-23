@@ -9,9 +9,13 @@ pub fn call(alloc: std.mem.Allocator, base_url: []const u8, body: ?[]const u8) !
     const host = try base.host.?.toRawMaybeAlloc(alloc);
     const loopback = std.mem.eql(u8, host, "127.0.0.1") or std.ascii.eqlIgnoreCase(host, "localhost") or std.mem.eql(u8, host, "[::1]");
     if (!std.ascii.eqlIgnoreCase(base.scheme, "https") and !(std.ascii.eqlIgnoreCase(base.scheme, "http") and loopback)) return error.InsecureWorkspaceEndpoint;
-    const token = io.getenv("OMOS_WORKSPACE_TOKEN") orelse return error.MissingWorkspaceServiceToken;
+    const company = if (body) |raw| blk: {
+        const envelope = (std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch break :blk false).value;
+        break :blk envelope == .object and envelope.object.contains("payload") and envelope.object.contains("signature");
+    } else false;
+    const token = io.getenv("OMOS_WORKSPACE_TOKEN") orelse if (company) "signed-company-request-without-bearer" else return error.MissingWorkspaceServiceToken;
     if (token.len < 32 or token.len > 1024 or std.mem.findScalar(u8, token, '\r') != null or std.mem.findScalar(u8, token, '\n') != null) return error.InvalidWorkspaceServiceToken;
-    const url = try alloc.print("{s}{s}", .{ std.mem.trimEnd(u8, base_url, "/"), if (body != null) "/v1/workspace" else "/v1/definition" });
+    const url = try alloc.print("{s}{s}", .{ std.mem.trimEnd(u8, base_url, "/"), if (company) "/v1/company" else if (body != null) "/v1/workspace" else "/v1/definition" });
     const bearer = try alloc.print("Bearer {s}", .{token});
     var client: std.http.Client = .{ .allocator = alloc, .io = io.getIo() };
     defer client.deinit();

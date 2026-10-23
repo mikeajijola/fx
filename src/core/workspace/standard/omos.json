@@ -801,6 +801,192 @@
           "api",
           "cli"
         ]
+      },
+      {
+        "id": "omos_company_request",
+        "capability": "general_task",
+        "description": "Authenticated company service envelope; runtime authority remains host owned.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "payload": {
+              "type": "string"
+            },
+            "signature": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "payload",
+            "signature"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "payload": {
+              "type": "string"
+            },
+            "signature": {
+              "type": "string"
+            },
+            "issuer": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "payload",
+            "signature",
+            "issuer"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
+        ]
+      },
+      {
+        "id": "omos_company_operation",
+        "capability": "general_task",
+        "description": "Scoped discovery, reads, isolated views, checkpoints, proposals and outcomes.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company/v1"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "grant": {
+              "type": "string"
+            },
+            "operation": {
+              "type": "string"
+            },
+            "expires_ms": {
+              "type": "integer"
+            },
+            "action": {
+              "type": "string",
+              "enum": [
+                "discover",
+                "read",
+                "create_view",
+                "checkpoint",
+                "submit",
+                "status",
+                "export_scope",
+                "delegate"
+              ]
+            },
+            "view": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "revision": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "content": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "previous_hash": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "objective": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "candidate": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16384
+            },
+            "encoding": {
+              "type": "string",
+              "enum": [
+                "utf8",
+                "base64"
+              ]
+            },
+            "remove": {
+              "type": "boolean"
+            },
+            "delegated_grant": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "outcome": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "version",
+            "workspace",
+            "actor",
+            "grant",
+            "operation",
+            "expires_ms",
+            "action"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object"
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
+        ]
       }
     ],
     "semantic": {
@@ -1000,6 +1186,104 @@
             "hash",
             "state",
             "reason"
+          ]
+        },
+        {
+          "id": "omos_document",
+          "fields": {
+            "path": "string"
+          },
+          "required": [
+            "path"
+          ]
+        },
+        {
+          "id": "omos_profile",
+          "fields": {
+            "id": "string",
+            "photo_hash": "string",
+            "mime": "string"
+          },
+          "required": [
+            "id",
+            "photo_hash",
+            "mime"
+          ]
+        },
+        {
+          "id": "omos_company_authority",
+          "fields": {
+            "version": "string",
+            "workspace": "string",
+            "epoch": "number",
+            "issuer": "string",
+            "grants": "json"
+          },
+          "required": [
+            "version",
+            "workspace",
+            "epoch",
+            "issuer",
+            "grants"
+          ]
+        },
+        {
+          "id": "omos_workspace_view",
+          "fields": {
+            "id": "string",
+            "actor": "string",
+            "grant": "string",
+            "task": "string",
+            "base": "string",
+            "pending": "json"
+          },
+          "required": [
+            "id",
+            "actor",
+            "grant",
+            "task",
+            "base"
+          ]
+        },
+        {
+          "id": "omos_company_operation",
+          "fields": {
+            "version": "string",
+            "actor": "string",
+            "grant": "string",
+            "operation": "string",
+            "request_hash": "string",
+            "state": "string",
+            "result": "json",
+            "failure": "json",
+            "view": "json"
+          },
+          "required": [
+            "version",
+            "actor",
+            "grant",
+            "operation",
+            "request_hash",
+            "state"
+          ]
+        },
+        {
+          "id": "omos_company_checkpoint",
+          "fields": {
+            "kind": "string",
+            "task": "string",
+            "operation": "string",
+            "base": "string",
+            "files": "json",
+            "outcome": "string",
+            "note": "string"
+          },
+          "required": [
+            "task",
+            "operation",
+            "base",
+            "files",
+            "outcome"
           ]
         }
       ],

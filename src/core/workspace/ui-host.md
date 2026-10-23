@@ -16,6 +16,7 @@ Supported operations:
 | `validation` | Return a host compilation receipt for an exact pending source revision request. |
 | `snapshot` | Read an allowlisted native JSON snapshot; arbitrary CLI arguments are unavailable. |
 | `workspace` | Use the revision-pinned read-only workspace service. |
+| `profile.read`, `profile.update` | Read or explicitly replace the local owner's portable profile photo through the host-owned record and image store. |
 | `ui.current`, `ui.history`, `ui.inspect`, `ui.read` | Inspect saved or selected-task UI source and historical versions. Individual source reads are bounded to 16 KiB. |
 | `ui.install` | Install and verify the first compatible source tree without overwriting an existing interface. |
 | `ui.write` | Write task source with a revision fence; publication remains pending. |
@@ -33,3 +34,5 @@ Compilation receipts establish compilation, not visual correctness or external-a
 Native UI turns identify the Fossil `ui/` tree as the running interface source. Tool-start events expose only bounded `path` and workspace `action` presentation fields, not file content or arbitrary arguments. Tool outcomes preserve their native kind and summary so the interface can show a held or denied action.
 
 The `fossil_workspace` tool uses native workspace ownership and protected-path checks without a second model safety review. Configured permission rules still apply. A saved task is required for mutations; ephemeral sessions remain read-only. The tool cannot overwrite host-owned evidence, assessments or publication receipts. Completion still requires independent verification and native publication.
+
+The UI host initializes an empty personal Fossil instance when no workspace is bound. Profile updates accept a validated base64 PNG, JPEG or WebP up to 512 KiB, or null for removal. They return the content and saved revision. The profile entity must exist in the current declaration. The external UI host owns migration of an old operational photo and retains its original source.
