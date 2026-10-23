@@ -273,7 +273,7 @@ const Server = struct {
         const acknowledgement = try value(arena, .{ .turn = id, .already_accepted = false });
         const execution_lease: ?workspace.ExecutionLease = if (scheduled == null) blk: {
             const manager = (try workspace.Manager.bound(arena)) orelse return error.NoFossilWorkspace;
-            break :blk (try manager.tryExecutionLease()) orelse return error.WorkspaceExecutionBusy;
+            break :blk (try manager.trySessionExecutionLease(request.session orelse id)) orelse return error.WorkspaceExecutionBusy;
         } else null;
         errdefer if (execution_lease) |lease| lease.release();
         const job = try alloc.create(Job);

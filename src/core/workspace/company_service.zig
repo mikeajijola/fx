@@ -5,6 +5,7 @@ const io = @import("../shared/io.zig");
 const workspace = @import("fossil_workspace.zig");
 const authority = @import("company_authority.zig");
 const records = @import("../shared/record_json.zig");
+const keys = @import("company_keys.zig");
 const model = @import("definition.zig");
 
 const Journal = struct {
@@ -38,45 +39,25 @@ fn state(manager: workspace.Manager) !authority.State {
     return value;
 }
 
-fn issuer(manager: workspace.Manager, create: bool) !std.crypto.sign.Ed25519.KeyPair {
-    const directory = try std.Io.Dir.path.join(manager.alloc, &.{ io.getenv("HOME") orelse return error.HomeUnavailable, ".fx", "authority", manager.manifest.id });
-    _ = try std.Io.Dir.cwd().createDirPathStatus(io.getIo(), directory, .fromMode(0o700));
-    const filename = try std.Io.Dir.path.join(manager.alloc, &.{ directory, "issuer.seed" });
-    if (create) {
-        const key = std.crypto.sign.Ed25519.KeyPair.generate(io.getIo());
-        var file = std.Io.Dir.cwd().createFile(io.getIo(), filename, .{ .exclusive = true, .permissions = .fromMode(0o600) }) catch |err| switch (err) {
-            error.PathAlreadyExists => return issuer(manager, false),
-            else => return err,
-        };
-        defer file.close(io.getIo());
-        try file.writeStreamingAll(io.getIo(), &key.secret_key.seed());
-        try file.sync(io.getIo());
-        return key;
-    }
-    var file = std.Io.Dir.cwd().openFile(io.getIo(), filename, .{ .allow_directory = false, .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound => return error.CompanyIssuerRecoveryRequired,
-        else => return err,
-    };
-    defer file.close(io.getIo());
-    const bytes = try io.readFileToEnd(manager.alloc, &file, 33);
-    if (bytes.len != 32) return error.CompanyIssuerRecoveryRequired;
-    return std.crypto.sign.Ed25519.KeyPair.generateDeterministic(bytes[0..32].*);
-}
-
 /// Administrative changes require local operator access. OmniForm definitions
 /// and scoped actor requests can never enroll or enlarge a root authority.
-pub fn administer(manager: workspace.Manager, raw: []const u8) ![]const u8 {
+pub fn administer(original: workspace.Manager, raw: []const u8) ![]const u8 {
+    var manager = original;
     const request = try records.decode(Admin, manager.alloc, raw, .{});
     if (!std.mem.eql(u8, request.version, "omos.company-admin/v1")) return error.UnsupportedCompanyApi;
     const lease = try manager.companyOperationLease();
     defer lease.release();
+    manager.company_operation_held = true;
+    const recovery_lease = if (request.action == .rotate) try keys.recoveryLease(manager) else null;
+    defer if (recovery_lease) |held| held.release();
     const revision_id = try manager.companyRevision();
     if (request.action == .status) return encode(manager.alloc, .{ .revision = revision_id, .authority = try state(manager) });
+    if (request.action != .initialize and request.action != .rotate) try validateInstance(manager);
     if (!equal(request.revision, revision_id)) return error.WorkspaceRevisionChanged;
     var current: authority.State = undefined;
     if (request.action == .initialize) {
         if (revision_id != null) return error.CompanyAlreadyInitialized;
-        const key = try issuer(manager, true);
+        const key = try keys.prepare(manager, 1, false);
         current = .{ .workspace = manager.manifest.id, .issuer = try manager.alloc.dupe(u8, &std.fmt.bytesToHex(key.public_key.toBytes(), .lower)) };
     } else {
         current = try state(manager);
@@ -101,9 +82,10 @@ pub fn administer(manager: workspace.Manager, raw: []const u8) ![]const u8 {
             // Restoring a repository never restores issuer power implicitly.
             // An operator must recover/create the protected key and advance the
             // epoch. All old grants remain recorded but become revoked.
-            const key = try issuer(manager, true);
+            const epoch = try keys.nextEpoch(manager, current.epoch);
+            const key = try keys.prepare(manager, epoch, true);
             current.issuer = try manager.alloc.dupe(u8, &std.fmt.bytesToHex(key.public_key.toBytes(), .lower));
-            current.epoch = try std.math.add(u64, current.epoch, 1);
+            current.epoch = epoch;
             const grants = try manager.alloc.dupe(authority.Grant, current.grants);
             for (grants) |*grant| grant.revoked = true;
             current.grants = grants;
@@ -137,7 +119,7 @@ fn saveJournal(manager: workspace.Manager, path: []const u8, journal: Journal) !
     _ = try manager.companyWrite(try manager.companyRevision(), files.items);
 }
 fn signed(manager: workspace.Manager, current: authority.State, request: authority.Request, request_hash: []const u8, result: []const u8) ![]const u8 {
-    const key = try issuer(manager, false);
+    const key = try keys.current(manager, current.epoch, current.issuer);
     const public = std.fmt.bytesToHex(key.public_key.toBytes(), .lower);
     if (!std.mem.eql(u8, &public, current.issuer)) return error.CompanyIssuerRecoveryRequired;
     const payload = try encode(manager.alloc, .{ .version = "omos.company-receipt/v1", .workspace = current.workspace, .actor = request.actor, .grant = request.grant, .operation = request.operation, .request_hash = request_hash, .action = request.action, .epoch = current.epoch, .result = try parse(manager.alloc, result) });
@@ -146,14 +128,25 @@ fn signed(manager: workspace.Manager, current: authority.State, request: authori
     return encode(manager.alloc, .{ .payload = payload, .signature = &signature_hex, .issuer = &public });
 }
 
-pub fn bootstrap(manager: workspace.Manager) ![]const u8 {
+pub fn validateInstance(manager: workspace.Manager) !void {
+    if (try manager.companyRevision() == null) return;
     const current = try state(manager);
+    _ = try keys.current(manager, current.epoch, current.issuer);
+}
+
+pub fn bootstrap(manager: workspace.Manager) ![]const u8 {
+    const lease = try manager.companyOperationLease();
+    defer lease.release();
+    const current = try state(manager);
+    _ = try keys.current(manager, current.epoch, current.issuer);
     return encode(manager.alloc, .{ .version = "omos.company/v1", .workspace = current.workspace, .issuer = current.issuer, .epoch = current.epoch, .revision = try manager.revision("trunk"), .features = .{ .scope = "path", .merge = "record_or_file", .max_read_bytes = 16384, .max_object_bytes = 8 * 1024 * 1024 } });
 }
 
-pub fn execute(manager: workspace.Manager, raw: []const u8, writable: bool) ![]const u8 {
+pub fn execute(original: workspace.Manager, raw: []const u8, writable: bool) ![]const u8 {
+    var manager = original;
     const lease = try manager.companyOperationLease();
     defer lease.release();
+    manager.company_operation_held = true;
     const current = try state(manager);
     const declaration = try manager.loadDeclaration(((try manager.modelBasis("trunk")) orelse return error.WorkspaceMigrationRequired).revision);
     try model.validateOperation(manager.alloc, declaration, "omos_company_request", try parse(manager.alloc, raw), .input);
@@ -167,7 +160,7 @@ pub fn execute(manager: workspace.Manager, raw: []const u8, writable: bool) ![]c
         if (selected.view.pending) |pending| if (!std.mem.eql(u8, pending, request.operation)) return error.CompanyOperationRecoveryRequired;
     };
     // Never perform an effect without the key needed to acknowledge it.
-    _ = try issuer(manager, false);
+    _ = try keys.current(manager, current.epoch, current.issuer);
     const path = try operationPath(manager, request.actor, request.operation);
     const request_hash = try workspace.hash(manager.alloc, (try records.decode(authority.Envelope, manager.alloc, raw, .{})).payload);
     const retained = try loadJournal(manager, path);

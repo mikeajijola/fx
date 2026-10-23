@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync, appendFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync, appendFileSync, statSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { createHash, generateKeyPairSync, sign, verify, createPublicKey } from "node:crypto";
+import { createHash, generateKeyPairSync, sign, verify, createPublicKey, createPrivateKey } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { cleanupFixtures, fixture, model, writeMemory } from "./fossil-workspace-helpers";
 
@@ -134,6 +134,103 @@ describe("portable Fossil workspace recovery", () => {
       await service.child.exited;
     }
   }, 120000);
+
+  test("publishes issuer keys atomically and recovers interrupted company initialization", async () => {
+    for (const stage of ["issuer-key-prepared", "issuer-binding-published"]) {
+      const f = fixture();
+      const initial = await f.run(["fossil", "init", "--json"]);
+      expect(initial.code, initial.stderr).toBe(0);
+      const identity = JSON.parse(initial.stdout).workspace_id;
+      const request = join(f.home, "initialize-company.json");
+      writeFileSync(request, JSON.stringify({ version: "omos.company-admin/v1", action: "initialize" }));
+      const interrupted = await f.run(["fossil", "company", request, "--json"], { FX_E2E_FOSSIL_FAULT: stage });
+      expect(interrupted.code).toBe(1);
+      expect(interrupted.stderr).toContain("WorkspaceInjectedFailure");
+      expect(f.fossil("branch", "list", "--all")).not.toContain("omos-company");
+      const directory = join(f.home, ".fx/authority", identity);
+      const descriptorFile = join(directory, "issuer.json");
+      const prepared = existsSync(descriptorFile) ? JSON.parse(readFileSync(descriptorFile, "utf8")) : null;
+      expect(Boolean(prepared)).toBe(stage === "issuer-binding-published");
+      const recovered = await f.run(["fossil", "company", request, "--json"]);
+      expect(recovered.code, recovered.stderr).toBe(0);
+      const company = JSON.parse(recovered.stdout).model_data.authority;
+      const descriptor = JSON.parse(readFileSync(descriptorFile, "utf8"));
+      expect(descriptor.public_key).toBe(company.issuer);
+      expect(descriptor.repository).toBe(join(f.cwd, "omos.fossil"));
+      if (prepared) expect(company.issuer).toBe(prepared.public_key);
+      const seed = readFileSync(join(directory, descriptor.seed_file));
+      expect(seed.length).toBe(32);
+      expect(statSync(join(directory, descriptor.seed_file)).mode & 0o777).toBe(0o600);
+      const secret = createPrivateKey({ key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seed]), format: "der", type: "pkcs8" });
+      expect(createPublicKey(secret).export({ format: "der", type: "spki" }).subarray(-32).toString("hex")).toBe(company.issuer);
+      expect(f.fossil("cat", "authority/state.json", "-r", "omos-company").includes(seed.toString("hex"))).toBe(false);
+    }
+  }, 90000);
+
+  test("requires explicit authority recovery for a copied repository and fences the previous server", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const admin = async (request: object) => {
+      const file = join(f.home, "operator-request.json");
+      writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...request }));
+      const result = await f.run(["fossil", "company", file, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    const initialized = await admin({ action: "initialize" });
+    const key = generateKeyPairSync("ed25519");
+    await admin({ action: "grant", revision: initialized.revision, grant: { id: "reader", actor: "reader", public_key: key.publicKey.export({ format: "der", type: "spki" }).subarray(-32).toString("hex"), paths: ["documents/"], actions: ["discover", "create_view"], expires_ms: Date.now() + 3600000 } });
+    const oldService = await startWorkspaceService(f, true);
+    let restoredService: Awaited<ReturnType<typeof startWorkspaceService>> | undefined;
+    try {
+      const original = await (await fetch(oldService.url + "/v1/company")).json() as any;
+      const payload = JSON.stringify({ version: "omos.company/v1", workspace: original.workspace, actor: "reader", grant: "reader", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action: "discover" });
+      const body = JSON.stringify({ payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") });
+      const read = (url: string) => fetch(url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", connection: "close" }, body });
+      expect((await read(oldService.url)).status).toBe(200);
+      const copy = join(f.home, "restored.fossil");
+      const exported = await f.run(["fossil", "export", copy]);
+      expect(exported.code, exported.stderr).toBe(0);
+      expect((await f.run(["fossil", "use", copy])).code).toBe(0);
+      restoredService = await startWorkspaceService(f, true);
+      const inactive = await read(restoredService.url);
+      expect(inactive.status).toBe(409);
+      expect((await inactive.json() as any).error).toBe("CompanyIssuerBoundElsewhere");
+      const live = await (await fetch(oldService.url + "/v1/company")).json() as any;
+      const mutation = JSON.stringify({ version: "omos.company/v1", workspace: original.workspace, actor: "reader", grant: "reader", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action: "create_view", revision: live.revision, objective: "Retain work created after the export" });
+      const advanced = await fetch(oldService.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ payload: mutation, signature: sign(null, Buffer.from(mutation), key.privateKey).toString("hex") }) });
+      expect(advanced.status, JSON.stringify(await advanced.json())).toBe(200);
+      const stale = await admin({ action: "status" });
+      const request = join(f.home, "stale-recovery.json");
+      writeFileSync(request, JSON.stringify({ version: "omos.company-admin/v1", action: "rotate", revision: stale.revision }));
+      const refused = await f.run(["fossil", "company", request, "--json"]);
+      expect(refused.code).toBe(1);
+      expect(refused.stderr).toContain("CompanyRecoverySourceAdvanced");
+      expect((await read(oldService.url)).status).toBe(200);
+      restoredService.child.kill(); await restoredService.child.exited; restoredService = undefined;
+      expect((await f.run(["fossil", "use", join(f.cwd, "omos.fossil")])).code).toBe(0);
+      const freshCopy = join(f.home, "fresh-restored.fossil");
+      expect((await f.run(["fossil", "export", freshCopy])).code).toBe(0);
+      expect((await f.run(["fossil", "use", freshCopy])).code).toBe(0);
+      restoredService = await startWorkspaceService(f, true);
+      const current = await admin({ action: "status" });
+      const rotated = await admin({ action: "rotate", revision: current.revision });
+      expect(rotated.authority.epoch).toBeGreaterThan(original.epoch);
+      expect(rotated.authority.issuer).not.toBe(original.issuer);
+      expect(rotated.authority.grants.every((grant: any) => grant.revoked)).toBe(true);
+      const active = await fetch(restoredService.url + "/v1/company");
+      expect(active.status).toBe(200);
+      expect((await active.json() as any).issuer).toBe(rotated.authority.issuer);
+      const fenced = await read(oldService.url);
+      expect(fenced.status).toBe(409);
+      expect((await fenced.json() as any).error).toBe("CompanyIssuerBoundElsewhere");
+      expect((await fetch(oldService.url + "/v1/definition", { headers: oldService.headers })).status).toBe(409);
+      expect((await read(restoredService.url)).status).toBe(403);
+    } finally {
+      oldService.child.kill(); await oldService.child.exited;
+      if (restoredService) { restoredService.child.kill(); await restoredService.child.exited; }
+    }
+  }, 90000);
 
   test("publishes independently reviewed company proposals and fences revocation during assessment", async () => {
     for (const revoked of [false, true]) {
@@ -278,6 +375,34 @@ describe("portable Fossil workspace recovery", () => {
     expect(changed.code).toBe(1);
     expect(changed.stderr).toContain("FossilExecutableChanged");
   }, 90000);
+
+  test.skipIf(!existsSync(join(import.meta.dir, "../../zig-out/libexec/fossil")))("installs a portable bundle without system Fossil and survives removal of the download", async () => {
+    const f = fixture();
+    const root = join(import.meta.dir, "../..");
+    const platform = `${process.platform === "darwin" ? "macos" : "linux"}-${process.arch === "arm64" ? "aarch64" : "x86_64"}`;
+    const archive = join(f.home, "omos-preview.tar.gz");
+    const packaged = spawnSync("python3", [join(root, "scripts/package-omos.py"), "--platform", platform, "--output", archive, "--compression-level", "1"], { encoding: "utf8", timeout: 90000 });
+    expect(packaged.status, packaged.stderr).toBe(0);
+    const unpacked = join(f.home, "download");
+    mkdirSync(unpacked);
+    const extracted = spawnSync("tar", ["-xzf", archive, "-C", unpacked], { encoding: "utf8" });
+    expect(extracted.status, extracted.stderr).toBe(0);
+    const bin = join(f.home, "commands");
+    const installed = spawnSync("sh", [join(unpacked, "omos/install.sh")], { env: { ...process.env, ...f.env, XDG_BIN_HOME: bin }, encoding: "utf8", timeout: 60000 });
+    expect(installed.status, `${installed.error ?? ""}\n${installed.stdout}\n${installed.stderr}`).toBe(0);
+    const binding = JSON.parse(readFileSync(join(f.home, ".fx/omos-workspace.json"), "utf8"));
+    rmSync(unpacked, { recursive: true });
+    const emptyPath = join(f.home, "empty-path");
+    mkdirSync(emptyPath);
+    for (const command of ["omos", "omo"]) {
+      const result = spawnSync(join(bin, command), ["fossil", "ensure", "--json"], { cwd: f.cwd, env: { ...process.env, ...f.env, PATH: emptyPath }, encoding: "utf8", timeout: 30000 });
+      expect(result.status, result.stderr).toBe(0);
+      const status = JSON.parse(result.stdout);
+      expect(status.workspace_id).toBe(binding.workspace_id);
+      expect(status.tasks).toEqual([]);
+      expect(status.repository).toBe(binding.repository);
+    }
+  }, 180000);
 
   test("creates one empty personal instance automatically without importing existing sessions", async () => {
     const f = fixture();

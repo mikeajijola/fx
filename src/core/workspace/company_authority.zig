@@ -141,28 +141,16 @@ pub fn authenticate(alloc: std.mem.Allocator, state: State, raw: []const u8, now
 pub fn authorizeTask(manager: workspace.Manager, task: workspace.Task) !void {
     const binding = task.authority orelse return;
     const state = try records.decode(State, manager.alloc, try manager.companyContent("authority/state.json"), .{});
+    _ = try @import("company_keys.zig").current(manager, state.epoch, state.issuer);
     const grant = try liveGrant(state, binding.grant, @import("../shared/io.zig").milliTimestamp());
     if (!std.mem.eql(u8, binding.actor, grant.actor) or !permitsAction(grant, .submit)) return error.CompanyAccessDenied;
     if (grant.human_approval) return error.CompanyApprovalRequired;
-    const paths = try manager.inventory(try manager.currentRevision(task));
-    const base = try manager.inventory(task.base_revision);
-    for (paths) |path| {
+    for (try manager.changedPaths(task.base_revision, try manager.currentRevision(task))) |path| {
         if (!permittedRoot(path)) continue;
         // A long signed objective is retained by the host as an immutable
         // request artifact. It is contract data, not an actor content mutation.
         if (task.request_artifact) |request| if (std.mem.eql(u8, request, path)) continue;
-        const exists = for (base) |previous| {
-            if (std.mem.eql(u8, previous, path)) break true;
-        } else false;
-        const changed = !exists or !std.mem.eql(u8, try workspace.hash(manager.alloc, try manager.contentAt(path, task.base_revision)), try workspace.hash(manager.alloc, try manager.contentAt(path, task.branch)));
-        if (changed and !permitsPath(grant, path)) return error.CompanyAccessDenied;
-    }
-    for (base) |path| {
-        if (!permittedRoot(path)) continue;
-        const exists = for (paths) |current| {
-            if (std.mem.eql(u8, current, path)) break true;
-        } else false;
-        if (!exists and !permitsPath(grant, path)) return error.CompanyAccessDenied;
+        if (!permitsPath(grant, path)) return error.CompanyAccessDenied;
     }
 }
 

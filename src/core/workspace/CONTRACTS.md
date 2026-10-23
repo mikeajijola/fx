@@ -297,10 +297,23 @@ an outcome using its original operation ID. Receipts identify the actor, grant,
 operation, authority epoch, and result, and are signed by the server issuer.
 
 Issuer seeds remain in protected profile storage under `~/.fx/authority/`,
-outside the repository and disposable checkout caches. Copying a repository
-alone does not restore issuer power. Recovery requires the protected key or
-explicit operator rotation; rotation advances the epoch and revokes existing
-grants. Issuer backup and single-writer deployment remain operator duties.
+outside the repository and disposable checkout caches. Immutable seed files
+have mode `0600`. An atomically published descriptor binds the issuer to one
+repository path, workspace identity, and authority epoch. Interrupted creation
+can retry without adopting a partial seed. All company mutations and publication
+share a per-workspace operation lease on the host.
+
+Copying a repository does not restore issuer power. Explicit operator rotation
+advances the epoch, creates a new key, and revokes existing grants. When the
+protected descriptor names another local repository, recovery compares committed
+history while holding that source's writer lease. `CompanyRecoverySourceAdvanced`
+means the copy is stale: preserve it, export the current source again, and retry
+with the fresh copy. Successful activation fences requests and publication from
+the previous local instance. An unavailable recorded source requires recovery
+of that source before local rebinding. A new host has no such descriptor;
+operators must fence the previous host before activating recovered authority.
+The local lease does not coordinate independent machines. Back up protected keys
+separately from portable company content.
 
 Submission retains an immutable proposal, integrates compatible accepted
 changes, and queues independent review. Candidate files and host checkpoint

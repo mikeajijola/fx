@@ -303,9 +303,14 @@ const Lease = struct {
 /// Kernel-owned actor exclusion; released automatically after a process crash.
 pub const ExecutionLease = struct {
     file: std.Io.File,
+    shared: ?std.Io.File = null,
     pub fn release(self: ExecutionLease) void {
         self.file.unlock(io_mod.getIo());
         self.file.close(io_mod.getIo());
+        if (self.shared) |file| {
+            file.unlock(io_mod.getIo());
+            file.close(io_mod.getIo());
+        }
     }
 };
 
@@ -333,6 +338,7 @@ pub fn configured(alloc: Allocator) !?Binding {
 pub const Manager = struct {
     expected_revision: ?[]const u8 = null,
     review_fence: ?@import("review_job.zig").Fence = null,
+    company_operation_held: bool = false,
 
     alloc: Allocator,
     repository: []const u8,
@@ -354,6 +360,28 @@ pub const Manager = struct {
             return null;
         }
         return .{ .file = file };
+    }
+
+    /// Independent sessions can execute concurrently. A scheduled invocation
+    /// retains the exclusive workspace gate until its existing executor ends.
+    pub fn trySessionExecutionLease(self: Manager, session: []const u8) !?ExecutionLease {
+        try mkdir(self.root);
+        const gate = try std.Io.Dir.cwd().createFile(io_mod.getIo(), try join(self.alloc, self.root, "actor.lock"), .{ .truncate = false, .permissions = .fromMode(0o600) });
+        var keep_gate = false;
+        defer if (!keep_gate) {
+            gate.unlock(io_mod.getIo());
+            gate.close(io_mod.getIo());
+        };
+        if (!try gate.tryLock(io_mod.getIo(), .shared)) return null;
+        const path = try join(self.alloc, self.root, try self.alloc.print("actor-{s}.lock", .{try hash(self.alloc, session)}));
+        const file = try std.Io.Dir.cwd().createFile(io_mod.getIo(), path, .{ .truncate = false, .permissions = .fromMode(0o600) });
+        errdefer file.close(io_mod.getIo());
+        if (!try file.tryLock(io_mod.getIo(), .exclusive)) {
+            file.close(io_mod.getIo());
+            return null;
+        }
+        keep_gate = true;
+        return .{ .file = file, .shared = gate };
     }
 
     const company_branch = "omos-company";
@@ -388,6 +416,7 @@ pub const Manager = struct {
 
     /// Company control records are host-owned and never enter actor checkouts.
     pub fn companyWrite(self: Manager, expected: ?[]const u8, files: []const CompanyFile) ![]const u8 {
+        if (!self.company_operation_held) return error.CompanyOperationLeaseRequired;
         const lease = try Lease.acquire(self.alloc, self.root);
         defer lease.release();
         const current = try self.companyRevision();
@@ -413,8 +442,33 @@ pub const Manager = struct {
     }
 
     pub fn companyOperationLease(self: Manager) !ExecutionLease {
-        const lease = try Lease.acquireNamed(self.alloc, self.root, "company-operation.lock");
+        const lease = try Lease.acquireNamed(self.alloc, try @import("company_keys.zig").directory(self), "operation.lock");
         return .{ .file = lease.file };
+    }
+
+    /// Recovery holds the source writer boundary until issuer activation ends.
+    pub fn snapshotLease(self: Manager) !ExecutionLease {
+        const lease = try Lease.acquire(self.alloc, self.root);
+        return .{ .file = lease.file };
+    }
+
+    pub fn repositoryFingerprint(self: Manager) ![]const u8 {
+        const output = try self.run(null, &.{ "timeline", "before", "9999-12-31", "--type", "ci", "--limit", "0", "--format", "%H", "-R", self.repository });
+        var identities: std.ArrayList([]const u8) = .empty;
+        var lines = std.mem.splitScalar(u8, output, '\n');
+        while (lines.next()) |raw| {
+            const identity = std.mem.trim(u8, raw, " \r\t");
+            if (identity.len == 0 or std.mem.startsWith(u8, identity, "===") or std.mem.startsWith(u8, identity, "+++")) continue;
+            if (identity.len != 40 and identity.len != 64) return error.InvalidFossilRevision;
+            for (identity) |ch| if (!std.ascii.isHex(ch)) return error.InvalidFossilRevision;
+            try identities.append(self.alloc, identity);
+        }
+        std.mem.sort([]const u8, identities.items, {}, struct {
+            fn less(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.less);
+        return hash(self.alloc, try json(self.alloc, identities.items));
     }
 
     pub fn bindCompanyTask(self: Manager, previous: Task, authority: @import("company_authority.zig").Binding) !Task {
@@ -724,6 +778,8 @@ pub const Manager = struct {
     }
 
     pub fn claimReview(self: Manager, owner: []const u8) !?@import("review_job.zig").Job {
+        const authority_lease: ?ExecutionLease = if (self.company_operation_held) null else try self.companyOperationLease();
+        defer if (authority_lease) |held| held.release();
         const lease = try Lease.acquire(self.alloc, self.root);
         defer lease.release();
         const now = io_mod.milliTimestamp();
@@ -1409,7 +1465,7 @@ pub const Manager = struct {
             const job = try self.loadReviewJob(latest, id);
             if (job.state == .queued or job.state == .running) return error.TaskReviewInProgress;
         };
-        if (latest.state == .paused or latest.state == .blocked or latest.state == .conflict) {
+        if (latest.state != .accepted and latest.state != .publication_pending) {
             const tree = try self.checkout(task.branch);
             const path = try join(self.alloc, tree, try self.taskPath(task.id));
             const bytes = try json(self.alloc, latest);
@@ -2049,8 +2105,8 @@ pub const Manager = struct {
         const Read = struct { path: []const u8, observed_hash: []const u8, reviewed_hash: ?[]const u8, bytes: usize, reviewed_content: []const u8, complete: bool, deleted: bool = false };
         var reads: std.ArrayList(Read) = .empty;
         var files: std.ArrayList(ReviewFile) = .empty;
+        const inventory_paths = try self.inventory(revision_id);
         for (latest.dependencies) |dependency| {
-            const inventory_paths = try self.inventory(revision_id);
             const present = for (inventory_paths) |path| {
                 if (std.mem.eql(u8, path, dependency.path)) break true;
             } else false;
@@ -2065,15 +2121,14 @@ pub const Manager = struct {
             try files.append(self.alloc, .{ .path = dependency.path, .content = bytes, .hash = digest });
         }
         if (task.authority != null) {
-            const base_paths = try self.inventory(task.base_revision);
-            for (try self.inventory(revision_id)) |path| {
+            for (try self.changedPaths(task.base_revision, revision_id)) |path| {
                 if (!allowedMutablePath(path) and !std.mem.startsWith(u8, path, "records/")) continue;
-                const present = for (base_paths) |old| {
-                    if (std.mem.eql(u8, path, old)) break true;
+                const present = for (inventory_paths) |current| {
+                    if (std.mem.eql(u8, path, current)) break true;
                 } else false;
+                if (!present) continue;
                 const bytes = try self.contentAt(path, revision_id);
                 const digest = try hash(self.alloc, bytes);
-                if (present and std.mem.eql(u8, digest, try hash(self.alloc, try self.contentAt(path, task.base_revision)))) continue;
                 const included = for (files.items) |file| {
                     if (std.mem.eql(u8, path, file.path)) break true;
                 } else false;
@@ -2164,13 +2219,25 @@ pub const Manager = struct {
         while (branch_lines.next()) |raw| {
             const branch = std.mem.trim(u8, raw, " *\r\t");
             if (branch.len == 0) continue;
-            if (!std.mem.eql(u8, branch, "trunk") and !std.mem.eql(u8, branch, schedule_branch) and !(std.mem.startsWith(u8, branch, "task/") and safeId(branch[5..])) and !(std.mem.startsWith(u8, branch, "definition/") and safeId(branch[11..]))) return error.UnexpectedWorkspaceBranch;
+            if (!std.mem.eql(u8, branch, "trunk") and !std.mem.eql(u8, branch, company_branch) and !std.mem.eql(u8, branch, schedule_branch) and !(std.mem.startsWith(u8, branch, "task/") and safeId(branch[5..])) and !(std.mem.startsWith(u8, branch, "definition/") and safeId(branch[11..]))) return error.UnexpectedWorkspaceBranch;
             const listing = try self.run(null, &.{ "ls", "-r", branch, "-R", self.repository });
             var files = std.mem.splitScalar(u8, listing, '\n');
             while (files.next()) |raw_path| {
                 const path = std.mem.trim(u8, raw_path, "\r");
                 if (path.len == 0) continue;
                 if (!allowedPath(path) and !std.mem.eql(u8, path, "registry.json")) return unexpectedEntry("checkout inventory", path);
+                if (std.mem.eql(u8, branch, company_branch)) {
+                    const entity: ?[]const u8 = if (std.mem.eql(u8, path, "authority/state.json")) "omos_company_authority" else if (std.mem.startsWith(u8, path, "company/views/")) "omos_workspace_view" else if (std.mem.startsWith(u8, path, "company/operations/")) "omos_company_operation" else null;
+                    if (entity) |kind| {
+                        const raw_record = try self.contentAt(path, branch);
+                        const declaration = try self.loadDeclaration("trunk");
+                        try model.validateRecord(declaration.semantic, kind, try parse(self.alloc, std.json.Value, raw_record), true);
+                        if (std.mem.eql(u8, kind, "omos_company_authority")) {
+                            const authority = try record_json.decode(@import("company_authority.zig").State, self.alloc, raw_record, .{});
+                            if (!std.mem.eql(u8, authority.workspace, self.manifest.id) or !std.mem.eql(u8, authority.version, "omos.company-authority/v1") or authority.epoch == 0) return error.WorkspaceBindingMismatch;
+                        }
+                    }
+                }
                 if (std.mem.startsWith(u8, path, "artifacts/")) {
                     const content_bytes = try self.run(null, &.{ "cat", path, "-r", branch, "-R", self.repository });
                     if (!std.mem.eql(u8, path[10..], try hash(self.alloc, content_bytes))) return error.InvalidArtifactIdentity;
@@ -2192,6 +2259,8 @@ pub const Manager = struct {
     /// before acknowledgement discovers the committed receipt and never reruns
     /// tools or asks the actor to repeat already completed external effects.
     pub fn publish(self: Manager, task: Task, review: Review) ![]const u8 {
+        const authority_lease: ?ExecutionLease = if (self.company_operation_held) null else try self.companyOperationLease();
+        defer if (authority_lease) |held| held.release();
         const lease = try Lease.acquire(self.alloc, self.root);
         defer lease.release();
         const latest = try self.loadTask(task.id);
@@ -2322,6 +2391,8 @@ pub const Manager = struct {
     }
 
     pub fn retryPublication(self: Manager, task: Task) !?[]const u8 {
+        const authority_lease: ?ExecutionLease = if (self.company_operation_held) null else try self.companyOperationLease();
+        defer if (authority_lease) |held| held.release();
         const lease = try Lease.acquire(self.alloc, self.root);
         defer lease.release();
         const bytes = read(self.alloc, try self.publicationPath(task.id)) catch |err| switch (err) {

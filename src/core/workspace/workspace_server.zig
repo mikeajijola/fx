@@ -126,10 +126,13 @@ fn dispatch(manager: workspace.Manager, request: *std.http.Server.Request, token
         return request.respond("{\"error\":\"Unauthorized\"}", .{ .status = .unauthorized, .keep_alive = false });
     }
     if (company and request.head.method == .GET) {
-        const response = @import("company_service.zig").bootstrap(manager) catch return request.respond("{\"error\":\"CompanyNotInitialized\"}", .{ .status = .not_found, .keep_alive = keep_alive.* });
+        const response = @import("company_service.zig").bootstrap(manager) catch |err| return request.respond(try std.json.Stringify.valueAlloc(manager.alloc, .{ .@"error" = @errorName(err) }, .{}), .{ .status = if (err == error.CompanyNotInitialized) .not_found else .conflict, .keep_alive = keep_alive.* });
         return request.respond(response, .{ .keep_alive = keep_alive.*, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
     }
     if (request.head.method == .GET and std.mem.eql(u8, request.head.target, "/v1/definition")) {
+        const lease = try manager.companyOperationLease();
+        defer lease.release();
+        @import("company_service.zig").validateInstance(manager) catch |err| return request.respond(try std.json.Stringify.valueAlloc(manager.alloc, .{ .@"error" = @errorName(err) }, .{}), .{ .status = .conflict, .keep_alive = keep_alive.* });
         const snapshot = try manager.definitionSnapshot(null);
         return request.respond(try std.json.Stringify.valueAlloc(manager.alloc, .{ .workspace = manager.manifest.id, .definition = snapshot, .revision = (try manager.snapshot("")).trunk_revision }, .{}), .{ .keep_alive = keep_alive.*, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
     }
@@ -141,17 +144,26 @@ fn dispatch(manager: workspace.Manager, request: *std.http.Server.Request, token
     };
     const body_reader = try request.readerExpectContinue(&.{});
     const raw = try body_reader.allocRemaining(manager.alloc, .limited(1024 * 1024));
-    const response = (if (company) @import("company_service.zig").execute(manager, raw, writable) else if (schedules) service.executeSchedule(manager, raw, writable) else service.execute(manager, raw, writable)) catch |err| {
+    const response = (if (company) @import("company_service.zig").execute(manager, raw, writable) else ownerRequest(manager, raw, writable, schedules)) catch |err| {
         @import("../shared/debug_trace.zig").logf("workspace", "workspace service rejected error={s}", .{@errorName(err)});
         const status: std.http.Status = switch (err) {
             error.CompanyAccessDenied, error.CompanyAccessRevoked, error.CompanySignatureRejected, error.CompanyRequestExpired, error.CompanyDelegationDenied, error.WorkspaceIdentityMismatch, error.ServiceReadOnly, error.HostOwnedEntity, error.WorkspacePathDenied => .forbidden,
-            error.CompanyOperationConflict, error.WorkspaceProjectionConflict, error.WorkspaceRevisionChanged, error.StaleWorkspaceDefinition, error.StaleWorkContract => .conflict,
+            error.CompanyIssuerBoundElsewhere, error.CompanyAuthorityRollbackDetected, error.CompanyIssuerRecoveryRequired, error.CompanyOperationConflict, error.WorkspaceProjectionConflict, error.WorkspaceRevisionChanged, error.StaleWorkspaceDefinition, error.StaleWorkContract => .conflict,
             else => .bad_request,
         };
         return request.respond(try std.json.Stringify.valueAlloc(manager.alloc, .{ .@"error" = @errorName(err) }, .{}), .{ .status = status, .keep_alive = keep_alive.* });
     };
     try request.respond(response, .{ .keep_alive = keep_alive.*, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
     @import("../shared/debug_trace.zig").logf("workspace", "workspace service response sent bytes={d}", .{response.len});
+}
+
+fn ownerRequest(original: workspace.Manager, raw: []const u8, writable: bool, schedules: bool) ![]const u8 {
+    var manager = original;
+    const lease = try manager.companyOperationLease();
+    defer lease.release();
+    manager.company_operation_held = true;
+    try @import("company_service.zig").validateInstance(manager);
+    return if (schedules) service.executeSchedule(manager, raw, writable) else service.execute(manager, raw, writable);
 }
 
 fn authenticated(value: ?[]const u8, token: []const u8) bool {
