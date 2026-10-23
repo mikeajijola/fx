@@ -10,6 +10,7 @@ const model = @import("definition.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const record_json = @import("../shared/record_json.zig");
 const scheduling = @import("scheduling.zig");
+const company_publication = @import("company_publication.zig");
 
 const Allocator = std.mem.Allocator;
 const max_bytes = 8 * 1024 * 1024;
@@ -60,20 +61,26 @@ pub const Review = struct {
 pub const ReviewFile = struct { path: []const u8, content: []const u8, hash: []const u8 };
 pub const ReviewInputs = struct { snapshot: []const u8, files: []const ReviewFile };
 const Publication = struct {
+    version: u32 = 1,
     operation: []const u8,
     source: []const u8,
     target: []const u8,
     task: Task,
     review: Review,
     review_fence: ?@import("review_job.zig").Fence = null,
+    issuer_proof: ?company_publication.Proof = null,
 };
 
 fn publicationEqual(alloc: Allocator, bytes: []const u8, expected: Publication) !bool {
     // Compare decoded contracts so newly added optional fields do not invalidate
     // a historical receipt that omitted their legacy defaults. Original bytes
     // remain retained and all known identities and values must still agree.
-    const retained = try record_json.decode(Publication, alloc, bytes, .{});
-    return std.mem.eql(u8, try json(alloc, retained), try json(alloc, expected));
+    var retained = try record_json.decode(Publication, alloc, bytes, .{});
+    const proposal = expected;
+    // The issuer proof is created under the final publication fence. A private
+    // pending journal can predate it; the committed proof is verified separately.
+    if (proposal.issuer_proof == null) retained.issuer_proof = null;
+    return std.mem.eql(u8, try json(alloc, retained), try json(alloc, proposal));
 }
 
 test "workspace paths historical publication receipts preserve omitted optional defaults" {
@@ -774,6 +781,7 @@ pub const Manager = struct {
         task.review_job = id;
         try self.saveReviewJob(task, job);
         try self.saveTask(task);
+        if (task.authority != null) try fault("company-review-queued");
         return job;
     }
 
@@ -1410,7 +1418,11 @@ pub const Manager = struct {
         const bytes = try portableValue(self.alloc, .{ .object = envelope });
         const id = try hash(self.alloc, bytes);
         try atomicWrite(self.alloc, try join(self.alloc, try self.journalDir(task), id), bytes);
-        if (std.mem.eql(u8, kind, "action_intent")) try fault("action-recorded");
+        if (std.mem.eql(u8, kind, "action_intent")) {
+            // No actor effect may start with its only intent in a local cache.
+            try self.drain(current);
+            try fault("action-recorded");
+        }
         return id;
     }
 
@@ -1536,7 +1548,7 @@ pub const Manager = struct {
 
     pub fn readContent(self: Manager, task: Task, path: []const u8) ![]const u8 {
         const bytes = try self.content(task, path);
-        if (!std.mem.startsWith(u8, path, "memory/") and !std.mem.startsWith(u8, path, "skills/")) return bytes;
+        if (!allowedMutablePath(path) and !std.mem.startsWith(u8, path, "records/")) return bytes;
         const lease = try Lease.acquire(self.alloc, self.root);
         defer lease.release();
         var current = try self.loadTask(task.id);
@@ -2257,6 +2269,10 @@ pub const Manager = struct {
                 if (std.mem.startsWith(u8, path, "artifacts/")) {
                     const content_bytes = try self.run(null, &.{ "cat", path, "-r", branch, "-R", self.repository });
                     if (!std.mem.eql(u8, path[10..], try hash(self.alloc, content_bytes))) return error.InvalidArtifactIdentity;
+                } else if (std.mem.startsWith(u8, path, "acceptances/")) {
+                    const publication = try parse(self.alloc, Publication, try self.contentAt(path, branch));
+                    try self.verifyPublication(publication);
+                    if (!std.mem.eql(u8, path, try self.alloc.print("acceptances/{s}.json", .{publication.operation}))) return error.WorkspaceVerificationFailed;
                 } else if (std.mem.startsWith(u8, path, "history/")) {
                     const name = std.Io.Dir.path.basename(path);
                     if (name.len != 69 or !std.mem.endsWith(u8, name, ".json")) return error.InvalidWorkspaceJournal;
@@ -2308,14 +2324,14 @@ pub const Manager = struct {
             try model.validateOperation(self.alloc, declaration_value, operation, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .summary = review.candidate, .evidence = references.items }), .{})).value, .output);
         }
         if (decision.disposition != .fulfilled) return error.WorkspaceReviewRequired;
-        if (latest.state == .accepted) return self.revision(task.parent);
+        if (latest.state == .accepted) return self.acceptedRevision(latest);
         if (!std.mem.eql(u8, review.revision, try self.revision(task.branch))) return error.WorkspaceRevisionChanged;
         if ((try self.entries(try self.journalDir(task))).len != 0) return error.WorkspacePendingEvidence;
         if (try self.uiChanged(latest.base_revision, review.revision) and !try self.hasUiReceipt(latest, review.revision)) return error.UiValidationRequired;
         try self.ensureMergeable(latest, review.revision, try self.revision(task.parent));
         try self.validateDependencies(latest);
         const operation = try hash(self.alloc, try json(self.alloc, .{ task.id, review.revision, review.contract_version, task.parent }));
-        const publication: Publication = .{ .operation = operation, .source = review.revision, .target = task.parent, .task = latest, .review = review, .review_fence = self.review_fence };
+        const publication: Publication = .{ .version = 2, .operation = operation, .source = review.revision, .target = task.parent, .task = latest, .review = review, .review_fence = self.review_fence };
         try atomicWrite(self.alloc, try self.publicationPath(task.id), try json(self.alloc, publication));
         var pending = latest;
         pending.state = .publication_pending;
@@ -2324,13 +2340,61 @@ pub const Manager = struct {
         return self.finishPublication(publication);
     }
 
-    fn finishPublication(self: Manager, publication: Publication) ![]const u8 {
+    fn publicationClaims(self: Manager, publication: Publication, authority_revision: []const u8, epoch: u64, issued_ms: i64) !company_publication.Claims {
+        const binding = publication.task.authority orelse return error.CompanyAccessDenied;
+        return .{ .workspace = self.manifest.id, .actor = binding.actor, .grant = binding.grant, .operation = publication.operation, .task = publication.task.id, .source = publication.source, .target = publication.target, .target_base = publication.task.base_revision, .contract_sha256 = try hash(self.alloc, try json(self.alloc, publication.task.definition)), .candidate_sha256 = try hash(self.alloc, publication.review.candidate), .assessment_sha256 = try hash(self.alloc, publication.review.assessment), .authority_revision = authority_revision, .epoch = epoch, .issued_ms = issued_ms };
+    }
+
+    fn verifyPublication(self: Manager, publication: Publication) !void {
+        if (publication.version != 1 and publication.version != 2) return error.InvalidWorkspaceFormat;
+        if (!std.mem.eql(u8, publication.task.workspace_id, self.manifest.id)) return error.WorkspaceIdentityMismatch;
+        if (publication.issuer_proof) |proof| {
+            const claims = try company_publication.verify(self, proof);
+            const expected = try self.publicationClaims(publication, claims.authority_revision, claims.epoch, claims.issued_ms);
+            if (!std.mem.eql(u8, try json(self.alloc, claims), try json(self.alloc, expected))) return error.WorkspaceVerificationFailed;
+        } else if (publication.version >= 2 and publication.task.authority != null) return error.CompanyPublicationProofRequired;
+    }
+
+    fn receiptRevision(self: Manager, publication: Publication) ![]const u8 {
+        const path = try self.alloc.print("acceptances/{s}.json", .{publication.operation});
+        const output = try self.run(null, &.{ "timeline", "ancestors", publication.target, "--path", path, "--type", "ci", "--limit", "1", "--format", "%H", "--quiet", "-R", self.repository });
+        // Older supported Fossil releases append a completion notice even with
+        // --quiet. The format guarantees the first row is the check-in hash.
+        var lines = std.mem.splitScalar(u8, output, '\n');
+        const revision_id = std.mem.trim(u8, lines.next() orelse return error.WorkspaceVerificationFailed, " \r\t");
+        if (revision_id.len != 40 and revision_id.len != 64) return error.WorkspaceVerificationFailed;
+        for (revision_id) |ch| if (!std.ascii.isHex(ch)) return error.WorkspaceVerificationFailed;
+        const bytes = try self.contentAt(path, revision_id);
+        if (!try publicationEqual(self.alloc, bytes, publication)) return error.WorkspaceVerificationFailed;
+        try self.verifyPublication(try parse(self.alloc, Publication, bytes));
+        return revision_id;
+    }
+
+    pub fn acceptedRevision(self: Manager, task: Task) ![]const u8 {
+        const source = try self.currentRevision(task);
+        const operation = try hash(self.alloc, try json(self.alloc, .{ task.id, source, task.definition.version, task.parent }));
+        const publication = try parse(self.alloc, Publication, try self.contentAt(try self.alloc.print("acceptances/{s}.json", .{operation}), task.parent));
+        if (!std.mem.eql(u8, publication.task.id, task.id) or !std.mem.eql(u8, publication.source, source) or !std.mem.eql(u8, publication.target, task.parent)) return error.WorkspaceVerificationFailed;
+        return self.receiptRevision(publication);
+    }
+
+    pub fn publicationSummary(self: Manager, task: Task) !std.json.Value {
+        const revision_id = try self.acceptedRevision(task);
+        const operation = try hash(self.alloc, try json(self.alloc, .{ task.id, try self.currentRevision(task), task.definition.version, task.parent }));
+        const path = try self.alloc.print("acceptances/{s}.json", .{operation});
+        const bytes = try self.contentAt(path, revision_id);
+        const publication = try parse(self.alloc, Publication, bytes);
+        return parse(self.alloc, std.json.Value, try json(self.alloc, .{ .revision = revision_id, .operation = operation, .receipt_path = path, .receipt_sha256 = try hash(self.alloc, bytes), .issuer_proof = publication.issuer_proof }));
+    }
+
+    fn finishPublication(self: Manager, pending_publication: Publication) ![]const u8 {
+        var publication = pending_publication;
         const receipt = try self.alloc.print("acceptances/{s}.json", .{publication.operation});
         const already = self.run(null, &.{ "cat", receipt, "-r", publication.target, "-R", self.repository }) catch null;
         var accepted_revision: []const u8 = undefined;
         if (already) |bytes| {
             if (!try publicationEqual(self.alloc, bytes, publication)) return error.WorkspaceVerificationFailed;
-            accepted_revision = try self.revision(publication.target);
+            accepted_revision = try self.receiptRevision(try parse(self.alloc, Publication, bytes));
         } else {
             try @import("company_authority.zig").authorizeTask(self, publication.task);
             if (publication.task.authority != null and !std.mem.eql(u8, publication.task.base_revision, try self.revision(publication.target))) return error.CompanyReconciliationRequired;
@@ -2348,6 +2412,11 @@ pub const Manager = struct {
             _ = try self.run(tree, &.{ "update", "--nosync", publication.target });
             try self.ensureMergeable(publication.task, publication.source, try self.revision(publication.target));
             try self.validateDependencies(publication.task);
+            if (publication.task.authority != null and publication.version >= 2) {
+                const authority_revision = (try self.companyRevision()) orelse return error.CompanyNotInitialized;
+                const current = try record_json.decode(@import("company_authority.zig").State, self.alloc, try self.contentAt("authority/state.json", authority_revision), .{});
+                publication.issuer_proof = try company_publication.seal(self, try self.publicationClaims(publication, authority_revision, current.epoch, io_mod.milliTimestamp()));
+            }
             const changes = try self.run(tree, &.{ "changes", "--hash", "--differ" });
             if (std.mem.trim(u8, changes, " \r\n").len != 0) return error.WorkspaceRecoveryRequired;
             try self.merge(tree, publication.source, publication.task);
@@ -2379,6 +2448,7 @@ pub const Manager = struct {
             else => return err,
         };
         if (!try publicationEqual(self.alloc, bytes, publication)) return error.WorkspaceVerificationFailed;
+        try self.verifyPublication(try parse(self.alloc, Publication, bytes));
         return true;
     }
 

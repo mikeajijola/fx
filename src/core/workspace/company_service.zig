@@ -18,6 +18,9 @@ const Journal = struct {
     result: ?[]const u8 = null,
     failure: ?[]const u8 = null,
     view: ?[]const u8 = null,
+    request: ?[]const u8 = null,
+    receipt: ?[]const u8 = null,
+    reconciled_by: ?[]const u8 = null,
 };
 const View = struct { id: []const u8, actor: []const u8, grant: []const u8, task: []const u8, base: []const u8, pending: ?[]const u8 = null };
 const Admin = struct {
@@ -153,9 +156,9 @@ pub fn execute(original: workspace.Manager, raw: []const u8, writable: bool) ![]
     const request = try authority.authenticate(manager.alloc, current, raw, io.milliTimestamp());
     try model.validateOperation(manager.alloc, declaration, "omos_company_operation", try parse(manager.alloc, (try records.decode(authority.Envelope, manager.alloc, raw, .{})).payload), .input);
     const grant = try authority.liveGrant(current, request.grant, io.milliTimestamp());
-    const mutation = request.action == .create_view or request.action == .checkpoint or request.action == .submit or request.action == .delegate;
+    const mutation = request.action == .create_view or request.action == .checkpoint or request.action == .submit or request.action == .delegate or request.action == .reconcile;
     if (mutation and !writable) return error.ServiceReadOnly;
-    if (mutation) if (request.view) |id| {
+    if (mutation and request.action != .reconcile) if (request.view) |id| {
         const selected = try loadView(manager, grant, id);
         if (selected.view.pending) |pending| if (!std.mem.eql(u8, pending, request.operation)) return error.CompanyOperationRecoveryRequired;
     };
@@ -171,22 +174,24 @@ pub fn execute(original: workspace.Manager, raw: []const u8, writable: bool) ![]
         // Only internal idempotent operations below can replay. No external
         // command or provider effect is dispatched by this API.
     }
-    var journal: Journal = .{ .actor = request.actor, .grant = request.grant, .operation = request.operation, .request_hash = request_hash, .state = .pending, .view = request.view };
+    var journal: Journal = .{ .actor = request.actor, .grant = request.grant, .operation = request.operation, .request_hash = request_hash, .state = .pending, .view = if (request.action == .reconcile) null else request.view, .request = if (retained) |previous| previous.request orelse raw else raw };
     if (mutation and retained == null) try saveJournal(manager, path, journal);
     const result = perform(manager, current, grant, request, request_hash) catch |err| {
         if (mutation) {
             journal.state = if (err == error.WorkspaceRevisionChanged or err == error.CompanyAccessDenied or err == error.WorkspaceProjectionConflict) .failed else .uncertain;
             journal.failure = @errorName(err);
+            journal.receipt = try signed(manager, current, request, request_hash, try encode(manager.alloc, .{ .operation = request.operation, .state = @tagName(journal.state), .failure = journal.failure }));
             try saveJournal(manager, path, journal);
         }
         return err;
     };
+    const response = try signed(manager, current, request, request_hash, result);
     if (mutation) {
         journal.state = .completed;
         journal.result = result;
+        journal.receipt = response;
         try saveJournal(manager, path, journal);
     }
-    const response = try signed(manager, current, request, request_hash, result);
     try model.validateOperation(manager.alloc, declaration, "omos_company_request", try parse(manager.alloc, response), .output);
     return response;
 }
@@ -198,11 +203,51 @@ fn loadView(manager: workspace.Manager, grant: authority.Grant, id: []const u8) 
     return .{ .view = view, .task = try manager.loadTask(view.task) };
 }
 
-fn perform(original: workspace.Manager, current: authority.State, grant: authority.Grant, request: authority.Request, operation_hash: []const u8) ![]const u8 {
+fn requestPage(manager: workspace.Manager, bytes: []const u8, offset: usize, limit: usize) !std.json.Value {
+    if (limit == 0 or limit > 16384 or offset > bytes.len) return error.InvalidEvidenceOffset;
+    const end = offset + @min(limit, bytes.len - offset);
+    const segment = bytes[offset..end];
+    const encoded = try manager.alloc.alloc(u8, std.base64.standard.Encoder.calcSize(segment.len));
+    return parse(manager.alloc, try encode(manager.alloc, .{ .sha256 = try workspace.hash(manager.alloc, bytes), .bytes = bytes.len, .offset = offset, .content = std.base64.standard.Encoder.encode(encoded, segment), .encoding = "base64", .next_offset = if (end < bytes.len) @as(?usize, end) else null }));
+}
+
+fn perform(original: workspace.Manager, current: authority.State, grant: authority.Grant, request: authority.Request, operation_hash: []const u8) anyerror![]const u8 {
     var manager = original;
     const alloc = manager.alloc;
     const selected = if (request.view) |id| try loadView(manager, grant, id) else null;
     const revision_id = if (selected) |view| try manager.currentRevision(view.task) else try manager.revision("trunk");
+    if (request.action == .reconcile) {
+        const id = request.outcome orelse return error.CompanyOutcomeRequired;
+        if (!authority.safeIdentity(id) or std.mem.eql(u8, id, request.operation)) return error.InvalidCompanyIdentity;
+        const path = try operationPath(manager, grant.actor, id);
+        var journal = (try loadJournal(manager, path)) orelse return error.CompanyOutcomeNotFound;
+        if (!std.mem.eql(u8, journal.grant, grant.id)) return error.CompanyAccessDenied;
+        if (journal.state == .failed) return error.CompanyOperationFailed;
+        const original_request = try authority.authenticateRetained(alloc, current, journal.request orelse return error.CompanyRequestNotRetained, request, io.milliTimestamp());
+        const envelope = try records.decode(authority.Envelope, alloc, journal.request.?, .{});
+        if (!std.mem.eql(u8, journal.request_hash, try workspace.hash(alloc, envelope.payload))) return error.CompanyOperationConflict;
+        if (journal.state != .completed) {
+            if (journal.view) |view_id| {
+                const view = try loadView(manager, grant, view_id);
+                if (view.view.pending) |pending| if (!std.mem.eql(u8, pending, id)) return error.CompanyOperationRecoveryRequired;
+            }
+            const result = perform(manager, current, grant, original_request, journal.request_hash) catch |err| {
+                journal.state = .uncertain;
+                journal.failure = @errorName(err);
+                journal.reconciled_by = request.operation;
+                journal.receipt = try signed(manager, current, original_request, journal.request_hash, try encode(alloc, .{ .operation = id, .state = @tagName(journal.state), .failure = journal.failure }));
+                try saveJournal(manager, path, journal);
+                return err;
+            };
+            journal.state = .completed;
+            journal.result = result;
+            journal.failure = null;
+            journal.reconciled_by = request.operation;
+            journal.receipt = try signed(manager, current, original_request, journal.request_hash, result);
+            try saveJournal(manager, path, journal);
+        }
+        return encode(alloc, .{ .operation = id, .request_hash = journal.request_hash, .state = @tagName(journal.state), .result = if (journal.result) |value| try parse(alloc, value) else null });
+    }
     if (request.action == .create_view) {
         const objective = request.objective orelse return error.MissingCompanyObjective;
         if (objective.len == 0 or objective.len > 16384) return error.InvalidCompanyObjective;
@@ -238,11 +283,11 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
             if (!authority.safeIdentity(id)) return error.InvalidCompanyIdentity;
             const journal = (try loadJournal(manager, try operationPath(manager, grant.actor, id))) orelse return error.CompanyOutcomeNotFound;
             if (!std.mem.eql(u8, journal.grant, grant.id)) return error.CompanyAccessDenied;
-            return encode(alloc, .{ .operation = id, .state = @tagName(journal.state), .failure = journal.failure, .result = if (journal.result) |value| try parse(alloc, value) else null });
+            return encode(alloc, .{ .operation = id, .request_hash = journal.request_hash, .state = @tagName(journal.state), .failure = journal.failure, .reconciled_by = journal.reconciled_by, .request = if (journal.request) |value| try requestPage(manager, value, request.offset, request.limit) else null, .receipt = if (journal.receipt) |value| try parse(alloc, value) else null, .result = if (journal.result) |value| try parse(alloc, value) else null });
         }
         const view = selected orelse return error.CompanyViewRequired;
         const job = if (view.task.review_job) |id| try manager.loadReviewJob(view.task, id) else null;
-        return encode(alloc, .{ .view = view.view.id, .revision = revision_id, .state = @tagName(view.task.state), .job = job });
+        return encode(alloc, .{ .view = view.view.id, .revision = revision_id, .state = @tagName(view.task.state), .job = job, .publication = if (view.task.state == .accepted) try manager.publicationSummary(view.task) else null });
     }
     if (request.action == .checkpoint) {
         const view = selected orelse return error.CompanyViewRequired;
@@ -272,9 +317,9 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
             if (std.mem.eql(u8, model.text(value, "operation"), request.operation)) retained_proposal = true;
         }
         if (retained_proposal) {
-            const job = try manager.queueReview(view.task);
+            const job = if (view.task.review_job) |id| try manager.loadReviewJob(view.task, id) else try manager.queueReview(view.task);
             if (!std.mem.eql(u8, job.candidate_hash, try workspace.hash(alloc, candidate))) return error.CompanyOperationConflict;
-            return encode(alloc, .{ .view = view.view.id, .candidate_revision = request.revision, .job = job.id, .state = if (grant.human_approval) "approval_required" else "verification_pending", .revision = try manager.currentRevision(view.task) });
+            return encode(alloc, .{ .view = view.view.id, .candidate_revision = request.revision, .job = job.id, .state = if (job.state == .published) "published" else if (grant.human_approval) "approval_required" else "verification_pending", .revision = try manager.currentRevision(view.task), .publication = if (job.state == .published) try manager.publicationSummary(view.task) else null });
         }
         if (request.revision == null or !std.mem.eql(u8, request.revision.?, revision_id)) return error.WorkspaceRevisionChanged;
         const integrated = try manager.refresh(view.task);

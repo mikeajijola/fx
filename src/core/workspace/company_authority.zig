@@ -4,7 +4,7 @@ const std = @import("std");
 const records = @import("../shared/record_json.zig");
 const workspace = @import("fossil_workspace.zig");
 
-pub const Action = enum { discover, read, create_view, checkpoint, submit, status, export_scope, delegate };
+pub const Action = enum { discover, read, create_view, checkpoint, submit, status, export_scope, delegate, reconcile };
 pub const Grant = struct {
     id: []const u8,
     actor: []const u8,
@@ -124,12 +124,27 @@ pub fn validateGrant(state: State, grant: Grant, now: i64) !void {
 }
 
 pub fn authenticate(alloc: std.mem.Allocator, state: State, raw: []const u8, now: i64) !Request {
+    return authenticateRequest(alloc, state, raw, now, false);
+}
+
+/// A fresh signed reconciliation request authorizes an already recorded
+/// operation. Its original signature and current grant still apply; an expired
+/// transport request cannot authorize a new action by itself.
+pub fn authenticateRetained(alloc: std.mem.Allocator, state: State, raw: []const u8, fresh: Request, now: i64) !Request {
+    if (fresh.action != .reconcile) return error.CompanyAccessDenied;
+    const original = try authenticateRequest(alloc, state, raw, now, true);
+    if (!std.mem.eql(u8, fresh.actor, original.actor) or !std.mem.eql(u8, fresh.grant, original.grant) or fresh.outcome == null or !std.mem.eql(u8, fresh.outcome.?, original.operation)) return error.CompanyAccessDenied;
+    if (original.action != .create_view and original.action != .checkpoint and original.action != .submit and original.action != .delegate) return error.CompanyRecoveryActionDenied;
+    return original;
+}
+
+fn authenticateRequest(alloc: std.mem.Allocator, state: State, raw: []const u8, now: i64, retained: bool) !Request {
     if (raw.len > 1024 * 1024) return error.ServiceRequestTooLarge;
     const envelope = try records.decode(Envelope, alloc, raw, .{});
     const request = try records.decode(Request, alloc, envelope.payload, .{});
     if (!std.mem.eql(u8, request.version, "omos.company/v1") or !std.mem.eql(u8, request.workspace, state.workspace)) return error.WorkspaceIdentityMismatch;
     if (!safeIdentity(request.operation) or !safeIdentity(request.actor)) return error.InvalidCompanyIdentity;
-    if (request.expires_ms <= now or request.expires_ms > now + 300000) return error.CompanyRequestExpired;
+    if (!retained and (request.expires_ms <= now or request.expires_ms > now + 300000)) return error.CompanyRequestExpired;
     const grant = try liveGrant(state, request.grant, now);
     if (!std.mem.eql(u8, grant.actor, request.actor) or !permitsAction(grant, request.action)) return error.CompanyAccessDenied;
     const public = try std.crypto.sign.Ed25519.PublicKey.fromBytes(try hexBytes(32, grant.public_key));

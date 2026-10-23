@@ -282,8 +282,8 @@ rejected; the existing shared bearer token remains a local-owner interface.
 The company transport and operation shapes are declared in OmniForm.
 
 Supported actions are `discover`, `read`, `create_view`, `checkpoint`, `submit`,
-`status`, `export_scope`, and `delegate`. Reads and inventories enforce the live
-grant and restrict historical revisions to accepted ancestry or the caller's
+`status`, `export_scope`, `delegate`, and `reconcile`. Reads and inventories
+enforce the live grant and restrict historical revisions to accepted ancestry or the caller's
 own view. Content reads use bounded base64 byte ranges and SHA-256 hashes.
 Scoped export currently returns a paginated content manifest for those reads;
 it does not clone the company repository or export issuer authority.
@@ -302,8 +302,21 @@ retries return the saved result after a fresh authority check. Reusing an
 operation ID for different bytes is rejected. Checkpoint receipts commit with
 the changed files, allowing a retry to reconcile a lost response. An uncertain
 operation retains ownership of its view until reconciled. `status` can inspect
-an outcome using its original operation ID. Receipts identify the actor, grant,
-operation, authority epoch, and result, and are signed by the server issuer.
+an outcome using its original operation ID. The outcome retains the exact signed
+request and final signed receipt. Original request bytes are available through
+bounded base64 pages with a SHA-256 identity, so another authorized client can
+inspect the retained intent without relying on the first client's files.
+Receipts identify the actor, grant, operation, authority epoch, and result.
+
+An expired envelope remains expired, including when a cached result exists.
+An actor with explicit `reconcile` authority can send a fresh signed request
+whose `outcome` names an existing operation. Recovery verifies the original
+signature and the current grant, then reconciles that operation's retained
+Fossil effects. A committed checkpoint is acknowledged without committing it
+again. A submitted proposal whose review already published returns its retained
+job. This path dispatches no external command or provider action. Legacy outcomes
+without a retained request remain inspectable; they cannot use this recovery path
+to invent missing intent.
 
 Issuer seeds remain in protected profile storage under `~/.fx/authority/`,
 outside the repository and disposable checkout caches. Immutable seed files
@@ -331,6 +344,21 @@ authority and the evaluated parent revision again. An advanced parent requires
 reconciliation and another assessment. Grants requiring human approval cannot
 publish automatically. Hosted company actor execution is rejected until an
 isolated execution backend is supplied; external runtimes can use scoped views.
+
+New company publications retain an issuer-signed authorization proof in their
+Fossil acceptance receipt. The proof binds the actor, grant, task, exact source,
+evaluated target base, contract hash, candidate hash, assessment hash, authority
+revision, epoch, and issuance time. `status` for an accepted view returns the
+receipt hash, this proof, and the check-in that published it. Later accepted
+changes do not change that resulting revision. Verification uses the public
+issuer and authority state retained at the signed revision; exporting and
+checking a repository does not require its issuer seed. Historical unsigned
+receipts retain their original format and are not retroactively signed.
+
+The signed proof records what the issuer attested. A verifier must establish
+trust in that company issuer separately. The resulting check-in contains the
+proof; it cannot embed its own final check-in hash. Fossil ancestry and the
+immutable receipt path connect the proof to the resulting revision.
 
 This service currently supports path scopes and file or record conflict
 boundaries. Field-level record merges, query absence dependencies, dependency

@@ -887,7 +887,8 @@
                 "submit",
                 "status",
                 "export_scope",
-                "delegate"
+                "delegate",
+                "reconcile"
               ]
             },
             "view": {
@@ -1256,7 +1257,10 @@
             "state": "string",
             "result": "json",
             "failure": "json",
-            "view": "json"
+            "view": "json",
+            "request": "json",
+            "receipt": "json",
+            "reconciled_by": "json"
           },
           "required": [
             "version",

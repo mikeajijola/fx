@@ -34,6 +34,7 @@ Exhausting the review budget retains the answer, evidence, and review records.
 Continuing a task with a retained failed-review candidate starts with verification.
 The actor resumes only when assessment identifies useful remaining work.
 
+The host commits each actor tool-batch intent before any tool effect starts.
 The host records review requests, evidence accesses, assessments, and failures.
 These records describe observable decisions. Provider replay state and private
 model reasoning remain outside the portable workspace. Review audit records are

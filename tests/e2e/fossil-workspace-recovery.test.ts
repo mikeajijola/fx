@@ -341,7 +341,51 @@ describe("portable Fossil workspace recovery", () => {
         }
         expect(job.state, JSON.stringify({ job, model: modelServer.counts() }) + "\n" + readFileSync(f.env.FX_TRACE_LOG, "utf8").slice(-6000)).toBe(revoked ? "failed" : "published");
         if (revoked) expect(f.fossil("ls", "-r", "trunk")).not.toContain("documents/report.md");
-        else expect(f.fossil("cat", "documents/report.md", "-r", "trunk")).toBe("Reviewed report");
+        else {
+          expect(f.fossil("cat", "documents/report.md", "-r", "trunk")).toBe("Reviewed report");
+          const status = await send("status", { view: view.view });
+          const publication = status.publication;
+          expect(publication.revision).toBe(f.fossil("timeline", "ancestors", "trunk", "--path", publication.receipt_path, "--limit", "1", "--format", "%H", "--quiet").split("\n")[0].trim());
+          const proof = publication.issuer_proof;
+          const issuer = createPublicKey({ key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(boot.issuer, "hex")]), format: "der", type: "spki" });
+          expect(verify(null, Buffer.from(proof.payload), issuer, Buffer.from(proof.signature, "hex"))).toBe(true);
+          const claims = JSON.parse(proof.payload);
+          expect(claims.actor).toBe("worker");
+          expect(claims.grant).toBe("reviewed-worker");
+          expect(claims.task).toBe(job.task);
+          expect(claims.candidate_sha256).toBe(createHash("sha256").update("Saved documents/report.md containing Reviewed report.").digest("hex"));
+          const receiptBytes = f.fossil("cat", publication.receipt_path, "-r", publication.revision);
+          expect(createHash("sha256").update(receiptBytes).digest("hex")).toBe(publication.receipt_sha256);
+          const retained = JSON.parse(receiptBytes);
+          expect(claims.contract_sha256).toBe(createHash("sha256").update(JSON.stringify(retained.task.definition)).digest("hex"));
+          expect(claims.source).toBe(retained.review.revision);
+          expect(claims.target_base).toBe(retained.task.base_revision);
+          expect(verify(null, Buffer.from(proof.payload.replace(claims.candidate_sha256, "00".repeat(32))), issuer, Buffer.from(proof.signature, "hex"))).toBe(false);
+          // Advance accepted state with unrelated work. The first receipt must
+          // keep reporting its own resulting revision, including after restore.
+          const accepted = await (await fetch(service.url + "/v1/company")).json() as any;
+          const later = await send("create_view", { revision: accepted.revision, objective: "Save a second company document" });
+          const savedLater = await send("checkpoint", { view: later.view, revision: later.revision, path: "documents/later.md", content: "Second report", previous_hash: null });
+          const submittedLater = await send("submit", { view: later.view, revision: savedLater.revision, candidate: "Saved the second company document." });
+          let laterStatus: any;
+          const laterDeadline = Date.now() + 60000;
+          while (Date.now() < laterDeadline) {
+            laterStatus = await send("status", { view: later.view });
+            if (!["queued", "running"].includes(laterStatus.job?.state)) break;
+            await Bun.sleep(30);
+          }
+          expect(laterStatus.job.id).toBe(submittedLater.job);
+          expect(laterStatus.job.state).toBe("published");
+          expect(laterStatus.publication.revision).not.toBe(publication.revision);
+          expect((await send("status", { view: view.view })).publication).toEqual(publication);
+          const exported = join(f.home, "company-with-publication-proofs.fossil");
+          const exportedResult = await f.run(["fossil", "export", exported, "--json"]);
+          expect(exportedResult.code, exportedResult.stderr).toBe(0);
+          const restored = fixture();
+          expect((await restored.run(["fossil", "use", exported, "--json"])).code).toBe(0);
+          const checked = await restored.run(["fossil", "verify", "--json"]);
+          expect(checked.code, checked.stderr).toBe(0);
+        }
         expect(modelServer.counts().actors).toBe(0);
       } finally {
         release!(); service.child.kill(); await service.child.exited;
@@ -398,6 +442,170 @@ describe("portable Fossil workspace recovery", () => {
     } finally {
       service.child.kill(); await service.child.exited;
     }
+  }, 90000);
+
+  test("reconciles a lost submission response after independent publication without rerunning the actor", async () => {
+    const f = fixture();
+    const inference = model(f, () => { throw Error("Submission recovery cannot invoke an actor"); });
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const admin = async (body: object) => {
+      const file = join(f.home, "operator.json");
+      writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+      const result = await f.run(["fossil", "company", file, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    const company = await admin({ action: "initialize" });
+    const key = generateKeyPairSync("ed25519");
+    await admin({ action: "grant", revision: company.revision, grant: { id: "recover-worker", actor: "worker", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["documents/"], actions: ["create_view", "checkpoint", "submit", "status", "reconcile"], expires_ms: Date.now() + 3600000 } });
+    let service = await startWorkspaceService(f, true, { FX_E2E_FOSSIL_FAULT: "company-review-queued" });
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const envelope = (action: string, params: object = {}) => {
+      const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "worker", grant: "recover-worker", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action, ...params });
+      return { payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") };
+    };
+    const post = (body: object) => fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", connection: "close" }, body: JSON.stringify(body) });
+    const send = async (action: string, params: object = {}) => {
+      const response = await post(envelope(action, params));
+      const reply = await response.json() as any;
+      expect(response.status, JSON.stringify(reply)).toBe(200);
+      return JSON.parse(reply.payload).result;
+    };
+    try {
+      const view = await send("create_view", { revision: boot.revision, objective: "Save a report exactly once" });
+      const checkpoint = await send("checkpoint", { view: view.view, revision: view.revision, path: "documents/recovered.md", content: "One reviewed report", previous_hash: null });
+      const original = envelope("submit", { view: view.view, revision: checkpoint.revision, candidate: "Saved documents/recovered.md containing One reviewed report.", expires_ms: Date.now() + 2000 });
+      expect((await post(original)).status).toBe(400);
+      const operation = JSON.parse(original.payload).operation;
+      let status: any;
+      const deadline = Date.now() + 60000;
+      while (Date.now() < deadline) {
+        status = await send("status", { view: view.view });
+        if (!["queued", "running"].includes(status.job?.state)) break;
+        await Bun.sleep(20);
+      }
+      expect(status.job.state, JSON.stringify(status)).toBe("published");
+      const pending = await send("status", { outcome: operation });
+      expect(pending.state).toBe("uncertain");
+      expect(JSON.parse(pending.receipt.payload).result.failure).toBe("WorkspaceInjectedFailure");
+      service.child.kill(); await service.child.exited;
+      service = await startWorkspaceService(f, true);
+      while (Date.now() <= JSON.parse(original.payload).expires_ms) await Bun.sleep(20);
+      expect((await post(original)).status).toBe(403);
+      const before = inference.counts();
+      const recovered = await send("reconcile", { outcome: operation });
+      expect(recovered.result.state).toBe("published");
+      expect(recovered.result.publication).toEqual(status.publication);
+      expect(inference.counts()).toEqual(before);
+      expect(before.actors).toBe(0);
+      const outcome = await send("status", { outcome: operation });
+      expect(outcome.state).toBe("completed");
+      expect(outcome.reconciled_by).toBeTruthy();
+      expect(f.fossil("cat", "documents/recovered.md", "-r", status.publication.revision)).toBe("One reviewed report");
+    } finally {
+      service.child.kill(); await service.child.exited;
+    }
+  }, 120000);
+
+  test("keeps the owner bearer token out of signed company client requests", async () => {
+    const f = fixture();
+    const requests: Array<{ path: string; authorization: string | null; body: any }> = [];
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+      requests.push({ path: new URL(request.url).pathname, authorization: request.headers.get("authorization"), body: await request.json() });
+      return Response.json({ workspace: "company-fixture", revision: "fixture-revision" });
+    } });
+    try {
+      const request = { payload: "{}", signature: "00".repeat(64) };
+      const file = join(f.home, "signed-request.json");
+      writeFileSync(file, JSON.stringify(request));
+      const result = await f.run(["fossil", "remote", `http://127.0.0.1:${server.port}`, file, "--json"], { OMOS_WORKSPACE_TOKEN: "private-owner-token-must-not-be-forwarded" });
+      expect(result.code, result.stderr).toBe(0);
+      expect(requests).toEqual([{ path: "/v1/company", authorization: null, body: request }]);
+      expect(result.stdout).not.toContain("private-owner-token");
+    } finally { server.stop(true); }
+  }, 30000);
+
+  test("retains signed requests and reconciles an expired checkpoint without replaying its commit", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const admin = async (body: object) => {
+      const file = join(f.home, "operator.json");
+      writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+      const result = await f.run(["fossil", "company", file, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    const initialized = await admin({ action: "initialize" });
+    const key = generateKeyPairSync("ed25519");
+    await admin({ action: "grant", revision: initialized.revision, grant: { id: "recoverable", actor: "worker", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["documents/"], actions: ["create_view", "checkpoint", "status", "reconcile"], expires_ms: Date.now() + 3600000 } });
+    let service = await startWorkspaceService(f, true, { FX_E2E_FOSSIL_FAULT: "company-checkpoint-committed" });
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const seal = (action: string, params: object, operation = crypto.randomUUID(), expires = Date.now() + 120000) => {
+      const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "worker", grant: "recoverable", operation, expires_ms: expires, action, ...params });
+      return { payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") };
+    };
+    const send = (request: object) => fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", connection: "close" }, body: JSON.stringify(request) });
+    const data = async (response: Response) => {
+      const value = await response.json() as any;
+      expect(response.status, JSON.stringify(value)).toBe(200);
+      return JSON.parse(value.payload).result;
+    };
+    try {
+      const view = await data(await send(seal("create_view", { revision: boot.revision, objective: "Retain this document checkpoint" })));
+      const operation = crypto.randomUUID();
+      const expires = Date.now() + 2000;
+      const content = "Durable original content café\n".repeat(2000);
+      const original = seal("checkpoint", { view: view.view, revision: view.revision, path: "documents/retained.txt", previous_hash: null, content }, operation, expires);
+      const raw = JSON.stringify(original);
+      expect((await send(original)).status).toBe(400);
+      service.child.kill(); await service.child.exited;
+      service = await startWorkspaceService(f, true);
+      if (Date.now() <= expires) await Bun.sleep(expires - Date.now() + 1);
+      expect((await send(original)).status).toBe(403);
+      const chunks: Buffer[] = [];
+      let offset = 0;
+      for (;;) {
+        const outcome = await data(await send(seal("status", { outcome: operation, offset })));
+        expect(outcome.state).toBe("uncertain");
+        expect(outcome.request_hash).toBe(createHash("sha256").update(original.payload).digest("hex"));
+        expect(outcome.request.sha256).toBe(createHash("sha256").update(raw).digest("hex"));
+        const page = Buffer.from(outcome.request.content, "base64");
+        expect(page.length).toBeLessThanOrEqual(16384);
+        chunks.push(page);
+        if (outcome.request.next_offset === null) break;
+        offset = outcome.request.next_offset;
+      }
+      expect(Buffer.concat(chunks).toString()).toBe(raw);
+      const before = f.fossil("info", `task/${view.contract.id}`);
+      const recoveryId = crypto.randomUUID();
+      const recovered = await data(await send(seal("reconcile", { outcome: operation }, recoveryId)));
+      expect(recovered.state).toBe("completed");
+      expect(f.fossil("info", `task/${view.contract.id}`)).toBe(before);
+      const outcome = await data(await send(seal("status", { outcome: operation })));
+      expect(outcome.reconciled_by).toBe(recoveryId);
+      const issuer = createPublicKey({ key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(boot.issuer, "hex")]), format: "der", type: "spki" });
+      expect(verify(null, Buffer.from(outcome.receipt.payload), issuer, Buffer.from(outcome.receipt.signature, "hex"))).toBe(true);
+      expect(JSON.parse(outcome.receipt.payload).operation).toBe(operation);
+      expect(f.fossil("cat", "documents/retained.txt", "-r", `task/${view.contract.id}`)).toBe(content);
+      const current = await admin({ action: "status" });
+      await admin({ action: "revoke", revision: current.revision, id: "recoverable" });
+      expect((await send(seal("reconcile", { outcome: operation }))).status).toBe(403);
+    } finally {
+      service.child.kill(); await service.child.exited;
+    }
+  }, 120000);
+
+  test("commits action intent to Fossil before a shell effect can start", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const program = join(f.home, "verify-intent.py");
+    const effect = join(f.home, "effect-receipt.txt");
+    writeFileSync(program, `import json, pathlib, subprocess\nrepo = ${JSON.stringify(join(f.cwd, "omos.fossil"))}\nbranches = subprocess.check_output(['fossil', 'branch', 'list', '--all', '-R', repo], text=True).splitlines()\nbranch = next(b.strip(' *\\t') for b in branches if b.strip(' *\\t').startswith('task/'))\nfiles = subprocess.check_output(['fossil', 'ls', '-r', branch, '-R', repo], text=True).splitlines()\nrows = [json.loads(subprocess.check_output(['fossil', 'cat', p, '-r', branch, '-R', repo], text=True)) for p in files if p.startswith('history/') and p.endswith('.json')]\nassert any(row.get('kind') == 'action_intent' and any(call.get('name') == 'shell' for call in row['value']['calls']) for row in rows), 'The effect started without a committed intent'\npathlib.Path(${JSON.stringify(effect)}).write_text('Committed intent observed before this effect')\nprint('Committed intent observed before this effect')\n`);
+    const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+    model(f, (_body, count) => count === 1 ? { tool_calls: [{ index: 0, id: "durable-effect", type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", command: `python3 ${quote(program)}`, timeout_ms: 10000 } }) } }] } : { content: "The effect observed its committed Fossil intent." });
+    const result = await f.run(["ask", "Run the local fixture and report its durable receipt", "--json"]);
+    expect(result.code, result.stderr).toBe(0);
+    expect(readFileSync(effect, "utf8")).toBe("Committed intent observed before this effect");
   }, 90000);
 
   test("does not initialize personal persistence for an unsaved turn", async () => {

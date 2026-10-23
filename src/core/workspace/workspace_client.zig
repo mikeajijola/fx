@@ -13,15 +13,17 @@ pub fn call(alloc: std.mem.Allocator, base_url: []const u8, body: ?[]const u8) !
         const envelope = (std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch break :blk false).value;
         break :blk envelope == .object and envelope.object.contains("payload") and envelope.object.contains("signature");
     } else false;
-    const token = io.getenv("OMOS_WORKSPACE_TOKEN") orelse if (company) "signed-company-request-without-bearer" else return error.MissingWorkspaceServiceToken;
-    if (token.len < 32 or token.len > 1024 or std.mem.findScalar(u8, token, '\r') != null or std.mem.findScalar(u8, token, '\n') != null) return error.InvalidWorkspaceServiceToken;
+    // Actor requests carry their own scoped signature. The installation's
+    // owner token must never follow them to a company endpoint.
+    const token: ?[]const u8 = if (company) null else io.getenv("OMOS_WORKSPACE_TOKEN") orelse return error.MissingWorkspaceServiceToken;
+    if (token) |value| if (value.len < 32 or value.len > 1024 or std.mem.findScalar(u8, value, '\r') != null or std.mem.findScalar(u8, value, '\n') != null) return error.InvalidWorkspaceServiceToken;
     const url = try alloc.print("{s}{s}", .{ std.mem.trimEnd(u8, base_url, "/"), if (company) "/v1/company" else if (body != null) "/v1/workspace" else "/v1/definition" });
-    const bearer = try alloc.print("Bearer {s}", .{token});
+    const bearer = if (token) |value| try alloc.print("Bearer {s}", .{value}) else null;
     var client: std.http.Client = .{ .allocator = alloc, .io = io.getIo() };
     defer client.deinit();
     var request = try client.request(if (body == null) .GET else .POST, try std.Uri.parse(url), .{
         .redirect_behavior = .unhandled,
-        .headers = .{ .authorization = .{ .override = bearer }, .content_type = .{ .override = "application/json" }, .accept_encoding = .omit },
+        .headers = .{ .authorization = if (bearer) |value| .{ .override = value } else .omit, .content_type = .{ .override = "application/json" }, .accept_encoding = .omit },
     });
     defer request.deinit();
     if (body) |raw| try request.sendBodyComplete(@constCast(raw)) else try request.sendBodiless();

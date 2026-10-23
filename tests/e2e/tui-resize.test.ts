@@ -653,7 +653,7 @@ function expectSkillsMenuGrid(
   expect(text).toContain("[All]");
   expect(text).toContain("omniseedos");
   expect(text).not.toContain("[Fx]");
-  expect(text).toContain("Source [All]");
+  expect(text).toMatch(new RegExp(`Skills ${count}\\s+(?:Source \\[All\\]|\\[All\\]\\s+omniseedos)`));
   expect(text).toContain("omniseedos · Global");
   expect(names.some((name) => text.includes(name))).toBe(true);
   expect(text).not.toContain("Visible skills (");
