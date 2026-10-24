@@ -1027,14 +1027,21 @@ pub const Manager = struct {
 
     fn retainedReviewTokens(self: Manager, task: Task, job: @import("review_job.zig").Job) !u64 {
         var tokens = job.reported_tokens;
-        for (try self.taskHistory(task, try self.revision(task.branch))) |raw| {
-            const row = (try std.json.parseFromSlice(std.json.Value, self.alloc, raw, .{})).value;
-            if (!std.mem.eql(u8, model.text(row, "kind"), "review_usage") or !std.mem.eql(u8, model.text(row, "review_job"), job.id)) continue;
-            const generation = model.field(row, "review_generation") orelse continue;
-            if (generation != .integer or generation.integer < 0 or @as(u64, @intCast(generation.integer)) < job.budget_epoch) continue;
-            const value = model.field(row, "value") orelse continue;
-            const usage = try record_json.decode(struct { reported_tokens: u64 }, self.alloc, model.text(value, "data"), .{ .ignore_unknown_fields = true });
-            tokens = @max(tokens, usage.reported_tokens);
+        var cursor = try self.historyCursor(task, try self.revision(task.branch));
+        while (cursor.offset < cursor.paths.len) {
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            const batch = (try cursor.next(a)) orelse break;
+            for (batch) |raw| {
+                const row = (try std.json.parseFromSlice(std.json.Value, a, raw, .{})).value;
+                if (!std.mem.eql(u8, model.text(row, "kind"), "review_usage") or !std.mem.eql(u8, model.text(row, "review_job"), job.id)) continue;
+                const generation = model.field(row, "review_generation") orelse continue;
+                if (generation != .integer or generation.integer < 0 or @as(u64, @intCast(generation.integer)) < job.budget_epoch) continue;
+                const value = model.field(row, "value") orelse continue;
+                const usage = try record_json.decode(struct { reported_tokens: u64 }, a, model.text(value, "data"), .{ .ignore_unknown_fields = true });
+                tokens = @max(tokens, usage.reported_tokens);
+            }
         }
         return tokens;
     }
@@ -1927,19 +1934,6 @@ pub const Manager = struct {
         return self.run(null, &.{ "cat", path, "-r", "trunk", "-R", self.repository });
     }
 
-    pub fn evidenceRecords(self: Manager, task: Task, revision_id: []const u8) ![]const []const u8 {
-        var records: std.ArrayList([]const u8) = .empty;
-        for (try self.taskHistory(task, revision_id)) |bytes| {
-            const entry = try parse(self.alloc, std.json.Value, bytes);
-            if (entry != .object) return error.InvalidWorkspaceJournal;
-            const kind = entry.object.get("kind") orelse return error.InvalidWorkspaceJournal;
-            if (kind != .string) return error.InvalidWorkspaceJournal;
-            if (!std.mem.eql(u8, kind.string, "tool_evidence")) continue;
-            try records.append(self.alloc, bytes);
-        }
-        return records.toOwnedSlice(self.alloc);
-    }
-
     pub fn taskHistoryPaths(self: Manager, task: Task, revision_id: []const u8) ![]const []const u8 {
         const prefix = try self.alloc.print("history/{s}/", .{task.id});
         var paths: std.ArrayList([]const u8) = .empty;
@@ -2099,13 +2093,21 @@ pub const Manager = struct {
     }
 
     pub fn hasUiReceipt(self: Manager, task: Task, revision_id: []const u8) !bool {
-        for (try self.taskHistory(task, revision_id)) |bytes| {
-            const entry = try parse(self.alloc, std.json.Value, bytes);
-            if (!std.mem.eql(u8, model.text(entry, "kind"), "ui_source_validation")) continue;
-            const contract_version = model.field(entry, "contract_version") orelse continue;
-            if (contract_version != .integer or contract_version.integer != task.definition.version) continue;
-            const receipt = model.field(entry, "value") orelse continue;
-            if (try self.validUiReceipt(revision_id, receipt)) return true;
+        var cursor = try self.historyCursor(task, revision_id);
+        while (cursor.offset < cursor.paths.len) {
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            var reader = self;
+            reader.alloc = scratch.allocator();
+            const batch = (try cursor.next(reader.alloc)) orelse break;
+            for (batch) |bytes| {
+                const entry = try parse(reader.alloc, std.json.Value, bytes);
+                if (!std.mem.eql(u8, model.text(entry, "kind"), "ui_source_validation")) continue;
+                const contract_version = model.field(entry, "contract_version") orelse continue;
+                if (contract_version != .integer or contract_version.integer != task.definition.version) continue;
+                const receipt = model.field(entry, "value") orelse continue;
+                if (try reader.validUiReceipt(revision_id, receipt)) return true;
+            }
         }
         return false;
     }
@@ -3591,21 +3593,32 @@ pub const Manager = struct {
                 legacy += 1;
                 continue;
             };
-            const declaration_value = try self.loadDeclaration(basis.revision);
+            var task_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer task_scratch.deinit();
+            var task_reader = self;
+            task_reader.alloc = task_scratch.allocator();
+            const declaration_value = try task_reader.loadDeclaration(basis.revision);
             if (!model.hasOperation(declaration_value, "omos_record_evidence")) {
                 legacy += 1;
                 continue;
             }
-            for (try self.taskHistory(task, try self.revision(task.branch))) |raw| {
-                const row = (try std.json.parseFromSlice(std.json.Value, self.alloc, raw, .{})).value;
-                const kind = model.text(row, "kind");
-                const operation = if (std.mem.eql(u8, kind, "action_intent")) "omos_record_action" else if (std.mem.eql(u8, kind, "tool_evidence")) "omos_record_evidence" else if (std.mem.eql(u8, kind, "task_plan")) "omos_record_plan" else "";
-                if (operation.len == 0 or !model.hasOperation(declaration_value, operation)) continue;
-                checked += 1;
-                const value = try omitNulls(self.alloc, model.field(row, "value") orelse .null);
-                model.validateOperation(self.alloc, declaration_value, operation, value, .input) catch |err| {
-                    try issues.append(self.alloc, .{ .task = task.id, .record = try hash(self.alloc, raw), .reason = @errorName(err) });
-                };
+            var cursor = try self.historyCursor(task, try self.revision(task.branch));
+            while (cursor.offset < cursor.paths.len) {
+                var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer scratch.deinit();
+                const a = scratch.allocator();
+                const batch = (try cursor.next(a)) orelse break;
+                for (batch) |raw| {
+                    const row = (try std.json.parseFromSlice(std.json.Value, a, raw, .{})).value;
+                    const kind = model.text(row, "kind");
+                    const operation = if (std.mem.eql(u8, kind, "action_intent")) "omos_record_action" else if (std.mem.eql(u8, kind, "tool_evidence")) "omos_record_evidence" else if (std.mem.eql(u8, kind, "task_plan")) "omos_record_plan" else "";
+                    if (operation.len == 0 or !model.hasOperation(declaration_value, operation)) continue;
+                    checked += 1;
+                    const value = try omitNulls(a, model.field(row, "value") orelse .null);
+                    model.validateOperation(a, declaration_value, operation, value, .input) catch |err| {
+                        try issues.append(self.alloc, .{ .task = task.id, .record = try hash(self.alloc, raw), .reason = @errorName(err) });
+                    };
+                }
             }
         }
         return json(self.alloc, .{ .version = "omos.contract-audit/v1", .tasks = tasks_value.len, .checked_records = checked, .legacy_tasks = legacy, .valid = issues.items.len == 0, .issues = issues.items });

@@ -74,19 +74,29 @@ pub fn candidate(manager: workspace.Manager, task: workspace.Task, revision: []c
     if (comptime @import("builtin").target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
     const binding = task.authority orelse return error.CompanyAccessDenied;
     const answer = (try manager.retainedReviewCandidateAt(task, revision)) orelse return error.NoRetainedReviewCandidate;
-    var proposal: ?std.json.Value = null;
+    var proposal: std.ArrayList(u8) = .empty;
+    defer proposal.deinit(std.heap.page_allocator);
     var proposal_at: i64 = -1;
-    for (try manager.taskHistory(task, revision)) |bytes| {
-        const row = try std.json.parseFromSliceLeaky(std.json.Value, manager.alloc, bytes, .{});
-        if (!std.mem.eql(u8, model.text(row, "kind"), "company_proposal")) continue;
-        const value = model.field(row, "value") orelse continue;
-        if (!std.mem.eql(u8, model.text(value, "actor"), binding.actor) or !std.mem.eql(u8, model.text(value, "grant"), binding.grant)) continue;
-        const at = model.field(row, "recorded_at_ms") orelse continue;
-        if (at != .integer or at.integer < proposal_at) continue;
-        proposal = value;
-        proposal_at = at.integer;
+    var cursor = try manager.historyCursor(task, revision);
+    while (cursor.offset < cursor.paths.len) {
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const batch = (try cursor.next(a)) orelse break;
+        for (batch) |bytes| {
+            const row = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+            if (!std.mem.eql(u8, model.text(row, "kind"), "company_proposal")) continue;
+            const value = model.field(row, "value") orelse continue;
+            if (!std.mem.eql(u8, model.text(value, "actor"), binding.actor) or !std.mem.eql(u8, model.text(value, "grant"), binding.grant)) continue;
+            const at = model.field(row, "recorded_at_ms") orelse continue;
+            if (at != .integer or at.integer < proposal_at) continue;
+            proposal.clearRetainingCapacity();
+            try proposal.appendSlice(std.heap.page_allocator, try encode(a, value));
+            proposal_at = at.integer;
+        }
     }
-    const value = proposal orelse return error.CompanyProposalRequired;
+    if (proposal_at < 0) return error.CompanyProposalRequired;
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, manager.alloc, proposal.items, .{ .allocate = .alloc_always });
     const integration = model.text(value, "integration_revision");
     if (integration.len == 0) return error.CompanyProposalResubmissionRequired;
     if (!try manager.revisionDescendsFrom(revision, integration)) return error.CompanyApprovalStale;

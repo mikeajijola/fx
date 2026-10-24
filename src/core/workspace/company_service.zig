@@ -440,11 +440,21 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
         const candidate = request.candidate orelse return error.MissingContent;
         if (candidate.len == 0 or candidate.len > 32768) return error.InvalidCompanyCandidate;
         var retained_proposal = false;
-        for (try manager.taskHistory(view.task, revision_id)) |raw| {
-            const row = try parse(alloc, raw);
-            if (!std.mem.eql(u8, model.text(row, "kind"), "company_proposal")) continue;
-            const value = model.field(row, "value") orelse continue;
-            if (std.mem.eql(u8, model.text(value, "operation"), request.operation)) retained_proposal = true;
+        var cursor = try manager.historyCursor(view.task, revision_id);
+        find_proposal: while (cursor.offset < cursor.paths.len) {
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            const batch = (try cursor.next(a)) orelse break;
+            for (batch) |raw| {
+                const row = try parse(a, raw);
+                if (!std.mem.eql(u8, model.text(row, "kind"), "company_proposal")) continue;
+                const value = model.field(row, "value") orelse continue;
+                if (std.mem.eql(u8, model.text(value, "operation"), request.operation)) {
+                    retained_proposal = true;
+                    break :find_proposal;
+                }
+            }
         }
         if (retained_proposal) {
             const job = if (view.task.review_job) |id| try manager.loadReviewJob(view.task, id) else try manager.queueReview(view.task);
