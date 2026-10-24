@@ -296,8 +296,11 @@ pending publications, conflicts, active review jobs, execution owned by another
 runtime, and company-authorized tasks cannot be relocated this way. Company
 execution requires its separate authority and ownership flow.
 
-Before an actor restores execution context, the host refreshes a newer
-canonical contract under execution ownership. This also fences an old project
+Before an actor restores execution context, the host refreshes the canonical
+contract, model, base, project, and authority under execution ownership. Matching
+contract version numbers do not make cached values authoritative. Local
+selection and publication recovery state is preserved. Buffered read observations
+survive only while their base still matches. This also fences an old project
 after a committed relocation whose local cache update was interrupted. A
 relocated task's provider checkpoint is retained in a private invalidated
 archive, outside Fossil, rather than replayed against the new contract.

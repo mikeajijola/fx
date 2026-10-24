@@ -1524,11 +1524,20 @@ pub const Manager = struct {
     }
 
     fn refreshTaskContextLocked(self: Manager, previous: Task) !Task {
-        const canonical = try self.decodeTask(previous.id, try self.content(previous, try self.taskPath(previous.id)));
+        var canonical = try self.decodeTask(previous.id, try self.content(previous, try self.taskPath(previous.id)));
         if (canonical.definition.version < previous.definition.version) return error.WorkspaceRecoveryRequired;
-        if (canonical.definition.version == previous.definition.version) return previous;
-        if ((canonical.source_validation_version orelse 0) > (previous.source_validation_version orelse 0)) try self.archiveProjectCheckpoint(canonical);
-        try self.saveTask(canonical);
+        const same_version = canonical.definition.version == previous.definition.version;
+        const relocated = !std.mem.eql(u8, canonical.project_root, previous.project_root);
+        if (relocated or (canonical.source_validation_version orelse 0) > (previous.source_validation_version orelse 0)) try self.archiveProjectCheckpoint(canonical);
+        if (same_version) {
+            // Selection and publication recovery may advance operational state
+            // without changing the source branch. Pending read observations are
+            // a local write-ahead buffer until the next host checkpoint. Neither
+            // can replace the canonical contract, authority, model, or base.
+            canonical.state = previous.state;
+            if (try self.sameRevision(canonical.base_revision, previous.base_revision)) canonical.dependencies = previous.dependencies;
+        }
+        if (!std.mem.eql(u8, try json(self.alloc, canonical), try json(self.alloc, previous))) try self.saveTask(canonical);
         return canonical;
     }
 
@@ -1538,7 +1547,7 @@ pub const Manager = struct {
             else => return err,
         };
         defer folder.close(io_mod.getIo());
-        const archive = try self.alloc.print("{s}.project-{d}.invalidated", .{ task.id, task.source_validation_version.? });
+        const archive = try self.alloc.print("{s}.project-{d}.invalidated", .{ task.id, task.source_validation_version orelse task.definition.version });
         folder.renamePreserve(task.id, folder, archive, io_mod.getIo()) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,

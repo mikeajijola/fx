@@ -196,6 +196,47 @@ describe("portable Fossil workspace recovery", () => {
     expect(refreshed.definition.version).toBe(task.definition.version + 1);
   }, 90000);
 
+  for (const staleBase of [false, true]) test(`restores canonical task context from a same-version cache${staleBase ? " after its base drifts" : " without losing buffered reads"}`, async () => {
+    const f = fixture();
+    let permit = false;
+    const content = "Retained recovery information";
+    const inference = model(f, (_body, count) => count === 1 ? writeMemory(content) : { content: "The retained information is saved." }, packet => permit ? "met" : {
+      name: "omos_contract_assessment", args: { contractId: packet.contract.id, version: packet.contract.version, obligations: [{ id: "request_complete", status: "met", evidence: ["unseen-fixture"], note: "Retain the candidate for the cache fixture" }] },
+    });
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const initial = await f.run(["ask", "Retain the recovery information", "--json"]);
+    expect(initial.code).toBe(1);
+    const session = JSON.parse(initial.stdout).session_id;
+    const status = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout);
+    const task = status.tasks[0];
+    const cache = join(f.home, ".fx/fossil", createHash("sha256").update(status.repository).digest("hex"));
+    const localTask = join(cache, "tasks", `${task.id}.json`);
+    const changed = structuredClone(task);
+    changed.definition.objective = "An incorrect cached objective";
+    changed.model_basis.capability = "unbound-cache-capability";
+    changed.authority = { actor: "cache-only", grant: "cache-only" };
+    changed.project_root = f.home;
+    changed.parent = `task/${"0".repeat(64)}`;
+    const buffered = { path: "memory/preference.md", base_hash: null, observed_hash: createHash("sha256").update(content).digest("hex") };
+    changed.dependencies = [buffered];
+    if (staleBase) changed.base_revision = f.fossil("timeline", "ancestors", task.branch, "--limit", "1", "--format", "%H", "--quiet").split("\n")[0].trim();
+    writeFileSync(localTask, JSON.stringify(changed));
+    permit = true;
+    const calls = inference.counts().actors;
+    const resumed = await f.run(["ask", "--resume-id", session, "continue", "--json"]);
+    expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
+    expect(inference.counts().actors).toBe(calls);
+    const restored = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    expect(restored.definition).toEqual(task.definition);
+    expect(restored.model_basis).toEqual(task.model_basis);
+    expect(restored.authority).toBeNull();
+    expect(restored.project_root).toBe(task.project_root);
+    expect(restored.parent).toBe(task.parent);
+    expect(restored.base_revision).toBe(task.base_revision);
+    expect(restored.dependencies).toEqual(staleBase ? task.dependencies : [buffered]);
+    expect(restored.state).toBe("accepted");
+  }, 120000);
+
   test("requires successful integrity reports and preserves private branches in a portable export", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
@@ -519,6 +560,18 @@ sys.exit(result.returncode)
       expect(remotePacket.workspace_id).toBe(boot.workspace);
       const view = await unpack(Response.json(remotePacket.model_data));
       expect((await unpack(await post(create))).view).toBe(view.view);
+      // A rebuildable cache must never erase canonical company authority,
+      // including when its contract version still matches the source branch.
+      const snapshot = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout);
+      const companyTask = snapshot.tasks.find((task: any) => task.authority?.actor === "alice");
+      expect(companyTask).toBeDefined();
+      const taskCache = join(f.home, ".fx/fossil", createHash("sha256").update(snapshot.repository).digest("hex"), "tasks", `${companyTask.id}.json`);
+      writeFileSync(taskCache, JSON.stringify({ ...companyTask, authority: null }));
+      const local = new NativeClient({ binary: join(import.meta.dir, "../../zig-out/bin/fx"), project: f.cwd, env: { ...process.env, ...f.env } });
+      try {
+        await expect(local.request("task.resume", { session: "company-cache-probe", task: companyTask.id, revision: view.revision, rebind_project: true })).rejects.toThrow("CompanyExecutionIsolationRequired");
+      } finally { await local.close(); }
+      expect(JSON.parse(readFileSync(taskCache, "utf8")).authority).toEqual(companyTask.authority);
       const a = envelope("checkpoint", { view: view.view, revision: view.revision, path: "documents/team/report.md", content: "Team report", previous_hash: null });
       const b = envelope("checkpoint", { view: view.view, revision: view.revision, path: "documents/team/other.md", content: "Other report", previous_hash: null });
       const replies = await Promise.all([post(a), post(b)]);
