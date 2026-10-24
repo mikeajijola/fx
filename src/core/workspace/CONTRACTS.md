@@ -388,8 +388,72 @@ accepted ancestry or the caller's own view. Content reads use bounded base64
 byte ranges and SHA-256 hashes. Canonical filenames are case-sensitive even
 when the host or repository defaults to case-insensitive lookup. Checkpoints
 reject new ASCII case collisions before changing working files.
-Scoped export currently returns a paginated content manifest for those reads;
-it does not clone the company repository or export issuer authority.
+`export_scope` returns a paginated content manifest, or bounded base64 content
+when `path` is supplied. An export-only grant needs no separate `read` action.
+Export transfers inspect content without changing a task's observed input set.
+They work through a read-only company service and enforce the live grant on
+every request. Inventory responses declare `dependency_closure: "not_evaluated"`;
+an empty list of external dependencies is not inferred from a file listing.
+
+`omos fossil export-scope CONFIG.json OUTPUT.tar --json` downloads a file
+snapshot at one complete, pinned revision. The configuration uses
+`omos.scope-export-request/v1`:
+
+```json
+{
+  "version": "omos.scope-export-request/v1",
+  "endpoint": "https://company.example.com",
+  "workspace": "your_company_workspace_id",
+  "actor": "your_actor_id",
+  "grant": "your_export_grant_id",
+  "key_handle": "your_local_key_handle",
+  "issuer": "your_trusted_company_public_key",
+  "revision": "your_complete_accepted_revision"
+}
+```
+
+Replace the identity placeholders with the company's enrolled values. The
+issuer must come from a trusted enrollment or discovery channel. An optional
+`view` selects the caller's own private view. Historical accepted revisions
+remain subject to the grant's current scope. Actor signing seeds stay in the
+private profile and never enter the archive.
+
+The archive contains `manifest.json` and deduplicated `objects/<sha256>` files.
+The manifest maps original paths to hashes and sizes and retains signed
+inventory receipts with their exact requests. The client verifies every
+response against the pinned issuer and epoch, then verifies the complete
+archive before publishing it. Publication uses an exclusive file link and
+refuses to replace an existing output.
+
+`omos fossil verify-scope CONFIG.json ARCHIVE.tar --json` verifies the package
+offline against the separate configuration pins. It requires no local Fossil
+repository, actor key, or server connection. It checks object hashes and sizes,
+manifest coverage, signed inventory pages, exact request bindings, and company,
+actor, grant, view and revision identities. This establishes historical package
+integrity; it does not establish that the grant remains live.
+
+Exports use at most 32 inventory entries per page and 16 KiB per content
+request. Files are limited to 8 MiB, inventories to 10,000 paths and 8 MiB of
+receipt metadata. `max_bytes` defaults to 1 GiB of logical file content and
+`deadline_ms` defaults to five minutes. Requests have a 30-second ceiling
+clipped to that overall deadline; a timeout cancels and drains the operation
+before its memory is released. The overall deadline can be configured from
+100 milliseconds to one hour, and the byte budget up to 1 TiB. These are
+bounds, not measured capacity guarantees.
+
+A private adjacent `OUTPUT.tar.partial-<request-hash>` directory caches complete
+verified objects. Retrying fetches a fresh authorised inventory and checks
+cached size and full hash before reuse. Corrupt objects are downloaded again;
+incomplete individual downloads restart from zero. A final authorised request
+checks access again before publication. Revocation stops subsequent service
+retrieval; previously downloaded plaintext remains with its recipient. Cache
+files can be removed when no export process is using them.
+
+This package declares `scope: "grant_file_snapshot"` and
+`dependency_closure: "not_evaluated"`. It includes the listed files, rather than
+a company repository clone, issuer authority, execution ownership, or a verified
+closure of capability and external runtime dependencies. Complete capability
+packages require a separate dependency-closure assessment.
 
 Reads attached to an active view record their inputs on the protected company
 branch. The response includes `read_tracking: "recorded"` and an `observation`

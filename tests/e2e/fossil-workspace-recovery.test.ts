@@ -1619,6 +1619,177 @@ sys.exit(result.returncode)
     } finally { server.stop(true); }
   }, 30000);
 
+  test("packages only authorised pinned company files with signed inventory and bounded content pages", async () => {
+    const f = fixture();
+    const content = "A portable, permission-scoped company document.\n".repeat(900);
+    const gateway = model(f, (_body, count) => count === 1 ? writeMemory(content) : { content: "Saved the company document." });
+    const prepared = await f.run(["ask", "--json", "Save the company document"]);
+    expect(prepared.code, prepared.stderr).toBe(0);
+    expect(gateway.counts().actors).toBe(2);
+    const admin = async (body: object) => {
+      const file = join(f.home, "operator.json");
+      writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+      const result = await f.run(["fossil", "company", file, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    const created = await f.run(["fossil", "company-key", "reader", "--json"]);
+    expect(created.code, created.stderr).toBe(0);
+    const identity = JSON.parse(created.stdout);
+    const initialized = await admin({ action: "initialize" });
+    await admin({ action: "grant", revision: initialized.revision, grant: { id: "file-export", actor: "reader", public_key: identity.public_key, paths: ["memory/"], actions: ["export_scope"], expires_ms: Date.now() + 3600000 } });
+    const service = await startWorkspaceService(f, false);
+    try {
+      const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+      const config = { version: "omos.scope-export-request/v1", endpoint: service.url, workspace: boot.workspace, actor: "reader", grant: "file-export", key_handle: "reader", issuer: boot.issuer, revision: boot.revision };
+      const input = join(f.home, "export.json"), output = join(f.home, "company-files.tar");
+      writeFileSync(input, JSON.stringify(config));
+      const exported = await f.run(["fossil", "export-scope", input, output, "--json"]);
+      expect(exported.code, exported.stderr + exported.stdout).toBe(0);
+      const result = JSON.parse(exported.stdout);
+      expect(result).toMatchObject({ version: "omos.scope-package/v1", path: output, workspace: boot.workspace, revision: boot.revision, files: 1, bytes: Buffer.byteLength(content), dependency_closure: "not_evaluated" });
+      expect(statSync(output).mode & 0o777).toBe(0o600);
+      const archive = readFileSync(output), objects = new Map<string, Buffer>();
+      for (let at = 0; at + 512 <= archive.length && archive[at] !== 0;) {
+        const header = archive.subarray(at, at + 512);
+        const name = header.subarray(0, 100).toString().split("\0")[0];
+        const size = parseInt(header.subarray(124, 136).toString().replace(/\0/g, "").trim(), 8);
+        objects.set(name, archive.subarray(at + 512, at + 512 + size));
+        at += 512 + Math.ceil(size / 512) * 512;
+      }
+      const manifest = JSON.parse(objects.get("manifest.json")!.toString());
+      expect(manifest).toMatchObject({ scope: "grant_file_snapshot", dependency_closure: "not_evaluated", revision: boot.revision, actor: "reader", grant: "file-export", issuer: boot.issuer });
+      expect(manifest.files).toEqual([{ path: "memory/preference.md", sha256: createHash("sha256").update(content).digest("hex"), bytes: Buffer.byteLength(content) }]);
+      const document = objects.get(`objects/${manifest.files[0].sha256}`)!;
+      expect(document.toString()).toBe(content);
+      expect(objects.size).toBe(2);
+      expect(manifest.inventory_receipts).toHaveLength(1);
+      for (const proof of manifest.inventory_receipts) {
+        const claims = JSON.parse(proof.receipt.payload), request = JSON.parse(proof.request);
+        const publicKey = createPublicKey({ key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(boot.issuer, "hex")]), type: "spki", format: "der" });
+        expect(verify(null, Buffer.from(proof.receipt.payload), publicKey, Buffer.from(proof.receipt.signature, "hex"))).toBe(true);
+        expect(claims.request_hash).toBe(createHash("sha256").update(request.payload).digest("hex"));
+        expect(claims.result.files).toEqual(manifest.files);
+        expect(JSON.parse(request.payload).action).toBe("export_scope");
+      }
+      const seed = readFileSync(join(f.home, ".fx", "company-keys", "reader.seed"));
+      expect(archive.includes(seed)).toBe(false);
+      const offline = fixture();
+      const offlineConfig = join(offline.home, "pins.json"), offlineArchive = join(offline.home, "files.tar");
+      writeFileSync(offlineConfig, JSON.stringify({ ...config, endpoint: "http://127.0.0.1:1" }));
+      writeFileSync(offlineArchive, archive);
+      const verified = await offline.run(["fossil", "verify-scope", offlineConfig, offlineArchive, "--json"]);
+      expect(verified.code, verified.stderr).toBe(0);
+      expect(JSON.parse(verified.stdout)).toMatchObject({ files: 1, bytes: Buffer.byteLength(content), revision: boot.revision });
+      expect(existsSync(join(offline.home, ".fx", "omos-workspace.json"))).toBe(false);
+      expect(existsSync(join(offline.home, ".fx", "company-keys"))).toBe(false);
+      const corrupt = Buffer.from(archive); corrupt[512] ^= 1;
+      writeFileSync(offlineArchive, corrupt);
+      const damaged = await offline.run(["fossil", "verify-scope", offlineConfig, offlineArchive, "--json"]);
+      expect(damaged.code).toBe(1);
+      expect(damaged.stdout + damaged.stderr).toContain("ScopeExportHashMismatch");
+      const invented = Buffer.from(archive);
+      const pathIndex = invented.indexOf(Buffer.from('"path":"memory/preference.md"'));
+      expect(pathIndex).toBeGreaterThan(0);
+      invented[pathIndex + Buffer.byteLength('"path":"memory/')] = "P".charCodeAt(0);
+      writeFileSync(offlineArchive, invented);
+      const forged = await offline.run(["fossil", "verify-scope", offlineConfig, offlineArchive, "--json"]);
+      expect(forged.code).toBe(1);
+      expect(forged.stdout + forged.stderr).toContain("InvalidScopePackage");
+      writeFileSync(offlineArchive, archive);
+      writeFileSync(offlineConfig, JSON.stringify({ ...config, issuer: "00".repeat(32) }));
+      const untrusted = await offline.run(["fossil", "verify-scope", offlineConfig, offlineArchive, "--json"]);
+      expect(untrusted.code).toBe(1);
+      expect(untrusted.stdout + untrusted.stderr).toContain("InvalidScopePackage");
+      const original = createHash("sha256").update(archive).digest("hex");
+      const duplicate = await f.run(["fossil", "export-scope", input, output, "--json"]);
+      expect(duplicate.code).toBe(1);
+      expect(createHash("sha256").update(readFileSync(output)).digest("hex")).toBe(original);
+      const staging = output + ".partial-" + createHash("sha256").update(JSON.stringify(config)).digest("hex");
+      expect(readFileSync(join(staging, manifest.files[0].sha256)).toString()).toBe(content);
+      rmSync(output);
+      const revoked = await admin({ action: "status" });
+      await admin({ action: "revoke", revision: revoked.revision, id: "file-export" });
+      const denied = await f.run(["fossil", "export-scope", input, output, "--json"]);
+      expect(denied.code).toBe(1);
+      expect(denied.stderr + denied.stdout).toContain("WorkspaceServiceDenied");
+      expect(existsSync(output)).toBe(false);
+    } finally { service.child.kill(); await service.child.exited; }
+  }, 120000);
+
+  test("rejects corrupt scoped export pages and enforces the network deadline without publishing partial archives", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "company-key", "reader", "--json"])).code).toBe(0);
+    const issuer = generateKeyPairSync("ed25519");
+    const public_key = issuer.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex");
+    const revision = "a".repeat(64), content = Buffer.alloc(20000, 42), hash = createHash("sha256").update(content).digest("hex");
+    let mode = "hash", posts = 0, contentCalls = 0;
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+      if (mode === "stall") return new Promise<Response>(() => {});
+      if (request.method === "GET") return Response.json({ version: "omos.company/v1", workspace: "company", issuer: public_key, epoch: 1 });
+      posts++;
+      expect(request.headers.get("authorization")).toBe(null);
+      const envelope = await request.json() as any, query = JSON.parse(envelope.payload);
+      let result: any;
+      if (!query.path) result = { version: "omos.scoped-export/v1", workspace: "company", revision, actor: "reader", grant: "exporter", files: [{ path: "documents/report.md", sha256: hash, bytes: content.length }], total: 1, next_offset: null };
+      else {
+        contentCalls++;
+        const end = Math.min(query.offset + 16384, content.length);
+        const bytes = Buffer.from(content.subarray(query.offset, end));
+        if (mode === "hash") bytes[0] ^= 1;
+        result = { revision, path: query.path, exists: true, offset: mode === "offset" ? query.offset + 1 : query.offset, bytes: content.length, sha256: hash, encoding: "base64", content: bytes.toString("base64"), next_offset: end < content.length ? end : null };
+      }
+      const payload = JSON.stringify({ version: "omos.company-receipt/v1", workspace: "company", actor: "reader", grant: "exporter", operation: query.operation, request_hash: createHash("sha256").update(envelope.payload).digest("hex"), action: "export_scope", epoch: 1, result });
+      return Response.json({ payload, signature: sign(null, Buffer.from(payload), issuer.privateKey).toString("hex"), issuer: public_key });
+    } });
+    try {
+      const config = { version: "omos.scope-export-request/v1", endpoint: `http://127.0.0.1:${server.port}`, workspace: "company", actor: "reader", grant: "exporter", key_handle: "reader", issuer: public_key, revision };
+      const input = join(f.home, "export.json"), output = join(f.home, "bounded.tar");
+      writeFileSync(input, JSON.stringify(config));
+      for (const [failure, expected] of [["hash", "ScopeExportHashMismatch"], ["offset", "InvalidScopeExportSegment"]]) {
+        mode = failure;
+        const rejected = await f.run(["fossil", "export-scope", input, output, "--json"]);
+        expect(rejected.code).toBe(1);
+        expect(rejected.stdout + rejected.stderr).toContain(expected);
+        expect(existsSync(output)).toBe(false);
+      }
+      mode = "valid";
+      writeFileSync(input, JSON.stringify({ ...config, max_bytes: content.length - 1 }));
+      const before = posts;
+      const over = await f.run(["fossil", "export-scope", input, output, "--json"]);
+      expect(over.code).toBe(1);
+      expect(over.stdout + over.stderr).toContain("ScopeExportByteLimit");
+      expect(posts - before).toBe(1);
+      expect(existsSync(output)).toBe(false);
+      writeFileSync(input, JSON.stringify(config));
+      const valid = await f.run(["fossil", "export-scope", input, output, "--json"]);
+      expect(valid.code, valid.stderr).toBe(0);
+      const stage = output + ".partial-" + createHash("sha256").update(JSON.stringify(config)).digest("hex");
+      expect(readFileSync(join(stage, hash)).equals(content)).toBe(true);
+      rmSync(output);
+      const warmBefore = contentCalls;
+      const warm = await f.run(["fossil", "export-scope", input, output, "--json"]);
+      expect(warm.code, warm.stderr).toBe(0);
+      expect(contentCalls).toBe(warmBefore);
+      rmSync(output);
+      writeFileSync(join(stage, hash), Buffer.alloc(content.length, 0));
+      const damagedBefore = contentCalls;
+      const repaired = await f.run(["fossil", "export-scope", input, output, "--json"]);
+      expect(repaired.code, repaired.stderr).toBe(0);
+      expect(contentCalls - damagedBefore).toBe(2);
+      expect(readFileSync(join(stage, hash)).equals(content)).toBe(true);
+      rmSync(output);
+      mode = "stall";
+      writeFileSync(input, JSON.stringify({ ...config, deadline_ms: 100 }));
+      const started = performance.now();
+      const timed = await f.run(["fossil", "export-scope", input, output, "--json"], {}, 5000);
+      expect(timed.code).toBe(1);
+      expect(timed.stdout + timed.stderr).toContain("Timeout");
+      expect(performance.now() - started).toBeLessThan(4000);
+      expect(existsSync(output)).toBe(false);
+    } finally { server.stop(true); }
+  }, 30000);
+
   test("retains signed requests and reconciles an expired checkpoint without replaying its commit", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);

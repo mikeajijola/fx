@@ -2,7 +2,7 @@ const std = @import("std");
 const workspace = @import("fossil_workspace.zig");
 
 pub const Options = struct {
-    action: enum { init, ensure, company, @"company-key", use, status, tasks, diff, history, verify, recover, migrate, definition, query, audit, serve, remote, @"export" } = .status,
+    action: enum { init, ensure, company, @"company-key", use, status, tasks, diff, history, verify, recover, migrate, definition, query, audit, serve, remote, @"export-scope", @"verify-scope", @"export" } = .status,
     path: ?[]const u8 = null,
     definition_action: enum { show, validate, propose } = .show,
     execution_path: ?[]const u8 = null,
@@ -49,12 +49,12 @@ pub fn parse(args: []const [:0]const u8) !Options {
         } else if (options.path == null) {
             options.path = arg;
             positional += 1;
-        } else if (options.action == .remote and options.request_path == null) {
+        } else if ((options.action == .remote or options.action == .@"export-scope" or options.action == .@"verify-scope") and options.request_path == null) {
             options.request_path = arg;
         } else return error.UnexpectedArgument;
     }
     switch (options.action) {
-        .use, .@"export", .remote => if (options.path == null) return error.MissingPath,
+        .use, .@"export", .remote, .@"export-scope", .@"verify-scope" => if (options.path == null) return error.MissingPath,
         .definition => switch (options.definition_action) {
             .show => if (options.path != null) return error.UnexpectedArgument,
             .validate, .propose => if (options.path == null) return error.MissingPath,
@@ -63,6 +63,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
         .init, .diff, .query, .serve => {},
         else => if (options.path != null) return error.UnexpectedArgument,
     }
+    if ((options.action == .@"export-scope" or options.action == .@"verify-scope") and options.request_path == null) return error.MissingPath;
     if (offset_seen and options.action != .query) return error.UnexpectedArgument;
     if (options.writable and options.action != .serve) return error.UnexpectedArgument;
     if (options.upgrade_contracts and options.action != .migrate) return error.UnexpectedArgument;
@@ -71,7 +72,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
     return options;
 }
 
-pub const Reply = union(enum) { workspace: workspace.Snapshot, identity: @import("company_identity.zig").Snapshot };
+pub const Reply = union(enum) { workspace: workspace.Snapshot, identity: @import("company_identity.zig").Snapshot, scope: @import("scope_export.zig").Snapshot };
 
 pub fn execute(alloc: std.mem.Allocator, options: Options) !Reply {
     if (options.action == .@"company-key") {
@@ -86,6 +87,17 @@ pub fn execute(alloc: std.mem.Allocator, options: Options) !Reply {
         const output = try std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, identity, .{}), .{});
         try model.validateOperation(alloc, declaration, "omos_create_company_key", output, .output);
         return .{ .identity = identity };
+    }
+    if (options.action == .@"export-scope" or options.action == .@"verify-scope") {
+        const model = @import("definition.zig");
+        const declaration = try model.parse(alloc, model.seed);
+        const raw = try readDefinition(alloc, options.path.?);
+        const input = try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{});
+        try model.validateOperation(alloc, declaration, if (options.action == .@"export-scope") "omos_export_scope" else "omos_verify_scope", input, .input);
+        const snapshot = if (options.action == .@"export-scope") try @import("scope_export.zig").write(alloc, raw, options.request_path.?) else try @import("scope_export.zig").verify(alloc, raw, options.request_path.?);
+        const output = try std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, snapshot, .{}), .{});
+        try model.validateOperation(alloc, declaration, if (options.action == .@"export-scope") "omos_export_scope" else "omos_verify_scope", output, .output);
+        return .{ .scope = snapshot };
     }
     if (options.action == .remote) {
         const data = try @import("workspace_client.zig").call(alloc, options.path.?, if (options.request_path) |path| try readDefinition(alloc, path) else null);
@@ -143,7 +155,7 @@ pub fn execute(alloc: std.mem.Allocator, options: Options) !Reply {
         .query => model_data = (try std.json.parseFromSlice(std.json.Value, alloc, try manager.queryRecords(null, options.path, options.offset), .{})).value,
         .audit => model_data = (try std.json.parseFromSlice(std.json.Value, alloc, try manager.auditContracts(), .{})).value,
         .serve => return error.ServiceRequiresCliHost,
-        .remote, .@"company-key" => unreachable,
+        .remote, .@"company-key", .@"export-scope", .@"verify-scope" => unreachable,
         .status, .tasks => {},
     }
     var snapshot = try manager.snapshot(detail);
@@ -178,4 +190,16 @@ test "fossil command query pagination validates offsets" {
     try std.testing.expectError(error.MissingOffset, parse(&.{ "query", "--offset" }));
     try std.testing.expectError(error.UnexpectedArgument, parse(&.{ "status", "--offset", "0" }));
     try std.testing.expectError(error.UnexpectedArgument, parse(&.{ "query", "--offset", "0", "--offset", "1" }));
+}
+
+test "scoped package commands require separate configuration and archive paths" {
+    const selected = try parse(&.{ "export-scope", "scope.json", "package.tar", "--json" });
+    try std.testing.expectEqualStrings("scope.json", selected.path.?);
+    try std.testing.expectEqualStrings("package.tar", selected.request_path.?);
+    try std.testing.expectEqual(.@"verify-scope", (try parse(&.{ "verify-scope", "scope.json", "package.tar" })).action);
+    try std.testing.expectError(error.MissingPath, parse(&.{"export-scope"}));
+    try std.testing.expectError(error.MissingPath, parse(&.{ "export-scope", "scope.json" }));
+    try std.testing.expectError(error.MissingPath, parse(&.{ "verify-scope", "scope.json" }));
+    try std.testing.expectError(error.UnexpectedArgument, parse(&.{ "export-scope", "scope.json", "package.tar", "extra" }));
+    try std.testing.expectError(error.UnexpectedArgument, parse(&.{ "export-scope", "scope.json", "package.tar", "--write" }));
 }

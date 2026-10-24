@@ -270,6 +270,8 @@ fn requestPage(manager: workspace.Manager, bytes: []const u8, offset: usize, lim
 }
 
 fn retainRead(manager: workspace.Manager, grant: authority.Grant, request: authority.Request, selected: ?View, revision: []const u8, raw: []const u8, writable: bool) ![]const u8 {
+    // Export transfers are inspection, not inputs to a future proposal.
+    if (request.action == .export_scope) return raw;
     var view = selected orelse return raw;
     const task = try manager.loadTask(view.task);
     var result = try parse(manager.alloc, raw);
@@ -468,7 +470,7 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
         const manifest = try records.decode(workspace.Manifest, alloc, try manager.contentAt("workspace.json", pinned), .{});
         if (!std.mem.eql(u8, manifest.id, current.workspace)) return error.WorkspaceIdentityMismatch;
         if (request.action == .query) return retainRead(manager, grant, request, if (selected) |view| view.view else null, pinned, try @import("company_records.zig").query(manager, grant, request, pinned), writable);
-        if (request.action == .read) {
+        if (request.action == .read or (request.action == .export_scope and request.path != null)) {
             const path = request.path orelse return error.MissingPath;
             if (!authority.permitsPath(grant, path)) return error.CompanyAccessDenied;
             const present = for (try manager.inventory(pinned)) |entry| {
@@ -495,7 +497,7 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
             }
             count += 1;
         }
-        return retainRead(manager, grant, request, if (selected) |view| view.view else null, pinned, try encode(alloc, .{ .version = if (request.action == .export_scope) "omos.scoped-export/v1" else "omos.scoped-inventory/v1", .workspace = current.workspace, .revision = pinned, .actor = grant.actor, .grant = grant.id, .files = files.items, .next_offset = if (request.offset + files.items.len < count) @as(?usize, request.offset + files.items.len) else null, .total = count, .content_endpoint = "/v1/company", .external_dependencies = &[_][]const u8{}, .authority = "content_only" }), writable);
+        return retainRead(manager, grant, request, if (selected) |view| view.view else null, pinned, try encode(alloc, .{ .version = if (request.action == .export_scope) "omos.scoped-export/v1" else "omos.scoped-inventory/v1", .workspace = current.workspace, .revision = pinned, .actor = grant.actor, .grant = grant.id, .files = files.items, .next_offset = if (request.offset + files.items.len < count) @as(?usize, request.offset + files.items.len) else null, .total = count, .content_endpoint = "/v1/company", .dependency_closure = "not_evaluated", .authority = "content_only" }), writable);
     }
     return error.UnsupportedCompanyApi;
 }

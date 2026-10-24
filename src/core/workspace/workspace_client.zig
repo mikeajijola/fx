@@ -13,8 +13,17 @@ pub const Company = struct {
     epoch: u64,
 };
 
+pub const Control = struct {
+    deadline: std.Io.Clock.Timestamp,
+    cancel: *std.atomic.Value(bool),
+};
+
 pub fn companyBootstrap(alloc: std.mem.Allocator, base_url: []const u8) !Company {
-    const value = try http(alloc, base_url, "/v1/company", null, null);
+    return companyBootstrapControlled(alloc, base_url, null);
+}
+
+pub fn companyBootstrapControlled(alloc: std.mem.Allocator, base_url: []const u8, control: ?Control) !Company {
+    const value = try httpControlled(alloc, base_url, "/v1/company", null, null, control);
     const company = try std.json.parseFromValueLeaky(Company, alloc, value, .{ .ignore_unknown_fields = true });
     if (!std.mem.eql(u8, company.version, "omos.company/v1") or !authority.safeIdentity(company.workspace) or company.epoch == 0) return error.InvalidCompanyInstance;
     _ = try std.crypto.sign.Ed25519.PublicKey.fromBytes(try authority.hexBytes(32, company.issuer));
@@ -48,10 +57,14 @@ pub fn verifyCompanyReceipt(alloc: std.mem.Allocator, company: Company, raw_requ
 /// The caller pins one instance for a sequence of reads. An issuer rotation
 /// or mismatched receipt ends that sequence instead of mixing trust contexts.
 pub fn companyCall(alloc: std.mem.Allocator, base_url: []const u8, company: Company, raw: []const u8) !std.json.Value {
+    return companyCallControlled(alloc, base_url, company, raw, null);
+}
+
+pub fn companyCallControlled(alloc: std.mem.Allocator, base_url: []const u8, company: Company, raw: []const u8, control: ?Control) !std.json.Value {
     const envelope = try records.decode(authority.Envelope, alloc, raw, .{});
     const request = try records.decode(authority.Request, alloc, envelope.payload, .{});
     if (!std.mem.eql(u8, request.version, "omos.company/v1") or !std.mem.eql(u8, request.workspace, company.workspace)) return error.WorkspaceIdentityMismatch;
-    const response = http(alloc, base_url, "/v1/company", raw, null) catch |err| {
+    const response = httpControlled(alloc, base_url, "/v1/company", raw, null, control) catch |err| {
         if (authority.isMutation(request.action)) {
             @import("../shared/debug_trace.zig").logf("workspace", "company response outcome unknown operation={s} cause={s}; reconcile the original operation before retrying", .{ request.operation, @errorName(err) });
             return error.WorkspaceServiceOutcomeUnknown;
@@ -79,6 +92,36 @@ pub fn call(alloc: std.mem.Allocator, base_url: []const u8, body: ?[]const u8) !
 }
 
 fn http(alloc: std.mem.Allocator, base_url: []const u8, endpoint: []const u8, body: ?[]const u8, token: ?[]const u8) !std.json.Value {
+    return httpControlled(alloc, base_url, endpoint, body, token, null);
+}
+
+const Body = struct {
+    bytes: []u8,
+    pub fn deinit(self: *Body, alloc: std.mem.Allocator) void {
+        alloc.free(self.bytes);
+    }
+};
+
+fn httpControlled(alloc: std.mem.Allocator, base_url: []const u8, endpoint: []const u8, body: ?[]const u8, token: ?[]const u8, control: ?Control) !std.json.Value {
+    var cancelled = std.atomic.Value(bool).init(false);
+    const per_request: std.Io.Clock.Timestamp = .{ .clock = .awake, .raw = std.Io.Clock.Timestamp.now(io.getIo(), .awake).raw.addDuration(.fromSeconds(30)) };
+    const deadline = if (control) |value| if (std.Io.Clock.Timestamp.compare(value.deadline, .lt, per_request)) value.deadline else per_request else per_request;
+    const Operation = struct {
+        alloc: std.mem.Allocator,
+        base_url: []const u8,
+        endpoint: []const u8,
+        body: ?[]const u8,
+        token: ?[]const u8,
+        pub fn run(self: @This()) !Body {
+            return .{ .bytes = try httpBody(self.alloc, self.base_url, self.endpoint, self.body, self.token) };
+        }
+    };
+    var result = try @import("../../gateway/client.zig").runBoundedHttpOperation(Body, alloc, if (control) |value| value.cancel else &cancelled, deadline, Operation{ .alloc = alloc, .base_url = base_url, .endpoint = endpoint, .body = body, .token = token });
+    defer result.deinit(alloc);
+    return std.json.parseFromSliceLeaky(std.json.Value, alloc, result.bytes, .{ .allocate = .alloc_always });
+}
+
+fn httpBody(alloc: std.mem.Allocator, base_url: []const u8, endpoint: []const u8, body: ?[]const u8, token: ?[]const u8) ![]u8 {
     const base = try std.Uri.parse(base_url);
     if (base.user != null or base.password != null or base.query != null or base.fragment != null or base.host == null) return error.InvalidWorkspaceEndpoint;
     const host = try base.host.?.toRawMaybeAlloc(alloc);
@@ -100,8 +143,7 @@ fn http(alloc: std.mem.Allocator, base_url: []const u8, endpoint: []const u8, bo
     if (response.head.status == .unauthorized or response.head.status == .forbidden) return error.WorkspaceServiceDenied;
     if (response.head.status != .ok) return error.WorkspaceServiceRejected;
     var transfer: [4096]u8 = undefined;
-    const raw = response.reader(&transfer).allocRemaining(alloc, .limited(1024 * 1024)) catch return error.WorkspaceServiceOutcomeUnknown;
-    return (try std.json.parseFromSlice(std.json.Value, alloc, raw, .{})).value;
+    return response.reader(&transfer).allocRemaining(alloc, .limited(1024 * 1024)) catch return error.WorkspaceServiceOutcomeUnknown;
 }
 
 test "company client verifies issuer, signature and exact request receipt binding" {

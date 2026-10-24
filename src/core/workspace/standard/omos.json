@@ -1133,6 +1133,242 @@
         "interfaces": [
           "cli"
         ]
+      },
+      {
+        "id": "omos_export_scope",
+        "capability": "general_task",
+        "description": "Export a verified file snapshot within a live company grant, with explicit dependency closure status.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.scope-export-request/v1"
+            },
+            "endpoint": {
+              "type": "string",
+              "minLength": 1
+            },
+            "workspace": {
+              "type": "string",
+              "minLength": 1
+            },
+            "actor": {
+              "type": "string",
+              "minLength": 1
+            },
+            "grant": {
+              "type": "string",
+              "minLength": 1
+            },
+            "key_handle": {
+              "type": "string",
+              "minLength": 1
+            },
+            "issuer": {
+              "type": "string",
+              "minLength": 1
+            },
+            "revision": {
+              "type": "string",
+              "minLength": 1
+            },
+            "view": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "max_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1099511627776
+            },
+            "deadline_ms": {
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 3600000
+            }
+          },
+          "required": [
+            "version",
+            "endpoint",
+            "workspace",
+            "actor",
+            "grant",
+            "key_handle",
+            "issuer",
+            "revision"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.scope-package/v1"
+            },
+            "path": {
+              "type": "string"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "files": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "scope": {
+              "const": "grant_file_snapshot"
+            },
+            "dependency_closure": {
+              "const": "not_evaluated"
+            }
+          },
+          "required": [
+            "version",
+            "path",
+            "workspace",
+            "revision",
+            "files",
+            "bytes",
+            "scope",
+            "dependency_closure"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli"
+        ]
+      },
+      {
+        "id": "omos_verify_scope",
+        "capability": "general_task",
+        "description": "Verify a scoped file package offline against separate issuer and scope pins.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.scope-export-request/v1"
+            },
+            "endpoint": {
+              "type": "string",
+              "minLength": 1
+            },
+            "workspace": {
+              "type": "string",
+              "minLength": 1
+            },
+            "actor": {
+              "type": "string",
+              "minLength": 1
+            },
+            "grant": {
+              "type": "string",
+              "minLength": 1
+            },
+            "key_handle": {
+              "type": "string",
+              "minLength": 1
+            },
+            "issuer": {
+              "type": "string",
+              "minLength": 1
+            },
+            "revision": {
+              "type": "string",
+              "minLength": 1
+            },
+            "view": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "max_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1099511627776
+            },
+            "deadline_ms": {
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 3600000
+            }
+          },
+          "required": [
+            "version",
+            "endpoint",
+            "workspace",
+            "actor",
+            "grant",
+            "key_handle",
+            "issuer",
+            "revision"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.scope-package/v1"
+            },
+            "path": {
+              "type": "string"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "files": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "scope": {
+              "const": "grant_file_snapshot"
+            },
+            "dependency_closure": {
+              "const": "not_evaluated"
+            }
+          },
+          "required": [
+            "version",
+            "path",
+            "workspace",
+            "revision",
+            "files",
+            "bytes",
+            "scope",
+            "dependency_closure"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": false,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli"
+        ]
       }
     ],
     "semantic": {
