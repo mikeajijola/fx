@@ -219,6 +219,28 @@ Each fresh instance receives a unique workspace identity, a declaration, and an
 execution policy. Unlike `fossil init`, bootstrap never imports old sessions.
 Initialization publishes the verified repository before publishing its binding.
 
+Task selection is retained as a host-owned `omos_event` on the `omos-runtime`
+branch. Each session binding names its workspace and selected task; it contains
+no provider replay state or credentials. Selecting work does not advance the
+accepted company branch. These events are available through typed event queries
+and travel with an ordinary repository copy, independently of the last export.
+They preserve an explicit switch to older work instead of guessing that the
+newest task must be active.
+
+When task or session index directories are missing, opening the bound instance
+reconstructs them from canonical task branches, acceptance receipts, and these
+selection events. A durable restore marker makes an interrupted rebuild resume
+before those indexes are used. A legacy export registry remains compatible;
+newer canonical task records and selection events take precedence. This rebuild
+does not restore private provider checkpoints or repeat actor actions.
+
+New host history entries carry a recording timestamp. If execution stops after
+retaining an answer but before recording an assessment outcome, `continue`
+resumes independent verification of that answer. Later actor intentions prevent
+an older candidate from taking this recovery path. A completed assessment that
+requires more work still returns control to the actor. Neither a retained
+answer nor a recovered index establishes completion by itself.
+
 The installation script copies its packaged Fossil helper, or an existing
 Fossil executable for a source install, into protected `~/.fx/libexec/` storage.
 A content-addressed filename and atomic integrity manifest identify the helper.

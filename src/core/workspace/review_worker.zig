@@ -24,7 +24,7 @@ pub fn perform(original: workspace.Manager, job: jobs.Job, model: Model) !void {
     manager.review_fence = .{ .task = job.task, .job = job.id, .generation = job.generation, .owner = job.owner };
     const task = try manager.loadTask(job.task);
     try manager.validateTaskBasis(task);
-    const candidate = (try manager.failedReviewCandidate(task)) orelse return error.NoRetainedReviewCandidate;
+    const candidate = (try manager.retainedReviewCandidate(task)) orelse return error.NoRetainedReviewCandidate;
     if (!std.mem.eql(u8, job.candidate_hash, try workspace.hash(manager.alloc, candidate)) or job.contract_version != task.definition.version) return error.StaleWorkContract;
     const definition_hash = if (task.model_basis) |basis| basis.definition_hash else "legacy-contract";
     if (!std.mem.eql(u8, definition_hash, job.definition_hash)) return error.StaleWorkspaceDefinition;

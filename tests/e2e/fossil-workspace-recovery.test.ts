@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import { createHash, generateKeyPairSync, sign, verify, createPublicKey, createPrivateKey } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { cleanupFixtures, fixture, model, writeMemory } from "./fossil-workspace-helpers";
+import { NativeClient } from "./workspace-ui-client.mjs";
 
 afterEach(cleanupFixtures);
 
@@ -46,6 +47,118 @@ async function startWorkspaceService(f: ReturnType<typeof fixture>, writable = f
 
 // These fault, boundary, migration, and authority cases qualify the candidate without training it.
 describe("portable Fossil workspace recovery", () => {
+  test("resumes verification after an abrupt assessment stop and index loss without repeating completed work", async () => {
+    const f = fixture();
+    let markReviewing!: () => void;
+    let release!: () => void;
+    let initial = true;
+    const reviewing = new Promise<void>(resolve => { markReviewing = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const inference = model(f, (_body, count) => count === 1 ? writeMemory("One completed effect before assessment.") : { content: "The preference was saved exactly once." }, async () => {
+      if (initial) { initial = false; markReviewing(); await gate; }
+      return "met";
+    });
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const child = Bun.spawn([join(import.meta.dir, "../../zig-out/bin/fx"), "ask", "Remember the preference and verify it", "--json"], { cwd: f.cwd, env: { ...process.env, ...f.env }, stdout: "pipe", stderr: "pipe" });
+    try {
+      await Promise.race([reviewing, Bun.sleep(30000).then(() => { throw Error("The original assessment never started"); })]);
+      child.kill("SIGKILL");
+      await child.exited;
+      release();
+      const state = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout);
+      const task = state.tasks[0];
+      const history = f.fossil("ls", "-r", task.branch).trim().split("\n").filter((path: string) => path.startsWith(`history/${task.id}/`)).map((path: string) => JSON.parse(f.fossil("cat", path, "-r", task.branch)));
+      expect(history.some((row: any) => row.kind === "review_candidate")).toBe(true);
+      expect(history.some((row: any) => row.kind === "review_failure")).toBe(false);
+      const sessions = JSON.parse((await f.run(["sessions", "--all", "--json"])).stdout).sessions;
+      const session = sessions.find((item: any) => createHash("sha256").update(item.id).digest("hex") === task.session).id;
+      const cache = join(f.home, ".fx/fossil", createHash("sha256").update(state.repository).digest("hex"));
+      rmSync(join(cache, "tasks"), { recursive: true });
+      rmSync(join(cache, "sessions"), { recursive: true });
+      const calls = inference.counts().actors;
+      const resumed = await f.run(["ask", "--resume-id", session, "continue", "--json"]);
+      expect(resumed.code, resumed.stderr + resumed.stdout).toBe(0);
+      expect(inference.counts().actors).toBe(calls);
+      expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("One completed effect before assessment.");
+      expect(JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0].state).toBe("accepted");
+    } finally { child.kill(); await child.exited; release(); }
+  }, 120000);
+
+  test("rebuilds interrupted task indexes and restores a newer selected task beyond the last export", async () => {
+    const f = fixture();
+    let permit = true;
+    const inference = model(f, () => ({ content: "The informational answer is retained." }), packet => permit ? "met" : {
+      name: "omos_contract_assessment", args: { contractId: packet.contract.id, version: packet.contract.version, obligations: [{ id: "request_complete", status: "met", evidence: ["unseen-fixture"], note: "Rejected fixture assessment" }] },
+    });
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const first = await f.run(["ask", "Give the first informational answer", "--json"]);
+    expect(first.code, first.stderr).toBe(0);
+    const session = JSON.parse(first.stdout).session_id;
+    expect((await f.run(["fossil", "export", join(f.home, "older-export.fossil")])).code).toBe(0);
+    permit = false;
+    const second = await f.run(["ask", "--resume-id", session, "Give a second distinct informational answer", "--json"]);
+    expect(second.code).toBe(1);
+    const before = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout);
+    const pending = before.tasks.find((task: any) => task.state !== "accepted");
+    expect(pending).toBeDefined();
+    const cache = join(f.home, ".fx/fossil", createHash("sha256").update(before.repository).digest("hex"));
+    rmSync(join(cache, "tasks"), { recursive: true });
+    rmSync(join(cache, "sessions"), { recursive: true });
+    const interrupted = await f.run(["fossil", "status", "--json"], { FX_E2E_FOSSIL_FAULT: "registry-task-restored" });
+    expect(interrupted.code).toBe(1);
+    expect(existsSync(join(cache, "restore.pending"))).toBe(true);
+    const restored = await f.run(["fossil", "tasks", "--json"]);
+    expect(restored.code, restored.stderr).toBe(0);
+    expect(JSON.parse(restored.stdout).tasks.map((task: any) => task.id).sort()).toEqual(before.tasks.map((task: any) => task.id).sort());
+    expect(existsSync(join(cache, "restore.pending"))).toBe(false);
+    const selectedSession = createHash("sha256").update(session).digest("hex");
+    expect(readFileSync(join(cache, "sessions", selectedSession), "utf8")).toBe(pending.id);
+    const events = JSON.parse((await f.run(["fossil", "query", "omos_event", "--json"])).stdout).model_data;
+    expect(events.records.some((row: any) => row.data.kind === "session_binding" && row.data.payload.session === selectedSession && row.data.task === pending.id)).toBe(true);
+    const calls = inference.counts().actors;
+    permit = true;
+    const resumed = await f.run(["ask", "--resume-id", session, "continue", "--json"]);
+    expect(resumed.code, resumed.stderr).toBe(0);
+    expect(inference.counts().actors).toBe(calls);
+    expect(JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks.every((task: any) => task.state === "accepted")).toBe(true);
+  }, 120000);
+
+  test("restores an explicit selection of older work without changing accepted company state", async () => {
+    const f = fixture();
+    let permit = false;
+    const inference = model(f, () => ({ content: "The candidate answer remains retained." }), packet => permit ? "met" : {
+      name: "omos_contract_assessment", args: { contractId: packet.contract.id, version: packet.contract.version, obligations: [{ id: "request_complete", status: "met", evidence: ["unseen-fixture"], note: "Rejected fixture assessment" }] },
+    });
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const first = await f.run(["ask", "Give a first retained answer", "--json"]);
+    const second = await f.run(["ask", "Give a later retained answer", "--json"]);
+    expect(first.code).toBe(1);
+    expect(second.code).toBe(1);
+    const secondSession = JSON.parse(second.stdout).session_id;
+    const before = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout);
+    const task = before.tasks.find((task: any) => task.session === createHash("sha256").update(JSON.parse(first.stdout).session_id).digest("hex"));
+    const native = new NativeClient({ binary: join(import.meta.dir, "../../zig-out/bin/fx"), project: f.cwd, env: { ...process.env, ...f.env } });
+    try {
+      const revision = f.fossil("info", task.branch).match(/(?:hash|uuid):\s+([a-f0-9]+)/)![1];
+      expect((await native.request("task.resume", { session: secondSession, task: task.id, revision })).id).toBe(task.id);
+      expect((await native.request("snapshot", { action: "fossil.status" })).trunk_revision).toBe(before.trunk_revision);
+    } finally { await native.close(); }
+    const cache = join(f.home, ".fx/fossil", createHash("sha256").update(before.repository).digest("hex"));
+    rmSync(join(cache, "tasks"), { recursive: true });
+    rmSync(join(cache, "sessions"), { recursive: true });
+    const restored = await f.run(["fossil", "status", "--json"]);
+    expect(restored.code, restored.stderr).toBe(0);
+    expect(readFileSync(join(cache, "sessions", createHash("sha256").update(secondSession).digest("hex")), "utf8")).toBe(task.id);
+    permit = true;
+    const calls = inference.counts().actors;
+    const resumed = await f.run(["ask", "--resume-id", secondSession, "continue", "--json"]);
+    expect(resumed.code, resumed.stderr).toBe(0);
+    expect(inference.counts().actors).toBe(calls);
+    const after = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks;
+    expect(after.find((item: any) => item.id === task.id).state).toBe("accepted");
+    expect(after.find((item: any) => item.id !== task.id).state).not.toBe("accepted");
+  }, 120000);
+
   test("authenticates scoped company views, fences concurrent checkpoints, retains outcomes and revokes access", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);

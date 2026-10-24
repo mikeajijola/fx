@@ -108,6 +108,15 @@ const PortableRegistry = struct {
     publications: []const Publication,
     sessions: []const struct { session: []const u8, task: []const u8 },
 };
+const SessionBinding = struct {
+    task: []const u8,
+    kind: enum { session_binding } = .session_binding,
+    payload: struct {
+        version: []const u8 = "omos.session-binding/v1",
+        workspace: []const u8,
+        session: []const u8,
+    },
+};
 
 pub const Snapshot = struct {
     repository: []const u8,
@@ -392,6 +401,7 @@ pub const Manager = struct {
     }
 
     const company_branch = "omos-company";
+    const runtime_branch = "omos-runtime";
     pub const CompanyFile = struct { path: []const u8, content: []const u8 };
 
     pub fn companyRevision(self: Manager) !?[]const u8 {
@@ -768,7 +778,7 @@ pub const Manager = struct {
         if (task.revision_pending) return error.TaskContractRevisionPending;
         if (task.state == .accepted or task.state == .publication_pending or task.state == .conflict) return error.TaskIsReadOnly;
         const definition_hash = if (task.model_basis) |basis| basis.definition_hash else "legacy-contract";
-        const candidate = (try self.failedReviewCandidate(task)) orelse return error.NoRetainedReviewCandidate;
+        const candidate = (try self.retainedReviewCandidate(task)) orelse return error.NoRetainedReviewCandidate;
         const candidate_hash = try hash(self.alloc, candidate);
         const workspace_basis = (try self.modelBasis(try self.revision("trunk"))) orelse return error.WorkspaceMigrationRequired;
         const id = try hash(self.alloc, try json(self.alloc, .{ task.id, task.definition.version, definition_hash, candidate_hash, workspace_basis.definition_hash }));
@@ -973,6 +983,11 @@ pub const Manager = struct {
         const binding = (try configured(alloc)) orelse return null;
         const self = try open(alloc, binding.repository);
         if (!std.mem.eql(u8, binding.workspace_id, self.manifest.id)) return error.WorkspaceBindingMismatch;
+        if (!exists(try join(alloc, self.root, "tasks")) or !exists(try join(alloc, self.root, "sessions")) or exists(try join(alloc, self.root, "restore.pending"))) {
+            const lease = try Lease.acquire(alloc, self.root);
+            defer lease.release();
+            try self.restoreRegistry();
+        }
         return self;
     }
 
@@ -1187,6 +1202,59 @@ pub const Manager = struct {
         return join(self.alloc, try join(self.alloc, self.root, "sessions"), try hash(self.alloc, session));
     }
 
+    fn validateSessionBinding(self: Manager, binding: SessionBinding, path: []const u8) !void {
+        if (!safeId(binding.task) or !safeId(binding.payload.session) or !std.mem.eql(u8, binding.payload.version, "omos.session-binding/v1") or !std.mem.eql(u8, binding.payload.workspace, self.manifest.id)) return error.InvalidWorkspaceFormat;
+        if (!std.mem.eql(u8, path, try self.alloc.print("runtime/sessions/{s}.json", .{binding.payload.session}))) return error.InvalidWorkspaceFormat;
+        if (try self.modelBasis("trunk")) |basis| {
+            const declaration = try self.loadDeclaration(basis.revision);
+            // The legacy adapter predates the generic host event bucket.
+            model.validateRecord(declaration.semantic, "omos_event", try parse(self.alloc, std.json.Value, try json(self.alloc, binding)), true) catch |err| switch (err) {
+                error.UnknownEntityType => {},
+                else => return err,
+            };
+        }
+    }
+
+    /// The host owns selection events. They are separate from accepted company
+    /// content so selecting a task cannot invalidate another task's base.
+    fn selectSession(self: Manager, session: []const u8, task: Task) !void {
+        const selected_session = try hash(self.alloc, session);
+        const binding: SessionBinding = .{ .task = task.id, .payload = .{ .workspace = self.manifest.id, .session = selected_session } };
+        const path = try self.alloc.print("runtime/sessions/{s}.json", .{selected_session});
+        try self.validateSessionBinding(binding, path);
+        const branches = try self.run(null, &.{ "branch", "list", "--all", "-R", self.repository });
+        var found = false;
+        var lines = std.mem.splitScalar(u8, branches, '\n');
+        while (lines.next()) |line| if (std.mem.eql(u8, std.mem.trim(u8, line, " *\r\t"), runtime_branch)) {
+            found = true;
+            break;
+        };
+        if (!found) _ = try self.run(null, &.{ "branch", "new", runtime_branch, "trunk", "--nosign", "-R", self.repository });
+        const tree = try self.checkout(runtime_branch);
+        const bytes = try json(self.alloc, binding);
+        const destination = try join(self.alloc, tree, path);
+        if (!std.mem.eql(u8, bytes, read(self.alloc, destination) catch "")) {
+            try atomicWrite(self.alloc, destination, bytes);
+            _ = try self.commit(tree, "Record selected workspace task");
+        }
+        try atomicWrite(self.alloc, try self.sessionPath(session), task.id);
+    }
+
+    fn restoreSessionBindings(self: Manager) !void {
+        const branches = try self.run(null, &.{ "branch", "list", "--all", "-R", self.repository });
+        var lines = std.mem.splitScalar(u8, branches, '\n');
+        while (lines.next()) |line| if (std.mem.eql(u8, std.mem.trim(u8, line, " *\r\t"), runtime_branch)) {
+            for (try self.inventory(runtime_branch)) |path| {
+                if (!std.mem.startsWith(u8, path, "runtime/sessions/")) continue;
+                const binding = try parse(self.alloc, SessionBinding, try self.contentAt(path, runtime_branch));
+                try self.validateSessionBinding(binding, path);
+                _ = try self.loadTask(binding.task);
+                try atomicWrite(self.alloc, try join(self.alloc, try join(self.alloc, self.root, "sessions"), binding.payload.session), binding.task);
+            }
+            return;
+        };
+    }
+
     pub fn active(self: Manager, session: []const u8) !?Task {
         const id = read(self.alloc, try self.sessionPath(session)) catch |err| switch (err) {
             error.FileNotFound => return null,
@@ -1257,7 +1325,7 @@ pub const Manager = struct {
         try atomicWrite(self.alloc, try join(self.alloc, tree, try self.taskPath(id)), try json(self.alloc, task));
         _ = try self.commit(tree, "Record task contract");
         try self.saveTask(task);
-        try atomicWrite(self.alloc, try self.sessionPath(session), id);
+        try self.selectSession(session, task);
         return task;
     }
 
@@ -1277,7 +1345,7 @@ pub const Manager = struct {
         }
         if (task.state != .publication_pending and task.state != .accepted) task.state = .active;
         try self.saveTask(task);
-        try atomicWrite(self.alloc, try self.sessionPath(session), id);
+        try self.selectSession(session, task);
         return task;
     }
 
@@ -1406,6 +1474,7 @@ pub const Manager = struct {
         try envelope.put(self.alloc, "kind", .{ .string = kind });
         try envelope.put(self.alloc, "task", .{ .string = task.id });
         try envelope.put(self.alloc, "contract_version", .{ .integer = task.definition.version });
+        try envelope.put(self.alloc, "recorded_at_ms", .{ .integer = io_mod.milliTimestamp() });
         try envelope.put(self.alloc, "value", value);
         if (self.review_fence) |fence| {
             try envelope.put(self.alloc, "review_job", .{ .string = fence.job });
@@ -1519,31 +1588,58 @@ pub const Manager = struct {
         return self.revision(task.branch);
     }
 
-    pub fn failedReviewCandidate(self: Manager, task: Task) !?[]const u8 {
+    pub fn retainedReviewCandidate(self: Manager, task: Task) !?[]const u8 {
         var candidate: ?[]const u8 = null;
         var candidate_at: i64 = -1;
         var failure_at: i64 = -1;
+        var actor_at: i64 = -1;
+        var assessment_at: i64 = -1;
+        var assessment_fulfilled = false;
+        var candidate_stamped = false;
         for (try self.taskHistory(task, try self.currentRevision(task))) |bytes| {
             const entry = try parse(self.alloc, std.json.Value, bytes);
             if (entry != .object) continue;
             const kind = entry.object.get("kind") orelse continue;
             const version_value = entry.object.get("contract_version") orelse continue;
             if (kind != .string or version_value != .integer or version_value.integer != task.definition.version) continue;
-            if (!std.mem.eql(u8, kind.string, "review_candidate") and !std.mem.eql(u8, kind.string, "review_failure")) continue;
+            const recorded = entry.object.get("recorded_at_ms");
+            if (std.mem.eql(u8, kind.string, "action_intent")) {
+                if (recorded) |at| if (at == .integer) {
+                    actor_at = @max(actor_at, at.integer);
+                };
+                continue;
+            }
             const value = entry.object.get("value") orelse continue;
             if (value != .object) continue;
             const at = value.object.get("at_ms") orelse continue;
             if (at != .integer) continue;
+            if (std.mem.eql(u8, kind.string, "review_assessment") and at.integer >= assessment_at) {
+                const decision = (std.json.parseFromSlice(std.json.Value, self.alloc, model.text(value, "data"), .{}) catch continue).value;
+                const obligations = model.items(decision, "obligations");
+                assessment_fulfilled = obligations.len > 0;
+                for (obligations) |obligation| if (!std.mem.eql(u8, model.text(obligation, "status"), "met")) {
+                    assessment_fulfilled = false;
+                };
+                assessment_at = at.integer;
+            }
             if (std.mem.eql(u8, kind.string, "review_failure")) {
                 failure_at = @max(failure_at, at.integer);
-            } else if (at.integer >= candidate_at) {
+            } else if (std.mem.eql(u8, kind.string, "review_candidate") and at.integer >= candidate_at) {
                 const text = value.object.get("text") orelse continue;
                 if (text != .string) continue;
                 candidate = text.string;
                 candidate_at = at.integer;
+                candidate_stamped = recorded != null and recorded.? == .integer;
             }
         }
-        return if (failure_at >= candidate_at) candidate else null;
+        if (candidate == null or actor_at > candidate_at) return null;
+        if (failure_at >= candidate_at) return candidate;
+        // An abrupt stop can precede both the assessment and its failure
+        // record. Resume that retained answer through independent verification.
+        // A completed non-fulfilled verdict still sends unfinished work back
+        // to the actor; a candidate alone can never establish completion.
+        if (candidate_stamped and (assessment_at < candidate_at or assessment_fulfilled)) return candidate;
+        return null;
     }
 
     pub fn readContent(self: Manager, task: Task, path: []const u8) ![]const u8 {
@@ -2247,13 +2343,14 @@ pub const Manager = struct {
         while (branch_lines.next()) |raw| {
             const branch = std.mem.trim(u8, raw, " *\r\t");
             if (branch.len == 0) continue;
-            if (!std.mem.eql(u8, branch, "trunk") and !std.mem.eql(u8, branch, company_branch) and !std.mem.eql(u8, branch, schedule_branch) and !(std.mem.startsWith(u8, branch, "task/") and safeId(branch[5..])) and !(std.mem.startsWith(u8, branch, "definition/") and safeId(branch[11..]))) return error.UnexpectedWorkspaceBranch;
+            if (!std.mem.eql(u8, branch, "trunk") and !std.mem.eql(u8, branch, company_branch) and !std.mem.eql(u8, branch, runtime_branch) and !std.mem.eql(u8, branch, schedule_branch) and !(std.mem.startsWith(u8, branch, "task/") and safeId(branch[5..])) and !(std.mem.startsWith(u8, branch, "definition/") and safeId(branch[11..]))) return error.UnexpectedWorkspaceBranch;
             const listing = try self.run(null, &.{ "ls", "-r", branch, "-R", self.repository });
             var files = std.mem.splitScalar(u8, listing, '\n');
             while (files.next()) |raw_path| {
                 const path = std.mem.trim(u8, raw_path, "\r");
                 if (path.len == 0) continue;
                 if (!allowedPath(path) and !std.mem.eql(u8, path, "registry.json")) return unexpectedEntry("checkout inventory", path);
+                if (std.mem.startsWith(u8, path, "runtime/sessions/")) try self.validateSessionBinding(try parse(self.alloc, SessionBinding, try self.contentAt(path, branch)), path);
                 if (std.mem.eql(u8, branch, company_branch)) {
                     const entity: ?[]const u8 = if (std.mem.eql(u8, path, "authority/state.json")) "omos_company_authority" else if (std.mem.startsWith(u8, path, "company/views/")) "omos_workspace_view" else if (std.mem.startsWith(u8, path, "company/operations/")) "omos_company_operation" else null;
                     if (entity) |kind| {
@@ -2631,7 +2728,8 @@ pub const Manager = struct {
             const bytes = self.run(null, &.{ "cat", try self.taskPath(branch[5..]), "-r", branch, "-R", self.repository }) catch continue;
             const canonical = try parse(self.alloc, Task, bytes);
             const previous = self.loadTask(canonical.id) catch null;
-            if (previous == null or previous.?.definition.version < canonical.definition.version) try self.saveTask(canonical);
+            if (previous == null or (previous.?.definition.version <= canonical.definition.version and previous.?.state != .publication_pending)) try self.saveTask(canonical);
+            try fault("registry-task-restored");
         }
         for (try self.tasks()) |task| {
             var current = task;
@@ -2661,9 +2759,14 @@ pub const Manager = struct {
 
     fn restoreRegistry(self: Manager) !void {
         const marker = try join(self.alloc, self.root, "restore.pending");
-        if ((try self.tasks()).len != 0 and !exists(marker)) return;
+        if ((try self.tasks()).len != 0 and exists(try join(self.alloc, self.root, "sessions")) and !exists(marker)) return;
+        try atomicWrite(self.alloc, marker, "Rebuild task and session indexes from retained Fossil records.");
         const bytes = self.run(null, &.{ "cat", "registry.json", "-r", "trunk", "-R", self.repository }) catch {
             try self.rebuildBranches(false);
+            try self.restoreSessionBindings();
+            try mkdir(try join(self.alloc, self.root, "tasks"));
+            try mkdir(try join(self.alloc, self.root, "sessions"));
+            try remove(marker);
             return;
         };
         const registry = try parse(self.alloc, PortableRegistry, bytes);
@@ -2683,6 +2786,9 @@ pub const Manager = struct {
             try atomicWrite(self.alloc, try join(self.alloc, try join(self.alloc, self.root, "sessions"), binding.session), binding.task);
         }
         try self.rebuildBranches(true);
+        try self.restoreSessionBindings();
+        try mkdir(try join(self.alloc, self.root, "tasks"));
+        try mkdir(try join(self.alloc, self.root, "sessions"));
         try remove(marker);
     }
 
@@ -2908,6 +3014,21 @@ pub const Manager = struct {
                 return filter == null or std.mem.eql(u8, filter.?, kind);
             }
         }.check;
+        if (matches(entity, "omos_event")) {
+            const branches = try self.run(null, &.{ "branch", "list", "--all", "-R", self.repository });
+            var lines = std.mem.splitScalar(u8, branches, '\n');
+            while (lines.next()) |line| if (std.mem.eql(u8, std.mem.trim(u8, line, " *\r\t"), runtime_branch)) {
+                const runtime_revision = try self.revision(runtime_branch);
+                for (try self.inventory(runtime_revision)) |path| {
+                    if (!std.mem.startsWith(u8, path, "runtime/sessions/")) continue;
+                    const binding = try parse(self.alloc, SessionBinding, try self.contentAt(path, runtime_revision));
+                    try self.validateSessionBinding(binding, path);
+                    if (task) |selected| if (!std.mem.eql(u8, selected.id, binding.task)) continue;
+                    try rows.append(self.alloc, try parse(self.alloc, std.json.Value, try json(self.alloc, .{ .entity = "omos_event", .id = try hash(self.alloc, path), .data = binding, .source_path = path, .revision = runtime_revision })));
+                }
+                break;
+            };
+        }
         if (matches(entity, "omos_task")) for (try self.tasks()) |item| try rows.append(self.alloc, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = "omos_task", .id = item.id, .revision = try self.currentRevision(item), .data = .{ .objective = item.definition.objective, .state = @tagName(item.state), .contract = item.definition, .basis = item.model_basis } }), .{})).value);
         if (matches(entity, "omos_capability")) {
             if (try self.modelBasis(revision_id)) |basis| {
@@ -3152,7 +3273,7 @@ fn allowedPath(path: []const u8) bool {
     while (parts.next()) |part| {
         if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..") or part[0] == '.') return false;
     }
-    for ([_][]const u8{ "memory/", "skills/", "artifacts/", "ui/", "documents/", "history/", "tasks/", "imports/", "acceptances/", "omniform/", "execution/", "records/", "proposals/", "activations/", "jobs/", "schedules/", "authority/", "company/" }) |prefix| {
+    for ([_][]const u8{ "memory/", "skills/", "artifacts/", "ui/", "documents/", "history/", "tasks/", "imports/", "acceptances/", "omniform/", "execution/", "records/", "proposals/", "activations/", "jobs/", "schedules/", "authority/", "company/", "runtime/" }) |prefix| {
         if (std.mem.startsWith(u8, path, prefix)) return true;
     }
     return std.mem.eql(u8, path, manifest_path);

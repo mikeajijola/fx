@@ -52,7 +52,7 @@ pub const Turn = struct {
         if (task.state == .conflict) return error.WorkspaceMergeConflict;
         if (task.state == .accepted) task = try manager.start(session, project, prompt, parent);
         turn.task = try manager.setState(task.id, .active);
-        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, prompt, " \t\r\n"), "continue")) turn.review_only_candidate = try manager.failedReviewCandidate(turn.task);
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, prompt, " \t\r\n"), "continue")) turn.review_only_candidate = try manager.retainedReviewCandidate(turn.task);
         if (parent_session == null and !std.mem.eql(u8, prompt, task.definition.objective)) {
             turn.task = try manager.amend(task, prompt);
         }
