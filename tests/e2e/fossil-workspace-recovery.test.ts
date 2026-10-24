@@ -47,6 +47,59 @@ async function startWorkspaceService(f: ReturnType<typeof fixture>, writable = f
 
 // These fault, boundary, migration, and authority cases qualify the candidate without training it.
 describe("portable Fossil workspace recovery", () => {
+  test("fences shared task execution across sessions and releases ownership after a crashed runtime", async () => {
+    const f = fixture();
+    let phase = "setup";
+    let taskId = "";
+    let held = false;
+    let entered!: () => void;
+    let release!: () => void;
+    const reviewing = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const inference = model(f, () => ({ content: "The informational answer is retained." }), async packet => {
+      if (phase === "setup") return { name: "omos_contract_assessment", args: { contractId: packet.contract.id, version: packet.contract.version, obligations: [{ id: "request_complete", status: "met", evidence: ["unseen-fixture"], note: "Retain the candidate for this fixture" }] } };
+      if (!held && phase === "hold" && packet.contract.id === taskId) { held = true; entered(); await gate; }
+      return "met";
+    });
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const first = await f.run(["ask", "Give a first retained answer", "--json"]);
+    const second = await f.run(["ask", "Give a second retained answer", "--json"]);
+    expect(first.code).toBe(1);
+    expect(second.code).toBe(1);
+    const firstSession = JSON.parse(first.stdout).session_id;
+    const secondSession = JSON.parse(second.stdout).session_id;
+    const tasks = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks;
+    const task = tasks.find((item: any) => item.session === createHash("sha256").update(firstSession).digest("hex"));
+    taskId = task.id;
+    const native = new NativeClient({ binary: join(import.meta.dir, "../../zig-out/bin/fx"), project: f.cwd, env: { ...process.env, ...f.env } });
+    let child: ReturnType<typeof Bun.spawn> | undefined;
+    try {
+      const fullRevision = () => f.fossil("timeline", "ancestors", task.branch, "--limit", "1", "--format", "%H", "--quiet").split("\n")[0].trim();
+      expect((await native.request("task.resume", { session: secondSession, task: task.id, revision: fullRevision() })).id).toBe(task.id);
+      phase = "hold";
+      child = Bun.spawn([join(import.meta.dir, "../../zig-out/bin/fx"), "ask", "--resume-id", firstSession, "continue", "--json"], { cwd: f.cwd, env: { ...process.env, ...f.env }, stdout: "pipe", stderr: "pipe" });
+      await Promise.race([reviewing, Bun.sleep(30000).then(() => { throw Error("The owning runtime never reached assessment"); })]);
+      const calls = inference.counts();
+      const contested = await f.run(["ask", "--resume-id", secondSession, "continue", "--json"]);
+      expect(contested.code).toBe(1);
+      expect(contested.stdout + contested.stderr).toContain("WorkspaceExecutionBusy");
+      expect(inference.counts()).toEqual(calls);
+      await expect(native.request("task.resume", { session: "another-session", task: task.id, revision: fullRevision() })).rejects.toThrow("WorkspaceExecutionBusy");
+      const independent = await f.run(["ask", "Answer an independent informational request", "--json"]);
+      expect(independent.code, independent.stderr).toBe(0);
+      expect(child.exitCode).toBeNull();
+      child.kill("SIGKILL");
+      await child.exited;
+      release();
+      phase = "resume";
+      const actors = inference.counts().actors;
+      const resumed = await f.run(["ask", "--resume-id", secondSession, "continue", "--json"]);
+      expect(resumed.code, resumed.stderr + resumed.stdout).toBe(0);
+      expect(inference.counts().actors).toBe(actors);
+      expect(JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks.find((item: any) => item.id === task.id).state).toBe("accepted");
+    } finally { if (child) { child.kill(); await child.exited; } release(); await native.close(); }
+  }, 180000);
+
   test("resumes verification after an abrupt assessment stop and index loss without repeating completed work", async () => {
     const f = fixture();
     let markReviewing!: () => void;

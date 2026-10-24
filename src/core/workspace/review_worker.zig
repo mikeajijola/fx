@@ -22,6 +22,8 @@ pub fn perform(original: workspace.Manager, job: jobs.Job, model: Model) !void {
     var manager = original;
     manager.expected_revision = null;
     manager.review_fence = .{ .task = job.task, .job = job.id, .generation = job.generation, .owner = job.owner };
+    const execution_lease = (try manager.tryTaskExecutionLease(job.task)) orelse return error.WorkspaceExecutionBusy;
+    defer execution_lease.release();
     const task = try manager.loadTask(job.task);
     try manager.validateTaskBasis(task);
     const candidate = (try manager.retainedReviewCandidate(task)) orelse return error.NoRetainedReviewCandidate;
@@ -127,7 +129,7 @@ pub const Scheduler = struct {
             };
             if (job) |claimed| {
                 self.executor.run(self.executor.context, manager, claimed, &self.stopping) catch |err| {
-                    manager.finishReviewJob(claimed, if (err == error.Cancelled) .queued else if (err == error.StaleWorkContract or err == error.StaleWorkspaceDefinition or err == error.CompanyReconciliationRequired) .changes_required else .failed, @errorName(err)) catch {};
+                    manager.finishReviewJob(claimed, if (err == error.Cancelled or err == error.WorkspaceExecutionBusy) .queued else if (err == error.StaleWorkContract or err == error.StaleWorkspaceDefinition or err == error.CompanyReconciliationRequired) .changes_required else .failed, @errorName(err)) catch {};
                 };
             } else std.Io.sleep(io.getIo(), .fromSeconds(1), .awake) catch {};
         }

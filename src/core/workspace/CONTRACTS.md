@@ -227,6 +227,16 @@ and travel with an ordinary repository copy, independently of the last export.
 They preserve an explicit switch to older work instead of guessing that the
 newest task must be active.
 
+Independent personal sessions can execute concurrently. A task has one kernel
+execution lease shared by CLI turns, UI turns, and the review worker. Selecting
+a task in another session does not duplicate execution ownership. A second
+execution or an attempt to resume actively owned work returns
+`WorkspaceExecutionBusy` before model actions. The kernel releases ownership
+after a process exits or crashes, allowing another session to resume retained
+work. Selecting other work does not pause a task another runtime is executing.
+An idle selected task's paused state is committed with the selection change.
+These leases coordinate runtimes on one host; they are not distributed leases.
+
 When task or session index directories are missing, opening the bound instance
 reconstructs them from canonical task branches, acceptance receipts, and these
 selection events. A durable restore marker makes an interrupted rebuild resume

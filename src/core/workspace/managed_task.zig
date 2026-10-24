@@ -20,6 +20,7 @@ pub const Turn = struct {
     invocation_id: ?[]const u8 = null,
     assessment_record: ?[]const u8 = null,
     filesystem_view: bool = false,
+    execution_lease: ?workspace.ExecutionLease = null,
 
     pub fn begin(alloc: std.mem.Allocator, session: []const u8, parent_session: ?[]const u8, project: []const u8, prompt: []const u8) !?Turn {
         const manager = try workspace.Manager.ensureBound(alloc);
@@ -28,7 +29,8 @@ pub const Turn = struct {
         if (task.authority != null) return error.CompanyExecutionIsolationRequired;
         if (!std.mem.eql(u8, project, task.project_root)) return error.TaskProjectMismatch;
         try manager.validateTaskBasis(task);
-        var turn: Turn = .{ .manager = manager, .task = task };
+        var turn: Turn = .{ .manager = manager, .task = task, .execution_lease = (try manager.tryTaskExecutionLease(task.id)) orelse return error.WorkspaceExecutionBusy };
+        errdefer turn.release();
         var invocation: [16]u8 = undefined;
         @import("../shared/io.zig").getIo().random(&invocation);
         turn.invocation_id = try workspace.hash(alloc, &invocation);
@@ -39,6 +41,7 @@ pub const Turn = struct {
                     _ = try manager.retryPublication(task);
                     try manager.acknowledge(task);
                     task = try manager.start(session, project, prompt, parent);
+                    try turn.selectTask(task);
                 } else {
                     task = try manager.reopenUnpublished(task);
                 }
@@ -50,7 +53,10 @@ pub const Turn = struct {
             }
         }
         if (task.state == .conflict) return error.WorkspaceMergeConflict;
-        if (task.state == .accepted) task = try manager.start(session, project, prompt, parent);
+        if (task.state == .accepted) {
+            task = try manager.start(session, project, prompt, parent);
+            try turn.selectTask(task);
+        }
         turn.task = try manager.setState(task.id, .active);
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, prompt, " \t\r\n"), "continue")) turn.review_only_candidate = try manager.retainedReviewCandidate(turn.task);
         if (parent_session == null and !std.mem.eql(u8, prompt, task.definition.objective)) {
@@ -61,6 +67,20 @@ pub const Turn = struct {
         try @import("filesystem_projection.zig").prepare(manager, turn.task);
         turn.filesystem_view = true;
         return turn;
+    }
+
+    fn selectTask(self: *Turn, task: workspace.Task) !void {
+        if (!std.mem.eql(u8, task.id, self.task.id)) {
+            const lease = (try self.manager.tryTaskExecutionLease(task.id)) orelse return error.WorkspaceExecutionBusy;
+            self.release();
+            self.execution_lease = lease;
+        }
+        self.task = task;
+    }
+
+    pub fn release(self: *Turn) void {
+        if (self.execution_lease) |lease| lease.release();
+        self.execution_lease = null;
     }
 
     // Checkpoints and reviews share these retained-evidence traversal paths.

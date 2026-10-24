@@ -432,6 +432,21 @@ pub const Manager = struct {
         return .{ .file = file, .shared = gate };
     }
 
+    /// Session selections can share retained work, but only one runtime owns
+    /// execution of a task. Kernel ownership also fences interrupted reviews.
+    pub fn tryTaskExecutionLease(self: Manager, id: []const u8) !?ExecutionLease {
+        if (!safeId(id)) return error.InvalidTaskId;
+        try mkdir(self.root);
+        const path = try join(self.alloc, self.root, try self.alloc.print("task-actor-{s}.lock", .{id}));
+        const file = try std.Io.Dir.cwd().createFile(io_mod.getIo(), path, .{ .truncate = false, .permissions = .fromMode(0o600) });
+        errdefer file.close(io_mod.getIo());
+        if (!try file.tryLock(io_mod.getIo(), .exclusive)) {
+            file.close(io_mod.getIo());
+            return null;
+        }
+        return .{ .file = file };
+    }
+
     const company_branch = "omos-company";
     const runtime_branch = "omos-runtime";
     pub const CompanyFile = struct { path: []const u8, content: []const u8 };
@@ -847,6 +862,8 @@ pub const Manager = struct {
         for (try self.tasks()) |loaded| {
             var task = loaded;
             if (task.state == .accepted or task.state == .conflict) continue;
+            const task_lease = (try self.tryTaskExecutionLease(task.id)) orelse continue;
+            defer task_lease.release();
             try self.drain(task);
             if (task.state == .publication_pending and try self.publicationCommitted(task)) {
                 _ = try self.finishPublication(try parse(self.alloc, Publication, try read(self.alloc, try self.publicationPath(task.id))));
@@ -1337,13 +1354,7 @@ pub const Manager = struct {
         if (goal.len > max_bytes or !std.unicode.utf8ValidateSlice(goal)) return error.WorkspaceGoalTooLarge;
         const lease = try Lease.acquire(self.alloc, self.root);
         defer lease.release();
-        if (try self.active(session)) |previous| {
-            if (previous.state != .accepted and previous.state != .publication_pending and previous.state != .conflict) {
-                var paused = previous;
-                paused.state = .paused;
-                try self.saveTask(paused);
-            }
-        }
+        try self.pauseSelectedTask(session, null);
         var nonce: [16]u8 = undefined;
         io_mod.getIo().random(&nonce);
         const id = try hash(self.alloc, &nonce);
@@ -1391,21 +1402,36 @@ pub const Manager = struct {
     pub fn resumeTask(self: Manager, session: []const u8, id: []const u8, project: []const u8) !Task {
         const lease = try Lease.acquire(self.alloc, self.root);
         defer lease.release();
+        const task_lease = (try self.tryTaskExecutionLease(id)) orelse return error.WorkspaceExecutionBusy;
+        defer task_lease.release();
         var task = try self.loadTask(id);
         try self.checkExpectedRevision(task.branch);
         if (!std.mem.eql(u8, project, task.project_root)) return error.TaskProjectMismatch;
         if (task.state == .accepted and !try self.publicationPending(task)) return error.TaskAlreadyAccepted;
-        if (try self.active(session)) |previous| {
-            if (!std.mem.eql(u8, previous.id, id) and previous.state != .accepted and previous.state != .publication_pending and previous.state != .conflict) {
-                var paused = previous;
-                paused.state = .paused;
-                try self.saveTask(paused);
-            }
-        }
+        try self.pauseSelectedTask(session, id);
         if (task.state != .publication_pending and task.state != .accepted) task.state = .active;
         try self.saveTask(task);
         try self.selectSession(session, task);
         return task;
+    }
+
+    // Caller holds the writer lease. Selecting other work cannot pause a task
+    // another session or reviewer is executing, or modify its assessed branch.
+    fn pauseSelectedTask(self: Manager, session: []const u8, selected: ?[]const u8) !void {
+        var previous = (try self.active(session)) orelse return;
+        if (selected) |id| if (std.mem.eql(u8, previous.id, id)) return;
+        if (previous.state == .accepted or previous.state == .publication_pending or previous.state == .conflict) return;
+        const execution_lease = (try self.tryTaskExecutionLease(previous.id)) orelse return;
+        defer execution_lease.release();
+        if (previous.review_job) |id| {
+            const job = try self.loadReviewJob(previous, id);
+            if (job.state == .queued or job.state == .running) return;
+        }
+        try self.drain(previous);
+        previous = try self.loadTask(previous.id);
+        previous.state = .paused;
+        try self.saveTask(previous);
+        try self.retainTaskState(previous);
     }
 
     pub fn storeLocalCheckpoint(self: Manager, task: Task, bytes: []const u8) !void {
@@ -1622,15 +1648,19 @@ pub const Manager = struct {
             if (job.state == .queued or job.state == .running) return error.TaskReviewInProgress;
         };
         if (latest.state != .accepted and latest.state != .publication_pending) {
-            const tree = try self.checkout(task.branch);
-            const path = try join(self.alloc, tree, try self.taskPath(task.id));
-            const bytes = try json(self.alloc, latest);
-            if (!std.mem.eql(u8, bytes, try read(self.alloc, path))) {
-                try atomicWrite(self.alloc, path, bytes);
-                _ = try self.commit(tree, "Retain task state");
-            }
+            try self.retainTaskState(latest);
         }
         return self.revision(task.branch);
+    }
+
+    fn retainTaskState(self: Manager, task: Task) !void {
+        const tree = try self.checkout(task.branch);
+        const path = try join(self.alloc, tree, try self.taskPath(task.id));
+        const bytes = try json(self.alloc, task);
+        if (!std.mem.eql(u8, bytes, try read(self.alloc, path))) {
+            try atomicWrite(self.alloc, path, bytes);
+            _ = try self.commit(tree, "Retain task state");
+        }
     }
 
     pub fn content(self: Manager, task: Task, path: []const u8) ![]const u8 {
@@ -2609,6 +2639,7 @@ pub const Manager = struct {
     }
 
     fn acceptedPublication(self: Manager, task: Task) !Publication {
+        if (comptime builtin.target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
         const source = try self.currentRevision(task);
         const operation = try hash(self.alloc, try json(self.alloc, .{ task.id, source, task.definition.version, task.parent }));
         const bytes = self.contentAt(try self.alloc.print("acceptances/{s}.json", .{operation}), task.parent) catch |err| switch (err) {

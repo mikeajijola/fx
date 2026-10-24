@@ -7152,8 +7152,11 @@ fn processQueuedPromptLoop(
         try managed_task.Turn.begin(arena, config.fossil_session_id.?, config.fossil_parent_session_id, config.workspace_root, job.prompt)
     else
         null;
-    defer if (managed) |*turn| turn.retain() catch |err| {
-        deps.push_system_notice(deps.ctx, @errorName(err)) catch {};
+    defer if (managed) |*turn| {
+        defer turn.release();
+        turn.retain() catch |err| {
+            deps.push_system_notice(deps.ctx, @errorName(err)) catch {};
+        };
     };
     if (managed) |turn| {
         if (turn.recovered_candidate) |candidate| {
