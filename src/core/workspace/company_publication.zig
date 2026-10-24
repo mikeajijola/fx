@@ -23,6 +23,7 @@ pub const Claims = struct {
     epoch: u64,
     issued_ms: i64,
     approval_sha256: ?[]const u8 = null,
+    reads_sha256: ?[]const u8 = null,
 };
 pub const Proof = struct { payload: []const u8, signature: []const u8, issuer: []const u8 };
 

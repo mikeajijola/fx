@@ -44,6 +44,7 @@ pub const Task = struct {
     revision_pending: bool = false,
     planned_amendments: usize = 0,
     dependencies: []const ReadDependency = &.{},
+    company_reads: []const @import("company_reads.zig").Reference = &.{},
     model_basis: ?model.Basis = null,
     review_job: ?[]const u8 = null,
     authority: ?@import("company_authority.zig").Binding = null,
@@ -510,7 +511,7 @@ pub const Manager = struct {
         const declaration = try self.loadDeclaration(basis.revision);
         for (files, 0..) |file, index| {
             if (!allowedPath(file.path) or (!std.mem.startsWith(u8, file.path, "authority/") and !std.mem.startsWith(u8, file.path, "company/"))) return error.WorkspacePathDenied;
-            const entity = if (std.mem.eql(u8, file.path, "authority/state.json")) "omos_company_authority" else if (std.mem.startsWith(u8, file.path, "company/views/")) "omos_workspace_view" else if (std.mem.startsWith(u8, file.path, "company/operations/")) "omos_company_operation" else if (std.mem.startsWith(u8, file.path, "company/approvals/")) "omos_company_approval" else return error.WorkspacePathDenied;
+            const entity = if (std.mem.eql(u8, file.path, "authority/state.json")) "omos_company_authority" else if (std.mem.startsWith(u8, file.path, "company/views/")) "omos_workspace_view" else if (std.mem.startsWith(u8, file.path, "company/operations/")) "omos_company_operation" else if (std.mem.startsWith(u8, file.path, "company/approvals/")) "omos_company_approval" else if (std.mem.startsWith(u8, file.path, "company/reads/")) "omos_company_read" else if (std.mem.startsWith(u8, file.path, "company/submissions/")) "omos_company_submission" else return error.WorkspacePathDenied;
             try model.validateRecord(declaration.semantic, entity, try parse(self.alloc, std.json.Value, file.content), true);
             if (file.content.len > max_bytes) return error.WorkspaceRecordTooLarge;
             for (files[0..index]) |previous| if (std.mem.eql(u8, previous.path, file.path)) return error.DuplicateWorkspacePath;
@@ -524,6 +525,7 @@ pub const Manager = struct {
         }
         const revision_id = if ((try self.run(tree, &.{ "changes", "--hash", "--differ" })).len == 0 and (try self.run(tree, &.{ "extras", "--dotfiles" })).len == 0) try self.revision(company_branch) else try self.commit(tree, "Record company operation outcome");
         try @import("company_keys.zig").observe(self);
+        for (files) |file| if (std.mem.startsWith(u8, file.path, "company/submissions/")) try fault("company-submission-prepared");
         return revision_id;
     }
 
@@ -570,6 +572,27 @@ pub const Manager = struct {
         try atomicWrite(self.alloc, try join(self.alloc, tree, try self.taskPath(task.id)), try json(self.alloc, task));
         _ = try self.commit(tree, "Bind company task authority");
         try self.saveTask(task);
+        return task;
+    }
+
+    pub fn freezeCompanyReads(self: Manager, previous: Task, references: []const @import("company_reads.zig").Reference) !Task {
+        if (!self.company_operation_held) return error.CompanyOperationLeaseRequired;
+        if (references.len > 100) return error.CompanyReadSetTooLarge;
+        const lease = try Lease.acquire(self.alloc, self.root);
+        defer lease.release();
+        var task = try self.loadTask(previous.id);
+        if (task.authority == null) return error.CompanyAccessDenied;
+        if (task.state == .accepted or task.state == .publication_pending) return error.TaskIsReadOnly;
+        const frozen = try self.alloc.dupe(@import("company_reads.zig").Reference, references);
+        const control = (try self.companyRevision()) orelse return error.CompanyNotInitialized;
+        for (frozen) |*reference| if (reference.revision.len == 0) {
+            reference.revision = control;
+        };
+        try @import("company_reads.zig").validate(self, task, frozen, try self.revision(task.parent));
+        task.company_reads = frozen;
+        try self.retainTaskState(task);
+        try self.saveTask(task);
+        try fault("company-reads-frozen");
         return task;
     }
 
@@ -1770,6 +1793,7 @@ pub const Manager = struct {
         var task = try self.loadTask(previous.id);
         if (task.state == .publication_pending or task.state == .accepted) return error.TaskIsReadOnly;
         const parent_revision = try self.revision(task.parent);
+        try @import("company_reads.zig").validate(self, task, task.company_reads, parent_revision);
         if (try self.sameRevision(parent_revision, task.base_revision)) return task;
         try self.ensureMergeable(task, try self.revision(task.branch), parent_revision);
         const tree = try self.checkout(task.branch);
@@ -1792,6 +1816,7 @@ pub const Manager = struct {
         try atomicWrite(self.alloc, try join(self.alloc, tree, try self.taskPath(task.id)), try json(self.alloc, task));
         _ = try self.commit(tree, "Refresh task workspace dependencies");
         try self.saveTask(task);
+        if (task.authority != null) try fault("company-submission-refreshed");
         return task;
     }
 
@@ -1824,6 +1849,7 @@ pub const Manager = struct {
     }
 
     fn validateDependencies(self: Manager, task: Task) !void {
+        try @import("company_reads.zig").validate(self, task, task.company_reads, try self.revision(task.parent));
         if (task.parent_task_id) |id| {
             const parent = try self.loadTask(id);
             if (task.parent_contract_version != parent.definition.version) return error.ParentContractChanged;
@@ -2532,8 +2558,9 @@ pub const Manager = struct {
 
     fn verifyFile(self: Manager, path: []const u8, bytes: []const u8, declaration: ?model.Declaration) !void {
         if (std.mem.startsWith(u8, path, "runtime/sessions/")) try self.validateSessionBinding(try parse(self.alloc, SessionBinding, bytes), path);
+        if (std.mem.startsWith(u8, path, "company/reads/")) try self.checkHistoryHash(path, bytes);
         if (declaration) |definition| {
-            const entity: ?[]const u8 = if (std.mem.eql(u8, path, "authority/state.json")) "omos_company_authority" else if (std.mem.startsWith(u8, path, "company/views/")) "omos_workspace_view" else if (std.mem.startsWith(u8, path, "company/operations/")) "omos_company_operation" else if (std.mem.startsWith(u8, path, "company/approvals/")) "omos_company_approval" else null;
+            const entity: ?[]const u8 = if (std.mem.eql(u8, path, "authority/state.json")) "omos_company_authority" else if (std.mem.startsWith(u8, path, "company/views/")) "omos_workspace_view" else if (std.mem.startsWith(u8, path, "company/operations/")) "omos_company_operation" else if (std.mem.startsWith(u8, path, "company/approvals/")) "omos_company_approval" else if (std.mem.startsWith(u8, path, "company/reads/")) "omos_company_read" else if (std.mem.startsWith(u8, path, "company/submissions/")) "omos_company_submission" else null;
             if (entity) |kind| {
                 try model.validateRecord(definition.semantic, kind, try parse(self.alloc, std.json.Value, bytes), true);
                 if (std.mem.eql(u8, kind, "omos_company_authority")) {
@@ -2622,7 +2649,7 @@ pub const Manager = struct {
                 if (!allowedPath(path) and !std.mem.eql(u8, path, "registry.json")) return unexpectedEntry("checkout inventory", path);
                 if (file.mode == .symlink) return error.WorkspaceSymlinkDenied;
                 const size = lengths.get(path) orelse return error.WorkspaceVerificationFailed;
-                const needs_body = std.mem.startsWith(u8, path, "runtime/sessions/") or std.mem.startsWith(u8, path, "artifacts/") or std.mem.startsWith(u8, path, "acceptances/") or std.mem.startsWith(u8, path, "history/") or (company and (std.mem.eql(u8, path, "authority/state.json") or std.mem.startsWith(u8, path, "company/views/") or std.mem.startsWith(u8, path, "company/operations/") or std.mem.startsWith(u8, path, "company/approvals/")));
+                const needs_body = std.mem.startsWith(u8, path, "runtime/sessions/") or std.mem.startsWith(u8, path, "artifacts/") or std.mem.startsWith(u8, path, "acceptances/") or std.mem.startsWith(u8, path, "history/") or (company and (std.mem.eql(u8, path, "authority/state.json") or std.mem.startsWith(u8, path, "company/views/") or std.mem.startsWith(u8, path, "company/operations/") or std.mem.startsWith(u8, path, "company/approvals/") or std.mem.startsWith(u8, path, "company/reads/") or std.mem.startsWith(u8, path, "company/submissions/")));
                 if (!needs_body) continue;
                 var digest = std.crypto.hash.sha2.Sha256.init(.{});
                 digest.update(if (company) "company" else "content");
@@ -2746,7 +2773,7 @@ pub const Manager = struct {
         const state = try record_json.decode(@import("company_authority.zig").State, self.alloc, try self.contentAt("authority/state.json", authority_revision), .{});
         const grant = try @import("company_authority.zig").liveGrant(state, binding.grant, issued_ms);
         const approval = if (grant.human_approval) try @import("company_approval.zig").authorize(self, publication.task, publication.source, authority_revision, state, issued_ms) else null;
-        return .{ .workspace = self.manifest.id, .actor = binding.actor, .grant = binding.grant, .operation = publication.operation, .task = publication.task.id, .source = publication.source, .target = publication.target, .target_base = publication.task.base_revision, .contract_sha256 = try hash(self.alloc, try json(self.alloc, publication.task.definition)), .candidate_sha256 = try hash(self.alloc, publication.review.candidate), .assessment_sha256 = try hash(self.alloc, publication.review.assessment), .authority_revision = authority_revision, .epoch = epoch, .issued_ms = issued_ms, .approval_sha256 = approval };
+        return .{ .workspace = self.manifest.id, .actor = binding.actor, .grant = binding.grant, .operation = publication.operation, .task = publication.task.id, .source = publication.source, .target = publication.target, .target_base = publication.task.base_revision, .contract_sha256 = try hash(self.alloc, try json(self.alloc, publication.task.definition)), .candidate_sha256 = try hash(self.alloc, publication.review.candidate), .assessment_sha256 = try hash(self.alloc, publication.review.assessment), .authority_revision = authority_revision, .epoch = epoch, .issued_ms = issued_ms, .approval_sha256 = approval, .reads_sha256 = if (publication.task.company_reads.len == 0) null else try hash(self.alloc, try json(self.alloc, publication.task.company_reads)) };
     }
 
     fn verifyPublication(self: Manager, publication: Publication) !void {
@@ -2756,6 +2783,7 @@ pub const Manager = struct {
             const claims = try company_publication.verify(self, proof);
             const expected = try self.publicationClaims(publication, claims.authority_revision, claims.epoch, claims.issued_ms);
             if (!std.mem.eql(u8, try json(self.alloc, claims), try json(self.alloc, expected))) return error.WorkspaceVerificationFailed;
+            try @import("company_reads.zig").validate(self, publication.task, publication.task.company_reads, publication.task.base_revision);
         } else if (publication.version >= 2 and publication.task.authority != null) return error.CompanyPublicationProofRequired;
     }
 

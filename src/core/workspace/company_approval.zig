@@ -22,6 +22,7 @@ pub const Candidate = struct {
     definition_sha256: []const u8,
     candidate_sha256: []const u8,
     changes_sha256: []const u8,
+    reads_sha256: ?[]const u8 = null,
 };
 pub const Decision = struct {
     version: []const u8 = "omos.company-approval/v1",
@@ -105,6 +106,7 @@ pub fn candidate(manager: workspace.Manager, task: workspace.Task, revision: []c
         .definition_sha256 = try workspace.hash(manager.alloc, try encode(manager.alloc, task.model_basis)),
         .candidate_sha256 = try workspace.hash(manager.alloc, answer),
         .changes_sha256 = changes,
+        .reads_sha256 = if (task.company_reads.len == 0) null else try workspace.hash(manager.alloc, try encode(manager.alloc, task.company_reads)),
     };
 }
 

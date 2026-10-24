@@ -1328,7 +1328,8 @@
             "grant": "string",
             "task": "string",
             "base": "string",
-            "pending": "json"
+            "pending": "json",
+            "reads": "json"
           },
           "required": [
             "id",
@@ -1397,6 +1398,61 @@
             "payload",
             "signature",
             "issuer"
+          ]
+        },
+        {
+          "id": "omos_company_read",
+          "fields": {
+            "version": "string",
+            "workspace": "string",
+            "task": "string",
+            "actor": "string",
+            "grant": "string",
+            "selector": "string",
+            "revision": "string",
+            "base_revision": "string",
+            "paths": "json",
+            "kind": "string",
+            "entity": "json",
+            "membership_hash": "json",
+            "base_membership_hash": "json",
+            "files": "json"
+          },
+          "required": [
+            "version",
+            "workspace",
+            "task",
+            "actor",
+            "grant",
+            "selector",
+            "revision",
+            "base_revision",
+            "paths",
+            "kind",
+            "files"
+          ]
+        },
+        {
+          "id": "omos_company_submission",
+          "fields": {
+            "version": "string",
+            "task": "string",
+            "operation": "string",
+            "request_hash": "string",
+            "revision": "string",
+            "contract_hash": "string",
+            "candidate_hash": "string",
+            "reads": "json"
+          },
+          "required": [
+            "version",
+            "task",
+            "operation",
+            "request_hash",
+            "revision",
+            "contract_hash",
+            "candidate_hash",
+            "reads"
           ]
         }
       ],

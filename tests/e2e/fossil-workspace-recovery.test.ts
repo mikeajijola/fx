@@ -451,8 +451,11 @@ sys.exit(result.returncode)
       expect(boot.features.typed_records).toBe("custom_entities");
       expect(boot.revision).toHaveLength(64);
       const aliasRead = await post(envelope("read", { revision: boot.revision, path: privateAlias }));
-      expect(aliasRead.status).toBe(400);
-      expect((await aliasRead.json() as any).content).toBeUndefined();
+      expect(aliasRead.status).toBe(200);
+      const missingAlias = await unpack(aliasRead);
+      expect(missingAlias.exists).toBe(false);
+      expect(missingAlias.sha256).toBeNull();
+      expect(missingAlias.content).toBe("");
       expect((await post(envelope("read", { revision: boot.revision, path: privatePath }))).status).toBe(403);
       const view = await send("create_view", { revision: boot.revision, objective: "Save the updated alpha note and the complete large note" });
       const first = await send("record", { view: view.view, revision: view.revision, entity: "company_note", record_id: "alpha", content: JSON.stringify({ text: "First alpha" }) });
@@ -773,6 +776,282 @@ sys.exit(result.returncode)
       expect(f.fossil("cat", "documents/team/report.md", "-r", "trunk")).toBe("Approved team report");
     } finally { await stop(); }
   }, 180000);
+
+  test("recovers submission preparation, frozen reads and refreshed integration without replaying actors or changing its inputs", async () => {
+    for (const stage of ["company-submission-prepared", "company-reads-frozen", "company-submission-refreshed"]) {
+      const f = fixture();
+      const inference = model(f, (_body, count) => count === 1 ? writeMemory("Independent accepted state") : { content: "Retained the independent company note." });
+      expect((await f.run(["fossil", "init"])).code).toBe(0);
+      const admin = async (body: object) => {
+        const file = join(f.home, "operator.json");
+        writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+        const result = await f.run(["fossil", "company", file, "--json"]);
+        expect(result.code, result.stderr).toBe(0);
+        return JSON.parse(result.stdout).model_data;
+      };
+      const initialized = await admin({ action: "initialize" });
+      const key = generateKeyPairSync("ed25519");
+      await admin({ action: "grant", revision: initialized.revision, grant: { id: "worker", actor: "worker", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["documents/team/"], actions: ["create_view", "checkpoint", "read", "submit", "status", "reconcile"], expires_ms: Date.now() + 3600000 } });
+      let service = await startWorkspaceService(f, true, { FX_E2E_FOSSIL_FAULT: stage });
+      const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+      const request = (action: string, params: object = {}) => {
+        const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "worker", grant: "worker", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action, ...params });
+        return { payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") };
+      };
+      const post = (body: object) => fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", connection: "close" }, body: JSON.stringify(body) });
+      const send = async (action: string, params: object = {}) => {
+        const response = await post(request(action, params));
+        const body = await response.json() as any;
+        expect(response.status, JSON.stringify({ stage, action, body })).toBe(200);
+        return JSON.parse(body.payload).result;
+      };
+      try {
+        const view = await send("create_view", { revision: boot.revision, objective: "Save and review the retained report" });
+        const saved = await send("checkpoint", { view: view.view, revision: view.revision, path: "documents/team/report.md", content: "Retained report" });
+        await send("read", { view: view.view, path: "documents/team/report.md" });
+        // Advance accepted state outside the observed scope so refresh has a
+        // real integration commit while the original inputs remain valid.
+        const independent = await f.run(["ask", "Save an independent company note", "--json"]);
+        expect(independent.code, independent.stderr).toBe(0);
+        const actorCount = inference.counts().actors;
+        const original = request("submit", { view: view.view, revision: saved.revision, candidate: "Saved the retained team report." });
+        const rejected = await post(original);
+        expect(rejected.status).toBe(400);
+        expect((await rejected.json() as any).error).toBe("WorkspaceInjectedFailure");
+        const operation = JSON.parse(original.payload).operation;
+        expect((await send("status", { outcome: operation })).state).toBe("uncertain");
+        const requestHash = createHash("sha256").update(original.payload).digest("hex");
+        const intent = JSON.parse(f.fossil("cat", `company/submissions/${view.contract.id}/${requestHash}.json`, "-r", "omos-company"));
+        expect(intent.revision).toBe(saved.revision);
+        expect(intent.reads).toHaveLength(1);
+        // Later inspection must not replace the interrupted proposal's inputs.
+        await send("read", { view: view.view, path: "documents/team/report.md" });
+        service.child.kill(); await service.child.exited;
+        service = await startWorkspaceService(f, true);
+        const recovered = await send("reconcile", { outcome: operation });
+        expect(recovered.state).toBe("completed");
+        const deadline = Date.now() + 60000;
+        let observed: any;
+        while (Date.now() < deadline) {
+          observed = await send("status", { view: view.view });
+          if (observed.job?.state === "published") break;
+          if (["failed", "blocked", "changes_required"].includes(observed.job?.state)) throw Error(JSON.stringify({ stage, observed }));
+          await Bun.sleep(30);
+        }
+        expect(observed.job?.state, JSON.stringify(observed)).toBe("published");
+        const claims = JSON.parse(observed.publication.issuer_proof.payload);
+        expect(claims.reads_sha256).toBe(createHash("sha256").update(JSON.stringify(intent.reads)).digest("hex"));
+        expect(inference.counts().actors).toBe(actorCount);
+        expect(f.fossil("cat", "documents/team/report.md", "-r", "trunk")).toBe("Retained report");
+        expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Independent accepted state");
+      } finally { service.child.kill(); await service.child.exited; }
+    }
+  }, 240000);
+
+  test("preserves legacy company views and requires a declared input model before recording new reads or submissions", async () => {
+    const f = fixture();
+    const inference = model(f, () => ({ content: "Only independent company verification should run." }));
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    // Reconstruct the earlier persisted declaration, including its view shape,
+    // to exercise an upgrade rather than only initializing the newest seed.
+    const legacy = JSON.parse(f.fossil("cat", "omniform/company.json", "-r", "trunk"));
+    legacy.spec.semantic.entityTypes = legacy.spec.semantic.entityTypes.filter((entity: any) => !["omos_company_read", "omos_company_submission"].includes(entity.id));
+    delete legacy.spec.semantic.entityTypes.find((entity: any) => entity.id === "omos_workspace_view").fields.reads;
+    const tree = join(f.home, "legacy-declaration");
+    mkdirSync(tree);
+    const fossil = (...args: string[]) => {
+      const result = spawnSync("fossil", ["--user", "omos", ...args], { cwd: tree, env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, XDG_CONFIG_HOME: f.home, USER: "fixture", LC_ALL: "C" }, encoding: "utf8" });
+      expect(result.status, result.stderr).toBe(0);
+    };
+    fossil("open", join(f.cwd, "omos.fossil"));
+    writeFileSync(join(tree, "omniform/company.json"), JSON.stringify(legacy));
+    fossil("commit", "--nosign", "-m", "Retain the prior company input contracts");
+    fossil("close");
+    const admin = async (body: object) => {
+      const file = join(f.home, "operator.json");
+      writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+      const result = await f.run(["fossil", "company", file, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    const initialized = await admin({ action: "initialize" });
+    const key = generateKeyPairSync("ed25519");
+    await admin({ action: "grant", revision: initialized.revision, grant: { id: "worker", actor: "worker", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["documents/team/"], actions: ["create_view", "checkpoint", "read", "submit", "status"], expires_ms: Date.now() + 3600000 } });
+    const service = await startWorkspaceService(f, true);
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const request = (action: string, params: object = {}) => {
+      const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "worker", grant: "worker", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action, ...params });
+      return { payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") };
+    };
+    const post = (body: object) => fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", connection: "close" }, body: JSON.stringify(body) });
+    const send = async (action: string, params: object = {}) => {
+      const response = await post(request(action, params));
+      const body = await response.json() as any;
+      expect(response.status, JSON.stringify({ action, body })).toBe(200);
+      return JSON.parse(body.payload).result;
+    };
+    try {
+      expect(boot.features.read_dependencies).toBe(false);
+      const view = await send("create_view", { revision: boot.revision, objective: "Retain the company report while upgrading its input model" });
+      const saved = await send("checkpoint", { view: view.view, revision: view.revision, path: "documents/team/report.md", content: "Retained legacy report" });
+      expect(JSON.parse(f.fossil("cat", `company/views/${view.view}.json`, "-r", "omos-company")).reads).toBeUndefined();
+      const beforeRead = (await admin({ action: "status" })).revision;
+      const refused = await post(request("read", { view: view.view, path: "documents/team/report.md" }));
+      expect(refused.status).toBe(400);
+      expect((await refused.json() as any).error).toBe("CompanyDefinitionUpdateRequired");
+      expect((await admin({ action: "status" })).revision).toBe(beforeRead);
+      const original = request("submit", { view: view.view, revision: saved.revision, candidate: "Saved the retained legacy report." });
+      const pending = await post(original);
+      expect(pending.status).toBe(400);
+      expect((await pending.json() as any).error).toBe("CompanyDefinitionUpdateRequired");
+      expect((await send("status", { outcome: JSON.parse(original.payload).operation })).state).toBe("failed");
+      const migration = await f.run(["fossil", "migrate", "--contracts", "--json"]);
+      expect(migration.code, migration.stderr).toBe(0);
+      expect((await (await fetch(service.url + "/v1/company")).json() as any).features.read_dependencies).toBe(true);
+      const read = await send("read", { view: view.view, path: "documents/team/report.md" });
+      expect(read.read_tracking).toBe("recorded");
+      expect(Buffer.from(read.content, "base64").toString()).toBe("Retained legacy report");
+      await send("submit", { view: view.view, revision: saved.revision, candidate: "Saved the retained legacy report." });
+      const deadline = Date.now() + 60000;
+      let state: any;
+      while (Date.now() < deadline) {
+        state = await send("status", { view: view.view });
+        if (state.job?.state === "published") break;
+        if (["failed", "blocked", "changes_required"].includes(state.job?.state)) throw Error(JSON.stringify(state));
+        await Bun.sleep(30);
+      }
+      expect(state.job?.state, JSON.stringify(state)).toBe("published");
+      expect(inference.counts().actors).toBe(0);
+      const verified = await f.run(["fossil", "verify", "--json"]);
+      expect(verified.code, verified.stderr).toBe(0);
+    } finally { service.child.kill(); await service.child.exited; }
+  }, 180000);
+
+  test("retains file, absence and query dependencies without changing view revisions or leaking unrelated membership", async () => {
+    const f = fixture();
+    const inference = model(f, () => ({ content: "Company input verification must not rerun an actor." }));
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const declaration = JSON.parse(f.fossil("cat", "omniform/company.json", "-r", "trunk"));
+    for (const id of ["company_note", "company_todo", "company_stable"]) declaration.spec.semantic.entityTypes.push({ id, fields: { text: "string" }, required: ["text"] });
+    const definition = join(f.home, "company-definition.json");
+    writeFileSync(definition, JSON.stringify(declaration));
+    const proposed = await f.run(["fossil", "definition", "propose", definition, "--json"]);
+    expect(proposed.code, proposed.stderr).toBe(0);
+    const admin = async (body: object) => {
+      const file = join(f.home, "operator.json");
+      writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+      const result = await f.run(["fossil", "company", file, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    let control = await admin({ action: "initialize" });
+    const key = generateKeyPairSync("ed25519");
+    const public_key = key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex");
+    for (const [id, paths] of [
+      ["publisher", ["documents/", "records/"]],
+      ["reader", ["documents/team/", "records/company_note/", "records/company_todo/"]],
+      ["scoped", ["records/company_stable/a.json"]],
+    ] as const) control = await admin({ action: "grant", revision: control.revision, grant: { id, actor: id, public_key, paths, actions: ["create_view", "checkpoint", "record", "query", "read", "submit", "status"], expires_ms: Date.now() + 3600000 } });
+    let service = await startWorkspaceService(f, true);
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const request = (actor: string, action: string, params: object = {}) => {
+      const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor, grant: actor, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action, ...params });
+      return { payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") };
+    };
+    const post = (body: object) => fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", connection: "close" }, body: JSON.stringify(body) });
+    const send = async (actor: string, action: string, params: object = {}) => {
+      const response = await post(request(actor, action, params));
+      const body = await response.json() as any;
+      expect(response.status, JSON.stringify({ action, body })).toBe(200);
+      return JSON.parse(body.payload).result;
+    };
+    const accepted = async (actor: string, view: string) => {
+      const deadline = Date.now() + 60000;
+      let observed: any;
+      while (Date.now() < deadline) {
+        observed = await send(actor, "status", { view });
+        if (observed.job?.state === "published") return observed;
+        if (["failed", "blocked", "changes_required"].includes(observed.job?.state)) throw Error(`Unexpected review result: ${JSON.stringify(observed)}`);
+        await Bun.sleep(30);
+      }
+      throw Error(`Company publication did not finish: ${JSON.stringify(observed)}`);
+    };
+    const currentBase = async () => (await (await fetch(service.url + "/v1/company")).json() as any).revision;
+    const create = async (actor: string, objective: string) => send(actor, "create_view", { revision: await currentBase(), objective });
+    try {
+      let writer = await create("publisher", "Save the initial company inputs");
+      let saved = await send("publisher", "checkpoint", { view: writer.view, revision: writer.revision, path: "documents/team/input.md", content: "First input" });
+      for (const [entity, text] of [["company_note", "First note"], ["company_stable", "Stable note"]]) saved = await send("publisher", "record", { view: writer.view, revision: saved.revision, entity, record_id: "a", content: JSON.stringify({ text }) });
+      await send("publisher", "submit", { view: writer.view, revision: saved.revision, candidate: "Saved the original document and company records." });
+      await accepted("publisher", writer.view);
+      const fileView = await create("reader", "Report the observed document input");
+      const absentView = await create("reader", "Report whether the additional document exists");
+      const emptyView = await create("reader", "Report company todo records");
+      const queryView = await create("reader", "Report company note records");
+      const scopedView = await create("scoped", "Report the authorized stable note");
+      service.child.kill(); await service.child.exited;
+      service = await startWorkspaceService(f, false);
+      const readOnlyBase = (await admin({ action: "status" })).revision;
+      const untracked = await post(request("reader", "read", { view: fileView.view, path: "documents/team/input.md" }));
+      expect(untracked.status).toBe(400);
+      expect((await untracked.json() as any).error).toBe("CompanyReadTrackingRequired");
+      const unbound = await send("reader", "read", { path: "documents/team/input.md" });
+      expect(Buffer.from(unbound.content, "base64").toString()).toBe("First input");
+      expect((await admin({ action: "status" })).revision).toBe(readOnlyBase);
+      service.child.kill(); await service.child.exited;
+      service = await startWorkspaceService(f, true);
+      const first = await send("reader", "read", { view: fileView.view, path: "documents/team/input.md" });
+      expect(first.read_tracking).toBe("recorded");
+      expect(first.observation.revision).toHaveLength(64);
+      expect((await send("reader", "status", { view: fileView.view })).revision).toBe(fileView.revision);
+      const absent = await send("reader", "read", { view: absentView.view, path: "documents/team/additional.md" });
+      expect(absent.exists).toBe(false);
+      expect(absent.sha256).toBeNull();
+      expect((await send("reader", "query", { view: emptyView.view, entity: "company_todo" })).total).toBe(0);
+      expect((await send("reader", "query", { view: queryView.view, entity: "company_note" })).total).toBe(1);
+      expect((await send("scoped", "query", { view: scopedView.view, entity: "company_stable" })).total).toBe(1);
+      writer = await create("publisher", "Update the shared inputs and add company records");
+      saved = await send("publisher", "checkpoint", { view: writer.view, revision: writer.revision, path: "documents/team/input.md", content: "Second input", previous_hash: createHash("sha256").update("First input").digest("hex") });
+      saved = await send("publisher", "checkpoint", { view: writer.view, revision: saved.revision, path: "documents/team/additional.md", content: "Additional input" });
+      for (const entity of ["company_note", "company_todo", "company_stable"]) saved = await send("publisher", "record", { view: writer.view, revision: saved.revision, entity, record_id: "b", content: JSON.stringify({ text: "New record" }) });
+      await send("publisher", "submit", { view: writer.view, revision: saved.revision, candidate: "Updated the shared inputs and added the requested company records." });
+      await accepted("publisher", writer.view);
+      for (const view of [fileView, absentView, emptyView, queryView]) {
+        const rejectedRequest = request("reader", "submit", { view: view.view, revision: view.revision, candidate: "The original observed inputs are still current." });
+        const response = await post(rejectedRequest);
+        expect(response.status).toBe(400);
+        expect((await response.json() as any).error).toBe("WorkspaceReadDependencyChanged");
+        const outcome = await send("reader", "status", { outcome: JSON.parse(rejectedRequest.payload).operation });
+        expect(outcome.state).toBe("failed");
+      }
+      await send("scoped", "submit", { view: scopedView.view, revision: scopedView.revision, candidate: "The authorized stable note still contains Stable note." });
+      const scopedPublished = await accepted("scoped", scopedView.view);
+      expect(JSON.parse(scopedPublished.publication.issuer_proof.payload).reads_sha256).toHaveLength(64);
+      const beforeInspection = (await admin({ action: "status" })).revision;
+      const inspection = await send("scoped", "query", { view: scopedView.view, entity: "company_stable" });
+      expect(inspection.total).toBe(1);
+      expect(inspection.read_tracking).toBe("frozen_inspection");
+      expect((await admin({ action: "status" })).revision).toBe(beforeInspection);
+      const observedAgain = await send("reader", "read", { view: fileView.view, revision: await currentBase(), path: "documents/team/input.md" });
+      expect(Buffer.from(observedAgain.content, "base64").toString()).toBe("Second input");
+      await send("reader", "submit", { view: fileView.view, revision: fileView.revision, candidate: "The observed document now contains Second input." });
+      await accepted("reader", fileView.view);
+      const newQuery = await send("reader", "query", { view: emptyView.view, revision: await currentBase(), entity: "company_todo" });
+      expect(newQuery.total).toBe(1);
+      await send("reader", "submit", { view: emptyView.view, revision: emptyView.revision, candidate: "The company todo query now contains the new record." });
+      await accepted("reader", emptyView.view);
+      expect(inference.counts().actors).toBe(0);
+      service.child.kill(); await service.child.exited;
+      const exported = join(f.home, "observed-inputs.fossil");
+      const result = await f.run(["fossil", "export", exported, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      const restored = fixture();
+      const used = await restored.run(["fossil", "use", exported, "--json"]);
+      expect(used.code, used.stderr).toBe(0);
+      const verified = await restored.run(["fossil", "verify", "--json"]);
+      expect(verified.code, verified.stderr).toBe(0);
+    } finally { service.child.kill(); await service.child.exited; }
+  }, 240000);
 
   test("keeps company drafts isolated without copying the company files for every view", async () => {
     const f = fixture();

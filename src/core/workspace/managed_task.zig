@@ -150,6 +150,10 @@ pub const Turn = struct {
         var evidence: std.ArrayList(review.Evidence) = .empty;
         var pages: std.ArrayList([]const u8) = .empty;
         var checkpoints: std.ArrayList([]const u8) = .empty;
+        for (self.task.company_reads) |reference| {
+            const bytes = try self.manager.contentAt(reference.path, reference.revision);
+            try evidence.append(alloc, .{ .id = try alloc.print("workspace-read:{s}", .{try workspace.hash(alloc, bytes)}), .kind = .verification, .status = .success, .content = bytes });
+        }
         if (self.task.authority != null) {
             const prefix = try alloc.print("company/checkpoints/{s}/", .{self.task.id});
             for (try self.manager.inventory(self.reviewed_revision.?)) |path| {

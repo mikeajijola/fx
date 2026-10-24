@@ -368,6 +368,51 @@ reject new ASCII case collisions before changing working files.
 Scoped export currently returns a paginated content manifest for those reads;
 it does not clone the company repository or export issuer authority.
 
+Reads attached to an active view record their inputs on the protected company
+branch. The response includes `read_tracking: "recorded"` and an `observation`
+reference. Tracking does not change the view's content revision. Authorized
+missing-file reads return `exists: false` with a null hash, so absence becomes
+an explicit dependency. Query and inventory observations retain scoped result
+membership as well as hashes for returned files or records. Inaccessible rows
+never affect that membership.
+
+Submission pins these observations to an immutable control revision before
+integration. Refresh preserves them. Validation runs before reconciliation,
+before independent assessment, and at publication. A changed file, a missing
+file becoming present, a changed returned record, or a changed query membership
+returns `WorkspaceReadDependencyChanged`. The failed submission releases its
+operation fence; the actor can read the relevant inputs at a newer authorized
+revision and submit again. Re-reading a selector updates the active reference
+while preserving previous observations in Fossil history. Changes outside the
+observed scope do not invalidate a result. Private edits still use the normal
+three-way conflict checks.
+
+Queued, running, and accepted views serve reads as `frozen_inspection`, without
+changing the submitted inputs. Reading an active view through a read-only
+service returns `CompanyReadTrackingRequired`; unbound scoped reads remain
+available. A view retains at most 100 active read selectors. It returns
+`CompanyReadSetTooLarge` before delivering an unrecorded result when that bound
+would be exceeded. Observations use the `omos_company_read` entity and live at
+`company/reads/<task>/<hash>.json`. Publication proofs bind the frozen read set,
+and exported history retains its original observations.
+
+Before freezing inputs or refreshing a submitted branch, the host records an
+`omos_company_submission` intent at
+`company/submissions/<task>/<request-hash>.json`. It retains the exact request
+identity, initial revision, contract and model hash, answer hash, and input
+references. An interrupted submission remains fenced until a fresh signed
+`reconcile` request resolves it. Recovery reuses those inputs even if later
+inspection added other active observations. Completed actor actions are not
+repeated. A deterministic input-change failure releases the operation fence
+and retains the failed outcome for a corrected submission.
+
+Instance discovery advertises `read_dependencies` and `operator_approvals` in
+`features`. Older company views keep their original stored shape until the
+declaration supports read tracking. New tracked reads and submissions return
+`CompanyDefinitionUpdateRequired` when those contracts are absent. Update them
+with `omos fossil migrate --contracts`; existing task contracts, grants,
+private files, and operation outcomes remain retained.
+
 `query` enumerates custom entity records at an authorized pinned revision. Path
 permissions and the optional `entity` filter apply before totals and pagination,
 so inaccessible rows do not affect the returned count. Pages contain at most

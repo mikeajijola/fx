@@ -18,6 +18,18 @@ pub fn validationFailure(err: anyerror) bool {
     };
 }
 
+pub fn identity(record_path: []const u8) ?struct { entity: []const u8, id: []const u8 } {
+    if (!std.mem.startsWith(u8, record_path, "records/") or !std.mem.endsWith(u8, record_path, ".json")) return null;
+    var parts = std.mem.splitScalar(u8, record_path, '/');
+    _ = parts.next();
+    const entity = parts.next() orelse return null;
+    const name = parts.next() orelse return null;
+    if (parts.next() != null or name.len <= 5 or std.mem.startsWith(u8, entity, "omos_")) return null;
+    const id = name[0 .. name.len - 5];
+    if (!authority.safeIdentity(entity) or !authority.safeIdentity(id)) return null;
+    return .{ .entity = entity, .id = id };
+}
+
 pub fn query(manager: workspace.Manager, grant: authority.Grant, request: authority.Request, revision: []const u8) ![]const u8 {
     const alloc = manager.alloc;
     if (request.limit == 0) return error.InvalidEvidenceOffset;
@@ -27,14 +39,10 @@ pub fn query(manager: workspace.Manager, grant: authority.Grant, request: author
     var page_bytes: usize = 0;
     var page_open = true;
     for (try manager.inventory(revision)) |record_path| {
-        if (!std.mem.startsWith(u8, record_path, "records/") or !std.mem.endsWith(u8, record_path, ".json") or !authority.permitsPath(grant, record_path)) continue;
-        var parts = std.mem.splitScalar(u8, record_path, '/');
-        _ = parts.next();
-        const entity = parts.next() orelse continue;
-        const name = parts.next() orelse continue;
-        if (parts.next() != null or name.len <= 5 or std.mem.startsWith(u8, entity, "omos_")) continue;
-        const id = name[0 .. name.len - 5];
-        if (!std.mem.eql(u8, record_path, try path(alloc, entity, id))) continue;
+        if (!authority.permitsPath(grant, record_path)) continue;
+        const selected = identity(record_path) orelse continue;
+        const entity = selected.entity;
+        const id = selected.id;
         if (request.entity) |filter| if (!std.mem.eql(u8, filter, entity)) continue;
         if (page_open and total >= request.offset and rows.items.len < @min(request.limit, 32)) {
             const bytes = try manager.contentAt(record_path, revision);
