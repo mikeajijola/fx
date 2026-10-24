@@ -6828,6 +6828,21 @@ test "compaction activity transaction settles only after publication and preserv
     }
 }
 
+// Durable checkpoint preparation precedes this window. UI compilation and
+// evidence inspection share the same first attempt and total allowance.
+const CompletionReviewWindow = struct {
+    started: std.Io.Clock.Timestamp,
+    deadline: std.Io.Clock.Timestamp,
+    attempt_deadline: std.Io.Clock.Timestamp,
+
+    fn init(policy: @import("../../workspace/definition.zig").ReviewPolicy) CompletionReviewWindow {
+        const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+        const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(policy.total_timeout_ms) });
+        const attempt = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(policy.attempt_timeout_ms) });
+        return .{ .started = started, .deadline = deadline, .attempt_deadline = if (std.Io.Clock.Timestamp.compare(attempt, .lt, deadline)) attempt else deadline };
+    }
+};
+
 // Auxiliary calls synchronously borrow the turn configuration and job.
 const ContractCandidate = struct {
     config: *const Config,
@@ -6849,6 +6864,8 @@ noinline fn assessCompletionContract(
     summary: *runtime_telemetry.TurnSummaryAccumulator,
     input: ContractCandidate,
 ) !work_contract.Decision {
+    const policy = if (input.managed) |turn| if (turn.task.model_basis) |basis| basis.execution.review else @import("../../workspace/definition.zig").ReviewPolicy{} else @import("../../workspace/definition.zig").ReviewPolicy{};
+    var validation_window: ?CompletionReviewWindow = null;
     if (input.managed) |turn| {
         const revision_id = try turn.manager.checkpoint(turn.task);
         if (try turn.manager.uiChanged(turn.task.base_revision, revision_id) and !try turn.manager.hasUiReceipt(turn.task, revision_id)) {
@@ -6859,7 +6876,10 @@ noinline fn assessCompletionContract(
                 _ = try turn.manager.checkpoint(turn.task);
                 return error.ContractReviewPending;
             };
-            const raw = ui.validateSource(arena, source_revision) catch {
+            validation_window = CompletionReviewWindow.init(policy);
+            try deps.push_system_notice(deps.ctx, "Checking your interface changes...");
+            const raw = ui.validateSource(arena, source_revision, validation_window.?.attempt_deadline) catch |err| {
+                if (err == error.Cancelled) return err;
                 try turn.manager.record(turn.task, "review_failure", .{ .at_ms = io_mod.milliTimestamp(), .reason = "Workspace UI validation is pending; source and candidate retained.", .candidate_retained = true });
                 _ = try turn.manager.checkpoint(turn.task);
                 return error.ContractReviewPending;
@@ -6872,13 +6892,14 @@ noinline fn assessCompletionContract(
             try turn.manager.record(turn.task, "ui_source_validation", receipt);
         }
     }
-    const policy = if (input.managed) |turn| if (turn.task.model_basis) |basis| basis.execution.review else @import("../../workspace/definition.zig").ReviewPolicy{} else @import("../../workspace/definition.zig").ReviewPolicy{};
-    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
-    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(policy.total_timeout_ms) });
+    const window = validation_window orelse CompletionReviewWindow.init(policy);
+    const deadline = window.deadline;
+    const started = window.started;
     var previous_progress: ?[]const u8 = if (input.managed) |turn| try turn.reviewProgress() else null;
     var token_spent: u64 = 0;
     for (0..policy.max_attempts) |attempt| {
-        const result = assessCompletionAttempt(deps, arena, summary, input, deadline, &token_spent) catch |err| switch (err) {
+        const attempt_deadline: ?std.Io.Clock.Timestamp = if (attempt == 0 and validation_window != null) window.attempt_deadline else null;
+        const result = assessCompletionAttempt(deps, arena, summary, input, deadline, attempt_deadline, &token_spent) catch |err| switch (err) {
             error.ContractReviewPending, error.Timeout => {
                 if (input.managed) |turn| {
                     const progress = try turn.reviewProgress();
@@ -6908,6 +6929,7 @@ noinline fn assessCompletionAttempt(
     summary: *runtime_telemetry.TurnSummaryAccumulator,
     input: ContractCandidate,
     total_deadline: std.Io.Clock.Timestamp,
+    initial_deadline: ?std.Io.Clock.Timestamp,
     token_spent: *u64,
 ) !work_contract.Decision {
     if (deps.assess_contract) |assess_contract| {
@@ -6919,7 +6941,7 @@ noinline fn assessCompletionAttempt(
     var event_context: u8 = 0;
     if (input.managed) |turn| try turn.manager.record(turn.task, "review_candidate", .{ .at_ms = io_mod.milliTimestamp(), .text = input.candidate });
     const policy = if (input.managed) |turn| if (turn.task.model_basis) |basis| basis.execution.review else @import("../../workspace/definition.zig").ReviewPolicy{} else @import("../../workspace/definition.zig").ReviewPolicy{};
-    const attempt_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(policy.attempt_timeout_ms) });
+    const attempt_deadline = initial_deadline orelse std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(policy.attempt_timeout_ms) });
     const collection_deadline = if (std.Io.Clock.Timestamp.compare(attempt_deadline, .lt, total_deadline)) attempt_deadline else total_deadline;
     const prior_evidence = if (input.managed) |turn| try turn.beforeReviewControlled(arena, input.messages, input.config.cancel_flag, collection_deadline) else &.{};
     var attempt_usage: types.Usage = .{};
