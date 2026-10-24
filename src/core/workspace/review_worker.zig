@@ -24,7 +24,7 @@ pub fn perform(original: workspace.Manager, job: jobs.Job, model: Model) !void {
     manager.review_fence = .{ .task = job.task, .job = job.id, .generation = job.generation, .owner = job.owner };
     const execution_lease = (try manager.tryTaskExecutionLease(job.task)) orelse return error.WorkspaceExecutionBusy;
     defer execution_lease.release();
-    const task = try manager.loadTask(job.task);
+    var task = try manager.loadTask(job.task);
     try manager.validateTaskBasis(task);
     try @import("company_reads.zig").validate(manager, task, task.company_reads, try manager.revision(task.parent));
     try @import("company_authority.zig").authorizeTask(manager, task);
@@ -40,6 +40,9 @@ pub fn perform(original: workspace.Manager, job: jobs.Job, model: Model) !void {
     var token_spent: u64 = job.reported_tokens;
     for (0..policy.max_attempts) |_| {
         if (!try manager.beginReviewAttempt(job)) return;
+        try manager.validateTaskBasis(task);
+        try @import("company_reads.zig").validate(manager, task, task.company_reads, try manager.revision(task.parent));
+        try @import("company_authority.zig").authorizeTask(manager, task);
         const attempt_deadline = std.Io.Clock.Timestamp.fromNow(io.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(policy.attempt_timeout_ms) });
         const collection_deadline = if (std.Io.Clock.Timestamp.compare(deadline, .lt, attempt_deadline)) deadline else attempt_deadline;
         const evidence = turn.beforeReviewControlled(manager.alloc, &.{}, model.cancel, collection_deadline) catch |err| {
@@ -95,7 +98,29 @@ pub fn perform(original: workspace.Manager, job: jobs.Job, model: Model) !void {
         try turn.sealReview();
         turn.assessment = result.assessment;
         if (result.decision.disposition == .fulfilled and try turn.sourceAssessmentCurrent(result.assessment)) {
-            try turn.publish(candidate);
+            turn.publish(candidate) catch |err| {
+                if (err != error.CompanyReconciliationRequired) return err;
+                // Retry only a definitely unpublished proposal. Recovery owns
+                // any durable publication intent or uncertain outcome.
+                const current = try manager.loadTask(task.id);
+                if (current.state == .publication_pending or current.state == .accepted or try manager.publicationPending(current)) return err;
+                const approval = @import("company_approval.zig");
+                var proposal = try approval.retainedProposal(manager, current, try manager.currentRevision(current));
+                const previous_integration = @import("definition.zig").text(proposal, "integration_revision");
+                task = try manager.refresh(current);
+                const integration_revision = try manager.currentRevision(task);
+                try proposal.object.put(manager.alloc, "integration_revision", .{ .string = integration_revision });
+                try manager.record(task, "company_proposal", proposal);
+                turn.task = task;
+                turn.reviewed_revision = null;
+                turn.assessment_record = null;
+                turn.assessment = "";
+                turn.review_snapshot = "";
+                try manager.record(task, "company_reconciliation", .{ .job = job.id, .generation = job.generation, .base = task.base_revision, .previous_integration = previous_integration, .integration_revision = integration_revision, .requires_fresh_assessment = true });
+                _ = try manager.checkpoint(task);
+                // The existing job keeps its attempt, time, and token budget.
+                continue;
+            };
             return;
         }
         turn.task = try manager.setState(task.id, if (result.decision.disposition == .blocked) .blocked else .paused);
@@ -111,6 +136,8 @@ pub fn perform(original: workspace.Manager, job: jobs.Job, model: Model) !void {
 
 fn discard(_: *anyopaque, _: streams.Event) void {}
 
+// Executors may be called concurrently with separate managers and arenas.
+// The shared context must remain immutable or synchronize its own state.
 pub const Executor = struct {
     context: *anyopaque,
     run: *const fn (*anyopaque, workspace.Manager, jobs.Job, *std.atomic.Value(bool)) anyerror!void,

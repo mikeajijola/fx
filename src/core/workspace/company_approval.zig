@@ -70,10 +70,10 @@ fn changesHash(manager: workspace.Manager, task: workspace.Task, revision: []con
     return manager.alloc.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
 }
 
-pub fn candidate(manager: workspace.Manager, task: workspace.Task, revision: []const u8, current: authority.State) !Candidate {
-    if (comptime @import("builtin").target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
+/// Load the host-retained proposal while preserving its original operation and
+/// candidate revision across subsequent integration receipts.
+pub fn retainedProposal(manager: workspace.Manager, task: workspace.Task, revision: []const u8) !std.json.Value {
     const binding = task.authority orelse return error.CompanyAccessDenied;
-    const answer = (try manager.retainedReviewCandidateAt(task, revision)) orelse return error.NoRetainedReviewCandidate;
     var proposal: std.ArrayList(u8) = .empty;
     defer proposal.deinit(std.heap.page_allocator);
     var proposal_at: i64 = -1;
@@ -96,12 +96,24 @@ pub fn candidate(manager: workspace.Manager, task: workspace.Task, revision: []c
         }
     }
     if (proposal_at < 0) return error.CompanyProposalRequired;
-    const value = try std.json.parseFromSliceLeaky(std.json.Value, manager.alloc, proposal.items, .{ .allocate = .alloc_always });
+    return std.json.parseFromSliceLeaky(std.json.Value, manager.alloc, proposal.items, .{ .allocate = .alloc_always });
+}
+
+pub fn candidate(manager: workspace.Manager, task: workspace.Task, revision: []const u8, current: authority.State) !Candidate {
+    if (comptime @import("builtin").target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
+    const binding = task.authority orelse return error.CompanyAccessDenied;
+    const answer = (try manager.retainedReviewCandidateAt(task, revision)) orelse return error.NoRetainedReviewCandidate;
+    const value = try retainedProposal(manager, task, revision);
     const integration = model.text(value, "integration_revision");
     if (integration.len == 0) return error.CompanyProposalResubmissionRequired;
     if (!try manager.revisionDescendsFrom(revision, integration)) return error.CompanyApprovalStale;
     const changes = try changesHash(manager, task, revision);
-    if (!std.mem.eql(u8, changes, try changesHash(manager, task, integration))) return error.CompanyApprovalStale;
+    // Compare the original proposal against its own recorded base. A crash
+    // can occur after refresh commits a new base but before the integration
+    // reference is checkpointed; the immutable proposal remains inspectable.
+    const original = try records.decode(workspace.Task, manager.alloc, try manager.contentAt(try manager.alloc.print("tasks/{s}.json", .{task.id}), integration), .{});
+    if (!std.mem.eql(u8, original.id, task.id) or !std.mem.eql(u8, original.workspace_id, task.workspace_id)) return error.CompanyApprovalStale;
+    if (!std.mem.eql(u8, changes, try changesHash(manager, original, integration))) return error.CompanyApprovalStale;
     return .{
         .workspace = manager.manifest.id,
         .task = task.id,

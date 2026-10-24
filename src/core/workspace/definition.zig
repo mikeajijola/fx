@@ -65,10 +65,35 @@ pub const ReviewPolicy = struct {
             self.max_read_bytes < 256 or self.max_read_bytes > 16 * 1024) return error.InvalidExecutionPolicy;
     }
 };
+pub const ServerPolicy = struct {
+    review_workers: usize = 2,
+};
+
 pub const Execution = struct {
     version: []const u8 = "omos.execution/v1",
     defaults: Policy = .{},
     review: ReviewPolicy = ReviewPolicy.legacy,
+    server: ?ServerPolicy = null,
+
+    pub fn reviewWorkers(self: Execution) usize {
+        return if (self.server) |server| server.review_workers else 1;
+    }
+
+    // Preserve hashes of pre-server policies embedded in existing task bases.
+    pub fn jsonStringify(self: Execution, writer: *std.json.Stringify) !void {
+        try writer.beginObject();
+        try writer.objectField("version");
+        try writer.write(self.version);
+        try writer.objectField("defaults");
+        try writer.write(self.defaults);
+        try writer.objectField("review");
+        try writer.write(self.review);
+        if (self.server) |server| {
+            try writer.objectField("server");
+            try writer.write(server);
+        }
+        try writer.endObject();
+    }
 };
 pub const Entity = struct { id: []const u8, fields: Value = .null, required: []const []const u8 = &.{}, indexed: []const []const u8 = &.{} };
 const Relationship = struct { id: []const u8, from: []const u8, to: []const u8, kind: enum { containment, dependency, applicability, provenance }, inheritScope: bool = false };
@@ -170,6 +195,7 @@ pub fn parseExecution(alloc: Allocator, bytes: []const u8) !Execution {
     const execution = try record_json.decode(Execution, alloc, bytes, .{});
     const p = execution.defaults;
     if (!std.mem.eql(u8, execution.version, "omos.execution/v1") or p.progress_interval == 0 or p.progress_interval > 100 or p.stalled_checks == 0 or p.stalled_checks > 20 or p.max_actor_steps < 2 or p.max_actor_steps > 10000) return error.InvalidExecutionPolicy;
+    if (execution.reviewWorkers() < 1 or execution.reviewWorkers() > 4) return error.InvalidExecutionPolicy;
     try execution.review.validate();
     return execution;
 }
@@ -180,7 +206,7 @@ pub fn compatibleExecution(old: Execution, next: Execution) bool {
     const b = next.defaults;
     const x = old.review;
     const y = next.review;
-    return b.max_actor_steps <= a.max_actor_steps and b.progress_interval <= a.progress_interval and b.stalled_checks <= a.stalled_checks and
+    return next.reviewWorkers() <= old.reviewWorkers() and b.max_actor_steps <= a.max_actor_steps and b.progress_interval <= a.progress_interval and b.stalled_checks <= a.stalled_checks and
         y.max_calls <= x.max_calls and y.reserved_calls >= x.reserved_calls and y.response_timeout_ms <= x.response_timeout_ms and
         y.attempt_timeout_ms <= x.attempt_timeout_ms and y.max_attempts <= x.max_attempts and y.total_timeout_ms <= x.total_timeout_ms and
         y.max_context_bytes <= x.max_context_bytes and y.max_read_bytes <= x.max_read_bytes and
@@ -670,4 +696,25 @@ test "workspace declaration compatible changes preserve every existing contract"
     const next = try parse(alloc, try std.mem.replaceOwned(u8, alloc, seed, "\"objective\": \"string\"", "\"objective\": \"boolean\""));
     try std.testing.expect(try compatible(alloc, old, old));
     try std.testing.expect(!try compatible(alloc, old, next));
+}
+
+test "workspace declaration bounds server review capacity and preserves legacy policy hashes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const old = try parseExecution(a, "{}");
+    try std.testing.expectEqual(@as(usize, 1), old.reviewWorkers());
+    const legacy = try std.json.Stringify.valueAlloc(a, old, .{});
+    try std.testing.expect(std.mem.find(u8, legacy, "server") == null);
+    const parallel = try parseExecution(a, "{\"server\":{\"review_workers\":2}}");
+    try std.testing.expectEqual(@as(usize, 2), parallel.reviewWorkers());
+    try std.testing.expect(!compatibleExecution(old, parallel));
+    try std.testing.expect(compatibleExecution(parallel, old));
+    for ([_][]const u8{
+        "{\"server\":{\"review_workers\":0}}",
+        "{\"server\":{\"review_workers\":5}}",
+        "{\"server\":{\"unknown\":1}}",
+    }) |raw| {
+        if (parseExecution(a, raw)) |_| return error.ExpectedInvalidPolicy else |_| {}
+    }
 }

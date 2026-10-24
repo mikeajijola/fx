@@ -64,7 +64,7 @@ pub const ReviewFile = struct { path: []const u8, hash: []const u8 };
 pub const ReviewInputs = struct { snapshot: []const u8, files: []const ReviewFile };
 pub const HistoryCursor = struct {
     manager: Manager,
-    task: Task,
+    task: ?Task = null,
     revision: []const u8,
     paths: []const []const u8,
     offset: usize = 0,
@@ -82,7 +82,11 @@ pub const HistoryCursor = struct {
         } else |err| {
             if (err == error.OutOfMemory or err == error.Cancelled or err == error.Timeout) return err;
             try reader.checkOperation();
-            const value = try reader.historyRecord(self.task, batch[0], self.revision);
+            const value = if (self.task) |task| try reader.historyRecord(task, batch[0], self.revision) else blk: {
+                const bytes = try reader.contentAt(batch[0], self.revision);
+                try reader.checkHistoryHash(batch[0], bytes);
+                break :blk bytes;
+            };
             self.offset += 1;
             const values = try alloc.alloc([]const u8, 1);
             values[0] = value;
@@ -938,6 +942,12 @@ pub const Manager = struct {
         for (try self.tasks()) |loaded| {
             var task = loaded;
             if (task.state == .accepted or task.state == .conflict) continue;
+            const job_id = task.review_job orelse continue;
+            var job = try self.loadReviewJob(task, job_id);
+            const eligible = job.state == .queued or (job.state == .running and job.lease_expires_ms <= now);
+            // Do not momentarily acquire an active review's execution lock
+            // between another worker's durable claim and executor startup.
+            if (!eligible and task.state != .publication_pending) continue;
             const task_lease = (try self.tryTaskExecutionLease(task.id)) orelse continue;
             defer task_lease.release();
             try self.drain(task);
@@ -945,12 +955,10 @@ pub const Manager = struct {
                 _ = try self.finishPublication(try parse(self.alloc, Publication, try read(self.alloc, try self.publicationPath(task.id))));
                 continue;
             }
-            for (try self.inventory(task.branch)) |path| {
-                if (!std.mem.startsWith(u8, path, "jobs/") or !std.mem.endsWith(u8, path, ".json")) continue;
-                const owned = try record_json.decode(@import("review_job.zig").Job, self.alloc, try self.contentAt(path, task.branch), .{});
-                if (!std.mem.eql(u8, owned.task, task.id)) continue;
-                var job = try self.loadReviewJob(task, path[5 .. path.len - 5]);
-                if (job.state != .queued and !(job.state == .running and job.lease_expires_ms <= now)) continue;
+            // The task pointer and job are committed atomically. Historical
+            // jobs stay retained; only the selected invocation can be claimed.
+            {
+                if (!eligible) continue;
                 if (task.state == .publication_pending) {
                     // A committed receipt was reconciled above. No effects were
                     // published, so an expired owner must acquire a fresh lease.
@@ -1195,7 +1203,7 @@ pub const Manager = struct {
         const tree = try self.checkout("trunk");
         try atomicWrite(alloc, try join(alloc, tree, manifest_path), try json(alloc, self.manifest));
         try atomicWrite(alloc, try join(alloc, tree, model.declaration_path), model.initial_declaration);
-        try atomicWrite(alloc, try join(alloc, tree, model.execution_path), try json(alloc, model.Execution{ .review = .{} }));
+        try atomicWrite(alloc, try join(alloc, tree, model.execution_path), try json(alloc, model.Execution{ .review = .{}, .server = .{} }));
         _ = try self.commit(tree, "Initialize omos agent workspace");
         return self;
     }
@@ -1950,28 +1958,6 @@ pub const Manager = struct {
         const bytes = try self.contentAt(path, revision_id);
         try self.checkHistoryHash(path, bytes);
         return bytes;
-    }
-
-    pub fn taskHistory(self: Manager, task: Task, revision_id: []const u8) ![]const []const u8 {
-        const history_paths = try self.taskHistoryPaths(task, revision_id);
-        var records: std.ArrayList([]const u8) = .empty;
-        var record_start: usize = 0;
-        while (record_start < history_paths.len) : (record_start += 16) {
-            const batch = history_paths[record_start..@min(record_start + 16, history_paths.len)];
-            if (self.historyBatch(batch, revision_id)) |values| {
-                try records.appendSlice(self.alloc, values);
-            } else |err| {
-                if (err == error.OutOfMemory) return err;
-                // Noncanonical whitespace or a large batch can defeat framing.
-                // Individual reads retain the same exact hash verification.
-                for (batch) |path| {
-                    const bytes = try self.contentAt(path, revision_id);
-                    try self.checkHistoryHash(path, bytes);
-                    try records.append(self.alloc, bytes);
-                }
-            }
-        }
-        return records.toOwnedSlice(self.alloc);
     }
 
     fn checkHistoryHash(self: Manager, path: []const u8, bytes: []const u8) !void {
@@ -3266,7 +3252,7 @@ pub const Manager = struct {
         var manifest = self.manifest;
         manifest.format = 2;
         try atomicWrite(self.alloc, try join(self.alloc, tree, model.declaration_path), model.initial_declaration);
-        try atomicWrite(self.alloc, try join(self.alloc, tree, model.execution_path), try json(self.alloc, model.Execution{ .review = .{} }));
+        try atomicWrite(self.alloc, try join(self.alloc, tree, model.execution_path), try json(self.alloc, model.Execution{ .review = .{}, .server = .{} }));
         try atomicWrite(self.alloc, try join(self.alloc, tree, manifest_path), try json(self.alloc, manifest));
         _ = try self.commit(tree, "Add governed workspace model; retain legacy task contracts");
         return self.alloc.print("Activated omos.workspace/v1 for future tasks. Verified backup: {s}. Existing tasks retain their original contract and legacy adapter.", .{backup});
@@ -3281,6 +3267,7 @@ pub const Manager = struct {
         var execution = old_execution;
         const execution_document = (try std.json.parseFromSlice(std.json.Value, self.alloc, old_execution_bytes, .{})).value;
         if (model.field(execution_document, "review") == null) execution.review = .{};
+        if (model.field(execution_document, "server") == null) execution.server = .{};
         if (std.mem.eql(u8, previous.hash, next.hash) and std.mem.eql(u8, try json(self.alloc, old_execution), try json(self.alloc, execution))) return "Workspace contracts are current; active task bases remain pinned.";
         const backup = try self.alloc.print("{s}.pre-contracts-{d}.fossil", .{ self.repository, io_mod.milliTimestamp() });
         try self.exportRepository(backup);
@@ -3327,6 +3314,7 @@ pub const Manager = struct {
             // Older policy proposals predate review settings. Preserve the
             // active review contract when that section was not supplied.
             if (model.field(supplied, "review") == null) execution.review = previous_execution.review;
+            if (model.field(supplied, "server") == null) execution.server = previous_execution.server;
         }
         const compatible = try model.compatible(self.alloc, old, proposed) and model.compatibleExecution(previous_execution, execution);
         const proposal_id = try hash(self.alloc, try json(self.alloc, .{ .base = base, .definition = proposed.hash, .execution = execution }));
@@ -3450,7 +3438,7 @@ pub const Manager = struct {
     pub fn queryRecords(self: Manager, task: ?Task, entity: ?[]const u8, offset: usize) ![]const u8 {
         const revision_id = if (task) |selected_task| try self.revision(selected_task.branch) else try self.revision("trunk");
         const paths = try self.inventory(revision_id);
-        var rows: std.ArrayList(std.json.Value) = .empty;
+        var page: @import("record_query.zig").Page = .{ .alloc = self.alloc, .offset = offset, .revision = revision_id };
         const matches = struct {
             fn check(filter: ?[]const u8, kind: []const u8) bool {
                 return filter == null or std.mem.eql(u8, filter.?, kind);
@@ -3466,109 +3454,108 @@ pub const Manager = struct {
                     const binding = try parse(self.alloc, SessionBinding, try self.contentAt(path, runtime_revision));
                     try self.validateSessionBinding(binding, path);
                     if (task) |selected| if (!std.mem.eql(u8, selected.id, binding.task)) continue;
-                    try rows.append(self.alloc, try parse(self.alloc, std.json.Value, try json(self.alloc, .{ .entity = "omos_event", .id = try hash(self.alloc, path), .data = binding, .source_path = path, .revision = runtime_revision })));
+                    try page.add(self, try parse(self.alloc, std.json.Value, try json(self.alloc, .{ .entity = "omos_event", .id = try hash(self.alloc, path), .data = binding, .source_path = path, .revision = runtime_revision })));
                 }
                 break;
             };
         }
-        if (matches(entity, "omos_task")) for (try self.tasks()) |item| try rows.append(self.alloc, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = "omos_task", .id = item.id, .revision = try self.currentRevision(item), .data = .{ .objective = item.definition.objective, .state = @tagName(item.state), .contract = item.definition, .basis = item.model_basis } }), .{})).value);
+        if (matches(entity, "omos_task")) for (try self.tasks()) |item| try page.add(self, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = "omos_task", .id = item.id, .revision = try self.currentRevision(item), .data = .{ .objective = item.definition.objective, .state = @tagName(item.state), .contract = item.definition, .basis = item.model_basis } }), .{})).value);
         if (matches(entity, "omos_capability")) {
             if (try self.modelBasis(revision_id)) |basis| {
                 const declaration = try self.loadDeclaration(basis.revision);
                 for (model.items(model.spec(declaration.value), "capabilities")) |item| {
                     var operations: std.ArrayList([]const u8) = .empty;
                     for (model.items(model.spec(declaration.value), "operations")) |operation| if (std.mem.eql(u8, model.text(operation, "capability"), model.text(item, "id"))) try operations.append(self.alloc, model.text(operation, "id"));
-                    try rows.append(self.alloc, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = "omos_capability", .id = model.text(item, "id"), .data = .{ .name = model.text(item, "name"), .requires = model.field(item, "requires").?, .operations = operations.items }, .source_path = model.declaration_path }), .{})).value);
+                    try page.add(self, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = "omos_capability", .id = model.text(item, "id"), .data = .{ .name = model.text(item, "name"), .requires = model.field(item, "requires").?, .operations = operations.items }, .source_path = model.declaration_path }), .{})).value);
                 }
             }
         }
-        var histories: std.ArrayList([]const u8) = .empty;
         const history_requested = entity == null or std.mem.eql(u8, entity.?, "omos_plan") or std.mem.eql(u8, entity.?, "omos_action") or std.mem.eql(u8, entity.?, "omos_evidence") or std.mem.eql(u8, entity.?, "omos_assessment") or std.mem.eql(u8, entity.?, "omos_event") or std.mem.eql(u8, entity.?, "omos_result");
         if (history_requested) {
-            if (task) |selected_task| {
-                try histories.appendSlice(self.alloc, try self.taskHistory(selected_task, revision_id));
-            } else for (paths) |path| {
-                if (std.mem.startsWith(u8, path, "history/")) try histories.append(self.alloc, try self.contentAt(path, revision_id));
+            var history_paths: std.ArrayList([]const u8) = .empty;
+            const prefix = if (task) |selected| try self.alloc.print("history/{s}/", .{selected.id}) else "history/";
+            for (paths) |path| if (std.mem.startsWith(u8, path, prefix)) try history_paths.append(self.alloc, path);
+            var cursor: HistoryCursor = .{ .manager = self, .task = task, .revision = revision_id, .paths = history_paths.items };
+            var links: @import("record_projection.zig").PlanLinks = .{};
+            while (cursor.offset < cursor.paths.len) {
+                var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer scratch.deinit();
+                const a = scratch.allocator();
+                const source_start = cursor.offset;
+                const batch = (try cursor.next(a)) orelse break;
+                for (batch, cursor.paths[source_start..cursor.offset]) |bytes, path| {
+                    var projection: @import("record_projection.zig").Projection = .{};
+                    const row = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+                    try projection.append(a, row, std.Io.Dir.path.basename(path)[0..64]);
+                    if (!std.mem.eql(u8, projection.source_path, path)) return error.InvalidWorkspaceJournal;
+                    for (projection.records.items) |projected| {
+                        if (matches(entity, model.text(projected, "entity"))) try page.add(self, projected);
+                        try links.remember(self.alloc, projected);
+                    }
+                    for (projection.relationships.items) |edge| try page.edge(edge);
+                }
             }
+            try links.emit(&page);
         }
-        var projection: @import("record_projection.zig").Projection = .{};
-        for (histories.items) |bytes| {
-            const row = (try std.json.parseFromSlice(std.json.Value, self.alloc, bytes, .{})).value;
-            try projection.append(self.alloc, row, try hash(self.alloc, bytes));
-        }
-        try projection.linkPlans(self.alloc);
-        for (projection.records.items) |row| if (matches(entity, model.text(row, "entity"))) try rows.append(self.alloc, row);
         for (paths) |path| {
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            var reader = self;
+            reader.alloc = scratch.allocator();
+            var projection: @import("record_projection.zig").Projection = .{};
             const logical = if (std.mem.startsWith(u8, path, "jobs/")) "omos_review_job" else if (std.mem.startsWith(u8, path, "proposals/")) "omos_definition_proposal" else if (std.mem.startsWith(u8, path, "acceptances/")) "omos_result" else if (std.mem.startsWith(u8, path, "memory/")) "omos_memory" else if (std.mem.startsWith(u8, path, "skills/")) "omos_skill" else if (std.mem.startsWith(u8, path, "artifacts/")) "omos_artifact" else if (std.mem.startsWith(u8, path, "documents/")) "omos_document" else "";
             if (std.mem.eql(u8, logical, "omos_review_job")) {
                 if (matches(entity, logical)) {
-                    const job = try record_json.decode(@import("review_job.zig").Job, self.alloc, try self.contentAt(path, revision_id), .{});
-                    try rows.append(self.alloc, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = logical, .id = job.id, .data = .{ .task = job.task, .state = @tagName(job.state), .generation = job.generation, .contract_version = job.contract_version, .definition_hash = job.definition_hash, .candidate_hash = job.candidate_hash } }), .{})).value);
+                    const job = try record_json.decode(@import("review_job.zig").Job, reader.alloc, try reader.contentAt(path, revision_id), .{});
+                    try page.add(reader, (try std.json.parseFromSlice(std.json.Value, reader.alloc, try json(reader.alloc, .{ .entity = logical, .id = job.id, .data = .{ .task = job.task, .state = @tagName(job.state), .generation = job.generation, .contract_version = job.contract_version, .definition_hash = job.definition_hash, .candidate_hash = job.candidate_hash } }), .{})).value);
                 }
                 continue;
             }
             if (std.mem.eql(u8, logical, "omos_definition_proposal")) {
-                const proposal = (try std.json.parseFromSlice(std.json.Value, self.alloc, try self.contentAt(path, revision_id), .{})).value;
+                const proposal = (try std.json.parseFromSlice(std.json.Value, reader.alloc, try reader.contentAt(path, revision_id), .{})).value;
                 const owner = model.text(proposal, "task");
                 const proposal_entity = if (owner.len > 0) "omos_definition_proposal" else "omos_workspace_definition_proposal";
                 if (matches(entity, proposal_entity)) {
                     const data = if (owner.len > 0)
-                        try json(self.alloc, .{ .task = owner, .hash = model.text(proposal, "hash"), .state = model.text(proposal, "state"), .reason = model.text(proposal, "reason") })
+                        try json(reader.alloc, .{ .task = owner, .hash = model.text(proposal, "hash"), .state = model.text(proposal, "state"), .reason = model.text(proposal, "reason") })
                     else
-                        try json(self.alloc, .{ .workspace = self.manifest.id, .hash = model.text(proposal, "hash"), .state = model.text(proposal, "state"), .reason = model.text(proposal, "reason") });
-                    try rows.append(self.alloc, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = proposal_entity, .id = model.text(proposal, "id"), .data = (try std.json.parseFromSlice(std.json.Value, self.alloc, data, .{})).value, .source_path = path }), .{})).value);
+                        try json(reader.alloc, .{ .workspace = reader.manifest.id, .hash = model.text(proposal, "hash"), .state = model.text(proposal, "state"), .reason = model.text(proposal, "reason") });
+                    try page.add(reader, (try std.json.parseFromSlice(std.json.Value, reader.alloc, try json(reader.alloc, .{ .entity = proposal_entity, .id = model.text(proposal, "id"), .data = (try std.json.parseFromSlice(std.json.Value, reader.alloc, data, .{})).value, .source_path = path }), .{})).value);
                 }
                 continue;
             }
             if (std.mem.eql(u8, logical, "omos_result")) {
                 if (matches(entity, logical)) {
-                    const publication = try record_json.decode(Publication, self.alloc, try self.contentAt(path, revision_id), .{});
+                    const publication = try record_json.decode(Publication, reader.alloc, try reader.contentAt(path, revision_id), .{});
                     if (task) |selected_task| if (!std.mem.eql(u8, publication.task.id, selected_task.id)) continue;
-                    try rows.append(self.alloc, try self.resultProjection(publication, path, revision_id, &projection));
+                    try page.add(reader, try reader.resultProjection(publication, path, revision_id, &projection));
+                    for (projection.relationships.items) |edge| try page.edge(edge);
                 }
                 continue;
             }
             if (std.mem.startsWith(u8, path, "records/")) {
-                var row = (try std.json.parseFromSlice(std.json.Value, self.alloc, try self.contentAt(path, revision_id), .{})).value;
-                try row.object.put(self.alloc, "source_path", .{ .string = path });
-                if (matches(entity, model.text(row, "entity"))) try rows.append(self.alloc, row);
-            } else if (logical.len > 0 and matches(entity, logical)) try rows.append(self.alloc, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = logical, .id = path, .path = path, .data = .{ .path = path } }), .{})).value);
+                var row = (try std.json.parseFromSlice(std.json.Value, reader.alloc, try reader.contentAt(path, revision_id), .{})).value;
+                try row.object.put(reader.alloc, "source_path", .{ .string = path });
+                if (matches(entity, model.text(row, "entity"))) try page.add(reader, row);
+            } else if (logical.len > 0 and matches(entity, logical)) try page.add(reader, (try std.json.parseFromSlice(std.json.Value, reader.alloc, try json(reader.alloc, .{ .entity = logical, .id = path, .path = path, .data = .{ .path = path } }), .{})).value);
         }
         if (task) |selected_task| if (selected_task.state == .accepted and matches(entity, "omos_result")) {
             const parent_revision = try self.revision(selected_task.parent);
             for (try self.inventory(parent_revision)) |path| {
                 if (!std.mem.startsWith(u8, path, "acceptances/")) continue;
-                const publication = try record_json.decode(Publication, self.alloc, try self.contentAt(path, parent_revision), .{});
+                var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer scratch.deinit();
+                var reader = self;
+                reader.alloc = scratch.allocator();
+                var projection: @import("record_projection.zig").Projection = .{};
+                const publication = try record_json.decode(Publication, reader.alloc, try reader.contentAt(path, parent_revision), .{});
                 if (!std.mem.eql(u8, publication.task.id, selected_task.id)) continue;
                 if (std.mem.eql(u8, parent_revision, revision_id)) continue;
-                try rows.append(self.alloc, try self.resultProjection(publication, path, parent_revision, &projection));
+                try page.add(reader, try reader.resultProjection(publication, path, parent_revision, &projection));
+                for (projection.relationships.items) |edge| try page.edge(edge);
             }
         };
-        const row_start = @min(offset, rows.items.len);
-        var end = row_start;
-        var page: std.ArrayList(std.json.Value) = .empty;
-        var page_bytes: usize = 0;
-        while (end < rows.items.len and page.items.len < 32) : (end += 1) {
-            const row = rows.items[end];
-            const encoded = try json(self.alloc, row);
-            const bounded = if (encoded.len <= 8192) row else blk: {
-                const entity_id = model.text(row, "entity");
-                const id = model.text(row, "id");
-                const explicit_path = model.text(row, "source_path");
-                const path = if (explicit_path.len > 0) explicit_path else if (std.mem.eql(u8, entity_id, "omos_task")) try self.taskPath(id) else "omniform/company.json";
-                const own_revision = model.text(row, "revision");
-                const source_revision = if (own_revision.len > 0) own_revision else revision_id;
-                const original = try self.contentAt(path, source_revision);
-                break :blk (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = entity_id, .id = id, .complete = false, .source_path = path, .revision = source_revision, .bytes = original.len, .sha256 = try hash(self.alloc, original), .projection_bytes = encoded.len, .note = "Read the original record in bounded pages; this reference cannot establish unseen content." }), .{})).value;
-            };
-            const bounded_bytes = (try json(self.alloc, bounded)).len;
-            if (page.items.len > 0 and page_bytes + bounded_bytes > 64 * 1024) break;
-            page_bytes += bounded_bytes;
-            try page.append(self.alloc, bounded);
-        }
-        const edge_start = @min(offset, projection.relationships.items.len);
-        const edge_end = @min(edge_start +| 32, projection.relationships.items.len);
-        return json(self.alloc, .{ .revision = revision_id, .records = page.items, .relationships = projection.relationships.items[edge_start..edge_end], .relationship_total = projection.relationships.items.len, .next_relationship_offset = if (edge_end < projection.relationships.items.len) @as(?usize, edge_end) else null, .next_offset = if (end < rows.items.len) @as(?usize, end) else null, .total = rows.items.len });
+        return page.result();
     }
 
     fn resultProjection(self: Manager, publication: Publication, path: []const u8, revision_id: []const u8, projection: *@import("record_projection.zig").Projection) !std.json.Value {

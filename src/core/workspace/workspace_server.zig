@@ -16,12 +16,17 @@ pub fn run(manager: workspace.Manager, port: u16, writable: bool, context: *anyo
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", port);
     var listener = try address.listen(io.getIo(), .{ .reuse_address = true });
     defer listener.deinit(io.getIo());
-    var scheduler: ?@import("review_worker.zig").Scheduler = if (executor) |worker| .{ .manager = manager, .executor = worker } else null;
-    const thread: ?std.Thread = if (scheduler) |*worker| try std.Thread.spawn(.{}, @import("review_worker.zig").Scheduler.loop, .{worker}) else null;
+    var scheduler: ?@import("review_worker.zig").Scheduler = if (writable and executor != null) .{ .manager = manager, .executor = executor.? } else null;
+    var review_threads: [4]?std.Thread = @splat(null);
     defer if (scheduler) |*worker| {
         worker.stopping.store(true, .release);
-        thread.?.join();
+        for (review_threads) |thread| if (thread) |running| running.join();
     };
+    if (scheduler) |*worker| {
+        const basis = try manager.modelBasis(try manager.revision("trunk"));
+        const count = if (basis) |pinned| pinned.execution.reviewWorkers() else 1;
+        for (review_threads[0..count]) |*thread| thread.* = try std.Thread.spawn(.{}, @import("review_worker.zig").Scheduler.loop, .{worker});
+    }
     var schedule_worker: ?@import("schedule_worker.zig").Scheduler = if (writable and schedule_executor != null) .{ .manager = manager, .executor = schedule_executor.? } else null;
     const schedule_thread: ?std.Thread = if (schedule_worker) |*worker| try std.Thread.spawn(.{}, @import("schedule_worker.zig").Scheduler.loop, .{worker}) else null;
     defer if (schedule_worker) |*worker| {

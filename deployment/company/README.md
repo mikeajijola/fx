@@ -1,7 +1,7 @@
 # Run the company service on one host
 
 These files deploy the current signed company gateway and independent review
-worker. They do not provide hosted actor isolation, SSO enrollment, or a complete
+workers. They do not provide hosted actor isolation, SSO enrollment, or a complete
 company reconciliation coordinator. See the supported operations and limits in
 [the workspace contracts](../../src/core/workspace/CONTRACTS.md#scoped-company-service).
 
@@ -74,8 +74,13 @@ Create a verified portable export with `omos fossil export PATH`. Preserve all
 company branches, including authority, views, proposals, and operation outcomes.
 Back up issuer material under `~/.fx/authority/`, review provider credentials,
 and the private environment file separately using the operator's protected
-backup procedure. Plain company exports do not contain those secrets. Current
-scoped exports are paginated content manifests, rather than complete packages.
+backup procedure. Plain company exports do not contain those secrets. Fossil
+repositories and scoped packages currently contain plaintext content. Use the
+host's encrypted storage and protected backup transport where your deployment
+requires encryption; object-level encryption and portable key-domain recovery
+are not implemented by this service. Current scoped exports can be downloaded as signed, content-addressed file packages with
+`omos fossil export-scope`, then verified offline with `omos fossil verify-scope`.
+They declare a file snapshot scope; capability dependency closure is not inferred.
 
 Before activating a restored instance on another host, stop and fence the old
 host. Bind the verified repository, inspect authority with `company` action
@@ -88,6 +93,16 @@ Company views reuse host mutation and integration checkouts while retaining
 separate canonical branches. Personal tasks still use their own native checkouts.
 Measure repository size, host checkout size, active view count, review duration,
 and storage growth when setting capacity expectations. Sparse projections,
-bounded shared caches, and continuous concurrent
+bounded shared caches, and continuous desired-state
 reconciliation remain required before treating this deployment as the complete
 large-company model.
+
+## Review capacity
+
+New instances store `server.review_workers: 2` in `execution/omos.json`. The
+accepted execution policy permits 1–4 workers. Restart the service after an
+explicit policy change; existing policies without this field use one worker.
+Each task retains its own review allowance and execution lease. Compatible
+changes to accepted state trigger reconciliation and fresh assessment within
+that allowance, while publication stays behind the coordinated writer boundary.
+Conflicts, stale approvals, and exhausted allowances remain recorded outcomes.

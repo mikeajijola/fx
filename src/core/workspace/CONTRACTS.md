@@ -194,6 +194,13 @@ permission to forge host evidence, activate incompatible definitions or publish
 a task directly. Writes check the expected revision under the workspace lease.
 The HTTP host supports persistent connections, at most 32 concurrent connection
 handlers and at most 100 requests per connection.
+Typed history queries consume and release bounded canonical history batches.
+Only the requested page's record bodies remain in the response arena; large
+records become immutable hash-and-size references. Provenance joins retain
+plan and action identities separately from their bodies. Queries still inspect
+every relevant canonical history identity, including records outside the page.
+Inventories and plan/action metadata grow with the selected history; pagination
+does not claim constant total memory or an indexed constant-time lookup.
 
 `read` accepts an original `path`, byte `offset` and a `limit` of at most 16,384
 bytes. Text segments use UTF-8; binary segments use base64 with offsets in the
@@ -645,9 +652,21 @@ separately from portable company content.
 Submission retains an immutable proposal, integrates compatible accepted
 changes, and queues independent review. Candidate files and host checkpoint
 receipts enter the assessor's evidence manifest. Publication checks live
-authority and the evaluated parent revision again. An advanced parent requires
-reconciliation and another assessment. Grants requiring human approval cannot
-publish automatically. Hosted company actor execution is rejected until an
+authority and the evaluated parent revision again. Independent reviews run on
+separate workers, with capacity pinned in `execution/omos.json` at server
+startup. Each claim follows the task's atomically committed current job pointer;
+retained historical jobs cannot become active by being rediscovered.
+
+If accepted state advances during assessment, the coordinator refreshes a
+compatible unpublished candidate and independently assesses it again within the
+same job's attempt, time, and token allowance. It never renews that allowance or
+replays actor tools. Conflicts and changed observed inputs require revision.
+An existing publication intent stays under publication recovery. Grants requiring
+human approval need a new exact decision after integration changes.
+Inspection compares an original proposal with its own recorded base. An
+interruption after committing refreshed state cannot make that retained
+proposal impossible to inspect or approve against the new base. Integration
+receipts preserve the original operation and candidate revision. Hosted company actor execution is rejected until an
 isolated execution backend is supplied; external runtimes can use scoped views.
 
 New company publications retain an issuer-signed authorization proof in their
@@ -666,8 +685,7 @@ proof; it cannot embed its own final check-in hash. Fossil ancestry and the
 immutable receipt path connect the proof to the resulting revision.
 
 This service currently supports path scopes and file or record conflict
-boundaries. Field-level record merges, query absence dependencies, dependency
-closure packaging, remote filesystem mounting, hosted actor isolation, human
-approval resolution, and continuous reconciliation retries require further
-implementation. They are not implied by signed requests or a successful
+boundaries. Field-level record merges, dependency closure packaging, remote
+filesystem mounting, hosted actor isolation, federated identity enrollment, and
+continuous desired-state reconciliation require further implementation. They are not implied by signed requests or a successful
 checkpoint.

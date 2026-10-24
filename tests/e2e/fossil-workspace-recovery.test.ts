@@ -707,81 +707,85 @@ sys.exit(result.returncode)
   }, 180000);
 
   test("requires a new operator decision after reconciling an approved proposal onto a newer accepted base", async () => {
-    const f = fixture();
-    const inference = model(f, (_body, count) => count === 1 ? writeMemory("Independent accepted company change") : { content: "Saved the independent memory change." });
-    expect((await f.run(["fossil", "init"])).code).toBe(0);
-    const admin = async (body: object, failure?: string) => {
-      const file = join(f.home, "operator.json");
-      writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
-      const result = await f.run(["fossil", "company", file, "--json"]);
-      if (failure) {
-        expect(result.code).toBe(1);
-        expect(result.stdout + result.stderr).toContain(failure);
-        return null;
-      }
-      expect(result.code, result.stderr).toBe(0);
-      return JSON.parse(result.stdout).model_data;
-    };
-    const initialized = await admin({ action: "initialize" });
-    const key = generateKeyPairSync("ed25519");
-    await admin({ action: "grant", revision: initialized.revision, grant: { id: "approval-worker", actor: "worker", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["documents/team/"], actions: ["create_view", "checkpoint", "submit", "status"], expires_ms: Date.now() + 3600000, human_approval: true } });
-    let service = await startWorkspaceService(f, true);
-    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
-    const send = async (action: string, params: object = {}) => {
-      const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "worker", grant: "approval-worker", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action, ...params });
-      const response = await fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", connection: "close" }, body: JSON.stringify({ payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") }) });
-      const body = await response.json() as any;
-      expect(response.status, JSON.stringify({ action, body })).toBe(200);
-      return JSON.parse(body.payload).result;
-    };
-    const stop = async () => { service.child.kill(); await service.child.exited; };
-    const waitJob = async (view: string, state: string, reason?: string) => {
-      const deadline = Date.now() + 60000;
-      let observed: any;
-      while (Date.now() < deadline) {
-        observed = await send("status", { view });
-        if (observed.job?.state === state && (reason === undefined || observed.job.reason === reason)) return observed;
-        await Bun.sleep(30);
-      }
-      throw Error(`Company review did not reach ${state}/${reason}: ${JSON.stringify(observed)}`);
-    };
-    const inspect = async (view: string) => admin({ action: "inspect_proposal", revision: (await admin({ action: "status" })).revision, view });
-    const approve = async (view: string, candidate_hash: string, failure?: string) => admin({ action: "approve", revision: (await admin({ action: "status" })).revision, view, candidate_hash, expires_ms: Date.now() + 300000 }, failure);
-    try {
-      const view = await send("create_view", { revision: boot.revision, objective: "Save the approved company report" });
-      const saved = await send("checkpoint", { view: view.view, revision: view.revision, path: "documents/team/report.md", content: "Approved team report" });
-      const candidate = "Saved the approved team report.";
-      await send("submit", { view: view.view, revision: saved.revision, candidate });
-      await waitJob(view.view, "blocked", "CompanyApprovalRequired");
-      await stop();
-      const original = await inspect(view.view);
-      await approve(view.view, original.candidate_hash);
-      const independent = await f.run(["ask", "Save an independent company memory note", "--json"]);
-      expect(independent.code, independent.stderr).toBe(0);
-      const actorCount = inference.counts().actors;
-      expect(actorCount).toBe(2);
-      service = await startWorkspaceService(f, true);
-      await waitJob(view.view, "changes_required", "CompanyReconciliationRequired");
-      await stop();
-      await approve(view.view, original.candidate_hash, "CompanyReconciliationRequired");
-      service = await startWorkspaceService(f, true);
-      const current = await send("status", { view: view.view });
-      await send("submit", { view: view.view, revision: current.revision, candidate });
-      await waitJob(view.view, "blocked", "CompanyApprovalStale");
-      await stop();
-      const integrated = await inspect(view.view);
-      expect(integrated.candidate_hash).not.toBe(original.candidate_hash);
-      expect(integrated.candidate.base_revision).not.toBe(original.candidate.base_revision);
-      expect(integrated.candidate.changes_sha256).toBe(original.candidate.changes_sha256);
-      await approve(view.view, integrated.candidate_hash);
-      service = await startWorkspaceService(f, true);
-      const published = await waitJob(view.view, "published");
-      expect(published.state).toBe("accepted");
-      expect(inference.counts().actors).toBe(actorCount);
-      expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Independent accepted company change");
-      expect(f.fossil("cat", "documents/team/report.md", "-r", "trunk")).toBe("Approved team report");
-    } finally { await stop(); }
-  }, 180000);
+    for (const interrupted of [false, true]) {
+      const f = fixture();
+      const inference = model(f, (_body, count) => count === 1 ? writeMemory("Independent accepted company change") : { content: "Saved the independent memory change." });
+      expect((await f.run(["fossil", "init"])).code).toBe(0);
+      const admin = async (body: object, failure?: string) => {
+        const file = join(f.home, "operator.json");
+        writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+        const result = await f.run(["fossil", "company", file, "--json"]);
+        if (failure) {
+          expect(result.code).toBe(1);
+          expect(result.stdout + result.stderr).toContain(failure);
+          return null;
+        }
+        expect(result.code, result.stderr).toBe(0);
+        return JSON.parse(result.stdout).model_data;
+      };
+      const initialized = await admin({ action: "initialize" });
+      const key = generateKeyPairSync("ed25519");
+      await admin({ action: "grant", revision: initialized.revision, grant: { id: "approval-worker", actor: "worker", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["documents/team/"], actions: ["create_view", "checkpoint", "submit", "status"], expires_ms: Date.now() + 3600000, human_approval: true } });
+      let service = await startWorkspaceService(f, true);
+      const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+      const send = async (action: string, params: object = {}) => {
+        const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "worker", grant: "approval-worker", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action, ...params });
+        const response = await fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", connection: "close" }, body: JSON.stringify({ payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") }) });
+        const body = await response.json() as any;
+        expect(response.status, JSON.stringify({ action, body })).toBe(200);
+        return JSON.parse(body.payload).result;
+      };
+      const stop = async () => { service.child.kill(); await service.child.exited; };
+      const waitJob = async (view: string, state: string, reason?: string) => {
+        const deadline = Date.now() + 60000;
+        let observed: any;
+        while (Date.now() < deadline) {
+          observed = await send("status", { view });
+          if (observed.job?.state === state && (reason === undefined || observed.job.reason === reason)) return observed;
+          await Bun.sleep(30);
+        }
+        throw Error(`Company review did not reach ${state}/${reason}: ${JSON.stringify(observed)}`);
+      };
+      const inspect = async (view: string) => admin({ action: "inspect_proposal", revision: (await admin({ action: "status" })).revision, view });
+      const approve = async (view: string, candidate_hash: string, failure?: string) => admin({ action: "approve", revision: (await admin({ action: "status" })).revision, view, candidate_hash, expires_ms: Date.now() + 300000 }, failure);
+      try {
+        const view = await send("create_view", { revision: boot.revision, objective: "Save the approved company report" });
+        const saved = await send("checkpoint", { view: view.view, revision: view.revision, path: "documents/team/report.md", content: "Approved team report" });
+        const candidate = "Saved the approved team report.";
+        await send("submit", { view: view.view, revision: saved.revision, candidate });
+        await waitJob(view.view, "blocked", "CompanyApprovalRequired");
+        await stop();
+        const original = await inspect(view.view);
+        await approve(view.view, original.candidate_hash);
+        const independent = await f.run(["ask", "Save an independent company memory note", "--json"]);
+        expect(independent.code, independent.stderr).toBe(0);
+        const actorCount = inference.counts().actors;
+        expect(actorCount).toBe(2);
+        service = await startWorkspaceService(f, true, interrupted ? { FX_E2E_FOSSIL_FAULT: "company-submission-refreshed" } : {});
+        // The coordinator now refreshes compatible unpublished proposals itself.
+        // That refresh invalidates the exact human decision and cannot publish.
+        await waitJob(view.view, interrupted ? "failed" : "blocked", interrupted ? "WorkspaceInjectedFailure" : "CompanyApprovalStale");
+        await stop();
+        await approve(view.view, original.candidate_hash, "CompanyApprovalStale");
+        const integrated = await inspect(view.view);
+        expect(integrated.candidate_hash).not.toBe(original.candidate_hash);
+        expect(integrated.candidate.base_revision).not.toBe(original.candidate.base_revision);
+        expect(integrated.candidate.changes_sha256).toBe(original.candidate.changes_sha256);
+        expect(integrated.candidate.proposal_revision).toBe(original.candidate.proposal_revision);
+        expect(integrated.candidate.proposal_operation).toBe(original.candidate.proposal_operation);
+        expect(integrated.candidate.candidate_sha256).toBe(original.candidate.candidate_sha256);
+        if (interrupted) expect(integrated.candidate.integration_revision).toBe(original.candidate.integration_revision);
+        else expect(integrated.candidate.integration_revision).not.toBe(original.candidate.integration_revision);
+        await approve(view.view, integrated.candidate_hash);
+        service = await startWorkspaceService(f, true);
+        const published = await waitJob(view.view, "published");
+        expect(published.state).toBe("accepted");
+        expect(inference.counts().actors).toBe(actorCount);
+        expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Independent accepted company change");
+        expect(f.fossil("cat", "documents/team/report.md", "-r", "trunk")).toBe("Approved team report");
+      } finally { await stop(); }
+    }
+  }, 240000);
 
   test("recovers submission preparation, frozen reads and refreshed integration without replaying actors or changing its inputs", async () => {
     for (const stage of ["company-submission-prepared", "company-reads-frozen", "company-submission-refreshed"]) {
@@ -1299,6 +1303,84 @@ sys.exit(result.returncode)
       if (restoredService) { restoredService.child.kill(); await restoredService.child.exited; }
     }
   }, 90000);
+
+  test("reviews independent company proposals concurrently and reassesses an advanced accepted base within the same allowance", async () => {
+    const f = fixture();
+    let inspecting = 0;
+    let release: () => void = () => {};
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const gateway = model(f, () => { throw Error("Company review must not execute actors"); }, async () => {
+      if (++inspecting <= 2) await gate;
+      return "met";
+    });
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    expect(JSON.parse(f.fossil("cat", "execution/omos.json", "-r", "trunk")).server.review_workers).toBe(2);
+    const admin = async (body: object) => {
+      const path = join(f.home, "operator.json");
+      writeFileSync(path, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+      const result = await f.run(["fossil", "company", path, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    const initialized = await admin({ action: "initialize" });
+    const key = generateKeyPairSync("ed25519");
+    await admin({ action: "grant", revision: initialized.revision, grant: {
+      id: "parallel-worker", actor: "worker", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"),
+      paths: ["documents/"], actions: ["create_view", "checkpoint", "submit", "status"], expires_ms: Date.now() + 3600000,
+    } });
+    const service = await startWorkspaceService(f, true);
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const send = async (action: string, params: object) => {
+      const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "worker", grant: "parallel-worker", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action, ...params });
+      const response = await fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", connection: "close" }, body: JSON.stringify({ payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") }) });
+      const result = await response.json() as any;
+      expect(response.status, JSON.stringify(result)).toBe(200);
+      return JSON.parse(result.payload).result;
+    };
+    try {
+      const views = [];
+      for (const name of ["alpha", "beta"]) {
+        const view = await send("create_view", { revision: boot.revision, objective: `Save documents/${name}.md containing ${name}` });
+        const saved = await send("checkpoint", { view: view.view, revision: view.revision, path: `documents/${name}.md`, content: name, previous_hash: null });
+        views.push({ ...view, revision: saved.revision, name, job: "" });
+      }
+      for (const view of views) {
+        const submitted = await send("submit", { view: view.view, revision: view.revision, candidate: `Saved documents/${view.name}.md containing ${view.name}.` });
+        view.job = submitted.job;
+      }
+      const startDeadline = Date.now() + 30000;
+      while (inspecting < 2 && Date.now() < startDeadline) await Bun.sleep(20);
+      // Neither model response can finish until both workers are inspecting.
+      expect(inspecting, readFileSync(f.env.FX_TRACE_LOG, "utf8").slice(-5000)).toBe(2);
+      release();
+      const statuses = [];
+      for (const view of views) {
+        let status: any;
+        const deadline = Date.now() + 90000;
+        do {
+          status = await send("status", { view: view.view });
+          if (!["queued", "running"].includes(status.job?.state)) break;
+          await Bun.sleep(30);
+        } while (Date.now() < deadline);
+        expect(status.job?.id).toBe(view.job);
+        expect(status.job?.state, JSON.stringify(status) + "\n" + readFileSync(f.env.FX_TRACE_LOG, "utf8").slice(-8000)).toBe("published");
+        expect(status.job.generation, JSON.stringify({ job: status.job, counts: gateway.counts() }) + "\n" + readFileSync(f.env.FX_TRACE_LOG, "utf8").slice(-16000)).toBe(1);
+        expect(status.job.budget_epoch).toBe(1);
+        statuses.push(status);
+      }
+      expect(f.fossil("cat", "documents/alpha.md", "-r", "trunk")).toBe("alpha");
+      expect(f.fossil("cat", "documents/beta.md", "-r", "trunk")).toBe("beta");
+      expect(statuses.map(status => status.job.review_attempts).sort()).toEqual([1, 2]);
+      expect(gateway.counts()).toEqual({ actors: 0, assessments: 3 });
+      const bases = statuses.map(status => JSON.parse(status.publication.issuer_proof.payload).target_base);
+      // The later publication must evaluate a base containing the earlier
+      // accepted change, regardless of which worker wins the writer lease.
+      expect(bases.some((base, index) => f.fossil("ls", "-r", base).includes(`documents/${views[1 - index].name}.md`)), JSON.stringify({ bases, jobs: statuses.map(status => status.job) })).toBe(true);
+      expect((await f.run(["fossil", "verify", "--json"])).code).toBe(0);
+    } finally {
+      release(); service.child.kill(); await service.child.exited;
+    }
+  }, 180000);
 
   test("publishes independently reviewed company proposals and fences revocation during assessment", async () => {
     for (const revoked of [false, true]) {
@@ -2147,6 +2229,79 @@ sys.exit(result.returncode)
       await service.child.exited;
     }
   }, 90000);
+
+  test("pages typed history beyond one Fossil packet and retains provenance without unselected payloads", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    model(f, () => ({ content: "Retain this candidate for inspection." }), () => "blocked");
+    expect((await f.run(["ask", "Retain a candidate for a typed history query", "--json"])).code).toBe(1);
+    const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    const tree = join(f.home, "typed-history-fixture");
+    mkdirSync(tree);
+    const fossil = (...args: string[]) => {
+      const result = spawnSync("fossil", args, { cwd: tree, env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, USER: "omos", LC_ALL: "C" }, encoding: "utf8" });
+      expect(result.status, result.stderr).toBe(0);
+      return result.stdout;
+    };
+    fossil("open", "--nosync", join(f.cwd, "omos.fossil"), task.branch);
+    const history = join(tree, "history", task.id);
+    mkdirSync(history, { recursive: true });
+    const originals = new Map<string, { path: string; bytes: number; sha256: string }>();
+    const save = (kind: string, value: any) => {
+      const raw = JSON.stringify({ kind, task: task.id, contract_version: task.definition.version, value });
+      const sha256 = createHash("sha256").update(raw).digest("hex");
+      const path = `history/${task.id}/${sha256}.json`;
+      writeFileSync(join(tree, path), raw);
+      return { path, bytes: Buffer.byteLength(raw), sha256 };
+    };
+    for (let i = 0; i < 60; i++) {
+      save("action_intent", { calls: [{ id: `call-${i}`, execution_id: `call-${i}`, name: "fixture_receipt", arguments: "{}" }] });
+      const id = `tool:query:${i}`;
+      originals.set(id, save("tool_evidence", [{ id, action_id: `call-${i}`, kind: "tool", tool: "fixture_receipt", status: "success", content: "x".repeat(220 * 1024) }]));
+    }
+    expect([...originals.values()].reduce((sum, record) => sum + record.bytes, 0)).toBeGreaterThan(8 * 1024 * 1024);
+    fossil("add", "history"); fossil("commit", "--nosync", "--no-warnings", "-m", "Retain canonical query fixtures");
+    const revision = fossil("timeline", "ancestors", task.branch, "--limit", "1", "--format", "%H", "--quiet").split("\n")[0].trim();
+    const service = await startWorkspaceService(f);
+    try {
+      const boot = await (await fetch(service.url + "/v1/definition", { headers: service.headers })).json() as any;
+      const basis = { version: "omos.workspace-api/v1", workspace: service.ready.workspace, definition_hash: boot.definition.basis.definition_hash, revision, task: task.id, action: "query", entity: "omos_evidence" };
+      const seen = new Set<string>();
+      let offset = 0;
+      for (;;) {
+        const response = await service.post({ ...basis, offset });
+        const raw = await response.text();
+        expect(response.status, raw).toBe(200);
+        expect(Buffer.byteLength(raw)).toBeLessThan(128 * 1024);
+        const page = JSON.parse(raw).data;
+        expect(page.total).toBe(60);
+        expect(page.records.length).toBeLessThanOrEqual(32);
+        for (const record of page.records) {
+          expect(seen.has(record.id)).toBe(false);
+          seen.add(record.id);
+          expect(record.complete).toBe(false);
+          expect({ path: record.source_path, bytes: record.bytes, sha256: record.sha256 }).toEqual(originals.get(record.id));
+        }
+        if (page.next_offset === null) break;
+        expect(page.next_offset).toBeGreaterThan(offset);
+        offset = page.next_offset;
+      }
+      expect(seen.size).toBe(60);
+      const later = await service.post({ ...basis, offset: 60 });
+      const provenance = (await later.json() as any).data;
+      expect(provenance.records).toEqual([]);
+      expect(provenance.relationships.some((edge: any) => edge.relationship === "omos_plan_actions")).toBe(true);
+      expect(provenance.relationships.every((edge: any) => edge.task === task.id && edge.from && edge.to)).toBe(true);
+      // Even an unselected record must retain its canonical identity check.
+      const changed = [...originals.values()][0];
+      appendFileSync(join(tree, changed.path), " ");
+      fossil("commit", "--nosync", "--no-warnings", "-m", "Corrupt an unselected fixture hash");
+      const fresh = fossil("timeline", "ancestors", task.branch, "--limit", "1", "--format", "%H", "--quiet").split("\n")[0].trim();
+      const rejected = await service.post({ ...basis, revision: fresh, offset: 10000 });
+      expect(rejected.status).toBe(400);
+      expect(await rejected.text()).toContain("InvalidWorkspaceJournal");
+    } finally { service.child.kill(); await service.child.exited; }
+  }, 180000);
 
   test("recovers an expired server review lease and retains evidence inspection without actor replay", async () => {
     const f = fixture();
