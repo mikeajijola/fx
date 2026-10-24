@@ -79,6 +79,32 @@ Neither kind of relationship establishes completion by itself. Record and
 relationship pages are independently bounded to 32 entries and expose their
 continuation offsets.
 
+The managed reviewer traverses hash-verified history in bounded batches and
+keeps file identities and bounded previews in its manifest. Large evidence
+payloads live in a private, rebuildable `review-payloads/` cache under the
+repository's profile cache. They are not additional canonical records and do
+not enter portable exports. The host reconstructs them from the pinned Fossil
+revision when missing, repairs corrupted cache entries during reconstruction,
+and checks size and full SHA-256 before delivering cached bytes. The manifest
+never treats a preview as the original payload. Progress checkpoints use the
+same backing records and preserve the full canonical identities used to
+distinguish useful work from repeated results.
+
+Retrieval and lexical search load one payload into independently released
+scratch memory at a time. Each serialized payload has a 64 MiB host ceiling;
+workspace content and canonical records retain their existing, separate file
+bounds. Memory still scales with manifest and assessment metadata, rather than
+with the sum of all payload bodies. Arbitrary external process memory and
+provider session storage are outside this bound.
+
+Raw prior-page replay has a 256 KiB host window and a 160 KiB assessor-packet
+window. Older pages remain in canonical history. Independently verified segment
+assessments retain inspection progress beyond these windows; an unassessed page
+may need to be retrieved again. Candidate recovery, source-validation lookup,
+and dependency preview generation also release each content batch before
+loading the next one. Binary workspace files receive an explicit base64 content
+envelope with their original file hash and byte count.
+
 Search previews never establish inspection of omitted bytes. Coverage queries
 return exact missing ranges and the payload hash. Complete record citations
 still require complete coverage or independently verified segment assessments.

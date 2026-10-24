@@ -4896,6 +4896,10 @@ test {
     _ = @import("core/workspace/company_records.zig");
     _ = @import("core/workspace/company_reads.zig");
     _ = @import("core/workspace/workspace_client.zig");
+    _ = @import("core/workspace/review_spool.zig");
+    _ = @import("core/workspace/task_governance.zig");
+    _ = @import("core/agent/runtime/review_evidence.zig");
+    _ = @import("core/agent/runtime/review_checkpoints.zig");
     _ = @import("core/workspace/fossil_manifest.zig");
     _ = @import("core/workspace/profile_photo.zig");
     _ = @import("core/workspace/declaration_schema.zig");

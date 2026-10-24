@@ -15,6 +15,7 @@ pub const Turn = struct {
     review_only_candidate: ?[]const u8 = null,
     source_basis: ?[]const u8 = null,
     prior_review_pages: []const []const u8 = &.{},
+    prior_payloads: []const @import("../agent/runtime/review_evidence.zig").PayloadRef = &.{},
     prior_review_checkpoints: []const []const u8 = &.{},
     recorded_evidence: std.ArrayList([]const u8) = .empty,
     invocation_id: ?[]const u8 = null,
@@ -140,7 +141,14 @@ pub const Turn = struct {
         self.review_snapshot = "";
         self.review_only_candidate = null;
         self.prior_review_pages = &.{};
+        self.prior_payloads = &.{};
         self.prior_review_checkpoints = &.{};
+    }
+
+    fn appendReviewEvidence(self: *Turn, alloc: std.mem.Allocator, rows: *std.ArrayList(review.Evidence), payloads: *std.ArrayList(@import("../agent/runtime/review_evidence.zig").PayloadRef), record: review.Evidence) !void {
+        const detached = try @import("review_spool.zig").detach(alloc, self.manager.root, record);
+        try rows.append(alloc, detached.record);
+        if (detached.payload) |reference| try payloads.append(alloc, reference);
     }
 
     pub noinline fn beforeReview(self: *Turn, alloc: std.mem.Allocator, messages: []const types.ChatMessage) ![]const review.Evidence {
@@ -148,11 +156,17 @@ pub const Turn = struct {
         if (self.task.revision_pending) return error.TaskContractRevisionPending;
         self.reviewed_revision = try self.manager.checkpoint(self.task);
         var evidence: std.ArrayList(review.Evidence) = .empty;
+        var payloads: std.ArrayList(@import("../agent/runtime/review_evidence.zig").PayloadRef) = .empty;
         var pages: std.ArrayList([]const u8) = .empty;
+        var page_bytes: usize = 0;
         var checkpoints: std.ArrayList([]const u8) = .empty;
         for (self.task.company_reads) |reference| {
-            const bytes = try self.manager.contentAt(reference.path, reference.revision);
-            try evidence.append(alloc, .{ .id = try alloc.print("workspace-read:{s}", .{try workspace.hash(alloc, bytes)}), .kind = .verification, .status = .success, .content = bytes });
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            var reader = self.manager;
+            reader.alloc = scratch.allocator();
+            const bytes = try reader.contentAt(reference.path, reference.revision);
+            try self.appendReviewEvidence(alloc, &evidence, &payloads, .{ .id = try reader.alloc.print("workspace-read:{s}", .{try workspace.hash(reader.alloc, bytes)}), .kind = .verification, .status = .success, .content = bytes });
         }
         if (self.task.authority != null) {
             const prefix = try alloc.print("company/checkpoints/{s}/", .{self.task.id});
@@ -160,49 +174,79 @@ pub const Turn = struct {
                 if (!std.mem.startsWith(u8, path, prefix)) continue;
                 const name = std.Io.Dir.path.basename(path);
                 if (name.len <= 5 or !std.mem.endsWith(u8, name, ".json")) return error.WorkspaceVerificationFailed;
-                _ = (try self.manager.companyCheckpointRevision(self.task, name[0 .. name.len - 5])) orelse return error.WorkspaceVerificationFailed;
-                const bytes = try self.manager.contentAt(path, self.reviewed_revision.?);
-                try evidence.append(alloc, .{ .id = try alloc.print("workspace-checkpoint:{s}", .{try workspace.hash(alloc, bytes)}), .kind = .verification, .status = .success, .content = bytes });
+                var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer scratch.deinit();
+                var reader = self.manager;
+                reader.alloc = scratch.allocator();
+                _ = (try reader.companyCheckpointRevision(self.task, name[0 .. name.len - 5])) orelse return error.WorkspaceVerificationFailed;
+                const bytes = try reader.contentAt(path, self.reviewed_revision.?);
+                try self.appendReviewEvidence(alloc, &evidence, &payloads, .{ .id = try reader.alloc.print("workspace-checkpoint:{s}", .{try workspace.hash(reader.alloc, bytes)}), .kind = .verification, .status = .success, .content = bytes });
             }
         }
-        for (try self.manager.taskHistory(self.task, self.reviewed_revision.?)) |bytes| {
-            const Entry = struct { kind: []const u8, task: []const u8, contract_version: u32, value: std.json.Value };
-            const entry = (try std.json.parseFromSlice(Entry, alloc, bytes, .{ .ignore_unknown_fields = true })).value;
-            if (std.mem.eql(u8, entry.kind, "command_receipt") or std.mem.eql(u8, entry.kind, "ui_source_validation")) {
-                const content = try std.json.Stringify.valueAlloc(alloc, entry.value, .{});
-                try evidence.append(alloc, .{
-                    .id = try alloc.print("command-receipt:{s}", .{try workspace.hash(alloc, content)}),
-                    .kind = .verification,
-                    .content = content,
-                    .status = if (std.mem.eql(u8, @import("definition.zig").text(entry.value, "outcome"), "failed") or std.mem.eql(u8, @import("definition.zig").text(entry.value, "status"), "failed")) .failure else if (std.mem.eql(u8, entry.kind, "ui_source_validation") and std.mem.eql(u8, @import("definition.zig").text(entry.value, "status"), "passed")) .success else null,
-                    .action_id = @import("definition.zig").text(entry.value, "action_id"),
-                    .source = @import("definition.zig").text(entry.value, "source"),
-                });
-            }
-            if (std.mem.eql(u8, entry.kind, "review_evidence_page") and entry.contract_version == self.task.definition.version) {
-                if (entry.value == .object) if (entry.value.object.get("data")) |data| if (data == .string) try pages.append(alloc, data.string);
-            }
-            if (std.mem.eql(u8, entry.kind, "review_segment_assessment") and entry.contract_version == self.task.definition.version) {
-                if (entry.value == .object) if (entry.value.object.get("data")) |data| if (data == .string) try checkpoints.append(alloc, data.string);
-            }
-            if (!std.mem.eql(u8, entry.kind, "tool_evidence")) continue;
-            const records = (try std.json.parseFromValue([]review.Evidence, alloc, entry.value, .{})).value;
-            for (records) |record| {
-                const present = for (evidence.items) |existing| {
-                    if (std.mem.eql(u8, record.id, existing.id)) break true;
-                } else false;
-                if (!present) try evidence.append(alloc, record);
+        var history = try self.manager.historyCursor(self.task, self.reviewed_revision.?);
+        while (history.offset < history.paths.len) {
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            var reader = self.manager;
+            reader.alloc = scratch.allocator();
+            const a = reader.alloc;
+            const batch = (try history.next(a)) orelse break;
+            for (batch) |bytes| {
+                const Entry = struct { kind: []const u8, task: []const u8, contract_version: u32, value: std.json.Value };
+                const entry = (try std.json.parseFromSlice(Entry, a, bytes, .{ .ignore_unknown_fields = true })).value;
+                if (!std.mem.eql(u8, entry.task, self.task.id)) return error.InvalidWorkspaceJournal;
+                if (std.mem.eql(u8, entry.kind, "command_receipt") or std.mem.eql(u8, entry.kind, "ui_source_validation")) {
+                    const content = try std.json.Stringify.valueAlloc(a, entry.value, .{});
+                    try self.appendReviewEvidence(alloc, &evidence, &payloads, .{
+                        .id = try a.print("command-receipt:{s}", .{try workspace.hash(a, content)}),
+                        .kind = .verification,
+                        .content = content,
+                        .status = if (std.mem.eql(u8, @import("definition.zig").text(entry.value, "outcome"), "failed") or std.mem.eql(u8, @import("definition.zig").text(entry.value, "status"), "failed")) .failure else if (std.mem.eql(u8, entry.kind, "ui_source_validation") and std.mem.eql(u8, @import("definition.zig").text(entry.value, "status"), "passed")) .success else null,
+                        .action_id = @import("definition.zig").text(entry.value, "action_id"),
+                        .source = @import("definition.zig").text(entry.value, "source"),
+                    });
+                }
+                if (std.mem.eql(u8, entry.kind, "review_evidence_page") and entry.contract_version == self.task.definition.version) {
+                    if (entry.value == .object) if (entry.value.object.get("data")) |data| if (data == .string and data.string.len <= 256 * 1024 - page_bytes) {
+                        // Raw replay is a bounded convenience window. Independent
+                        // segment decisions below preserve progress beyond it.
+                        try pages.append(alloc, try alloc.dupe(u8, data.string));
+                        page_bytes += data.string.len;
+                    };
+                }
+                if (std.mem.eql(u8, entry.kind, "review_segment_assessment") and entry.contract_version == self.task.definition.version) {
+                    if (entry.value == .object) if (entry.value.object.get("data")) |data| if (data == .string) try checkpoints.append(alloc, try alloc.dupe(u8, data.string));
+                }
+                if (!std.mem.eql(u8, entry.kind, "tool_evidence")) continue;
+                const records = (try std.json.parseFromValue([]review.Evidence, a, entry.value, .{})).value;
+                for (records) |record| {
+                    const present = for (evidence.items) |existing| {
+                        if (std.mem.eql(u8, record.id, existing.id)) break true;
+                    } else false;
+                    if (!present) try self.appendReviewEvidence(alloc, &evidence, &payloads, record);
+                }
             }
         }
         self.prior_review_pages = pages.items;
         self.prior_review_checkpoints = checkpoints.items;
         const inputs = try self.manager.reviewInputs(self.task, self.reviewed_revision.?);
         self.review_snapshot = inputs.snapshot;
-        if (self.source_basis) |source| try evidence.append(alloc, .{ .id = try alloc.print("source-state:{s}", .{source}), .kind = .verification, .content = try std.json.Stringify.valueAlloc(alloc, .{ .source_hash = source, .note = "Current source bytes observed by the host; validation requires a matching successful command receipt." }, .{}) });
-        try evidence.append(alloc, try review.workspaceEvidence(alloc, self.review_snapshot));
+        if (self.source_basis) |source| try self.appendReviewEvidence(alloc, &evidence, &payloads, .{ .id = try alloc.print("source-state:{s}", .{source}), .kind = .verification, .content = try std.json.Stringify.valueAlloc(alloc, .{ .source_hash = source, .note = "Current source bytes observed by the host; validation requires a matching successful command receipt." }, .{}) });
+        try self.appendReviewEvidence(alloc, &evidence, &payloads, try review.workspaceEvidence(alloc, self.review_snapshot));
         for (inputs.files) |file| {
-            try evidence.append(alloc, .{ .id = try alloc.print("workspace-file:{s}:{s}", .{ file.hash, file.path }), .kind = .workspace, .content = file.content });
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            var reader = self.manager;
+            reader.alloc = scratch.allocator();
+            const bytes = try reader.contentAt(file.path, self.reviewed_revision.?);
+            if (!std.mem.eql(u8, file.hash, try workspace.hash(reader.alloc, bytes))) return error.WorkspaceVerificationFailed;
+            const content = if (std.unicode.utf8ValidateSlice(bytes)) bytes else blk: {
+                const buffer = try reader.alloc.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+                break :blk try std.json.Stringify.valueAlloc(reader.alloc, .{ .encoding = "base64", .bytes = bytes.len, .sha256 = file.hash, .content = std.base64.standard.Encoder.encode(buffer, bytes) }, .{});
+            };
+            try self.appendReviewEvidence(alloc, &evidence, &payloads, .{ .id = try reader.alloc.print("workspace-file:{s}:{s}", .{ file.hash, file.path }), .kind = .workspace, .content = content, .source = file.path });
         }
+        self.prior_payloads = payloads.items;
         return evidence.toOwnedSlice(alloc);
     }
 
@@ -219,18 +263,26 @@ pub const Turn = struct {
     pub fn reviewProgress(self: *Turn) ![]const u8 {
         const revision = try self.manager.checkpoint(self.task);
         var identities: std.StringHashMapUnmanaged(void) = .empty;
-        for (try self.manager.taskHistory(self.task, revision)) |raw| {
-            const model = @import("definition.zig");
-            const row = (try std.json.parseFromSlice(std.json.Value, self.manager.alloc, raw, .{})).value;
-            const kind = model.text(row, "kind");
-            if (!std.mem.eql(u8, kind, "review_evidence_page") and !std.mem.eql(u8, kind, "review_segment_assessment")) continue;
-            const version = model.field(row, "contract_version") orelse continue;
-            if (version != .integer or version.integer != self.task.definition.version) continue;
-            const value = model.field(row, "value") orelse continue;
-            const data = model.text(value, "data");
-            const page = (std.json.parseFromSlice(std.json.Value, self.manager.alloc, data, .{}) catch continue).value;
-            if (std.mem.eql(u8, kind, "review_evidence_page") and model.text(page, "id").len == 0) continue;
-            try identities.put(self.manager.alloc, try workspace.hash(self.manager.alloc, data), {});
+        var history = try self.manager.historyCursor(self.task, revision);
+        while (history.offset < history.paths.len) {
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            var reader = self.manager;
+            reader.alloc = scratch.allocator();
+            const batch = (try history.next(reader.alloc)) orelse break;
+            for (batch) |raw| {
+                const model = @import("definition.zig");
+                const row = (try std.json.parseFromSlice(std.json.Value, reader.alloc, raw, .{})).value;
+                const kind = model.text(row, "kind");
+                if (!std.mem.eql(u8, kind, "review_evidence_page") and !std.mem.eql(u8, kind, "review_segment_assessment")) continue;
+                const version = model.field(row, "contract_version") orelse continue;
+                if (version != .integer or version.integer != self.task.definition.version) continue;
+                const value = model.field(row, "value") orelse continue;
+                const data = model.text(value, "data");
+                const page = (std.json.parseFromSlice(std.json.Value, reader.alloc, data, .{}) catch continue).value;
+                if (std.mem.eql(u8, kind, "review_evidence_page") and model.text(page, "id").len == 0) continue;
+                try identities.put(self.manager.alloc, try workspace.hash(self.manager.alloc, data), {});
+            }
         }
         // Count distinct immutable pages; repeated identical pages do not advance.
         return self.manager.alloc.print("{d}", .{identities.count()});
@@ -256,34 +308,36 @@ pub const Turn = struct {
     pub fn sourceAssessmentCurrent(self: *Turn, bytes: []const u8) !bool {
         const basis = self.task.model_basis orelse return true;
         if (basis.capability == null or !std.mem.eql(u8, basis.capability.?, "coding_task")) return true;
-        const current = try @import("source_state.zig").fingerprint(self.manager.alloc, self.task.project_root, self.manager.repository);
-        const history = try self.manager.taskHistory(self.task, self.reviewed_revision.?);
-        const assessment = try record_json.decode(@import("../agent/runtime/work_contract.zig").Assessment, self.manager.alloc, bytes, .{});
-        for (assessment.obligations) |obligation| {
-            if (!std.mem.eql(u8, obligation.id, "coding_validation") or obligation.status != .met) continue;
-            var supported = false;
-            for (history) |raw| {
-                const record = (try std.json.parseFromSlice(std.json.Value, self.manager.alloc, raw, .{})).value;
+        const alloc = self.manager.alloc;
+        const current = try @import("source_state.zig").fingerprint(alloc, self.task.project_root, self.manager.repository);
+        const assessment = try record_json.decode(@import("../agent/runtime/work_contract.zig").Assessment, alloc, bytes, .{});
+        var validations: std.StringHashMapUnmanaged(void) = .empty;
+        var receipts: std.StringHashMapUnmanaged([]const u8) = .empty;
+        var history = try self.manager.historyCursor(self.task, self.reviewed_revision.?);
+        while (history.offset < history.paths.len) {
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            const batch = (try history.next(a)) orelse break;
+            for (batch) |raw| {
+                const row = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
                 const model = @import("definition.zig");
-                if (!std.mem.eql(u8, model.text(record, "kind"), "source_validation")) continue;
-                const value = model.field(record, "value") orelse continue;
-                if (!std.mem.eql(u8, model.text(value, "source"), current)) continue;
-                for (obligation.evidence) |id| {
-                    if (std.mem.eql(u8, id, model.text(value, "evidence"))) {
-                        supported = true;
-                        continue;
-                    }
-                    for (history) |receipt_raw| {
-                        const receipt_row = (try std.json.parseFromSlice(std.json.Value, self.manager.alloc, receipt_raw, .{})).value;
-                        if (!std.mem.eql(u8, model.text(receipt_row, "kind"), "command_receipt")) continue;
-                        const receipt = model.field(receipt_row, "value") orelse continue;
-                        if (!std.mem.eql(u8, model.text(receipt, "outcome"), "succeeded") or !std.mem.eql(u8, model.text(receipt, "evidence_id"), model.text(value, "evidence"))) continue;
-                        const content = try std.json.Stringify.valueAlloc(self.manager.alloc, receipt, .{});
-                        const reference = try self.manager.alloc.print("command-receipt:{s}", .{try workspace.hash(self.manager.alloc, content)});
-                        if (std.mem.eql(u8, id, reference)) supported = true;
-                    }
+                const value = model.field(row, "value") orelse continue;
+                if (std.mem.eql(u8, model.text(row, "kind"), "source_validation") and std.mem.eql(u8, model.text(value, "source"), current)) {
+                    try validations.put(alloc, try alloc.dupe(u8, model.text(value, "evidence")), {});
+                } else if (std.mem.eql(u8, model.text(row, "kind"), "command_receipt") and std.mem.eql(u8, model.text(value, "outcome"), "succeeded") and std.mem.eql(u8, model.text(value, "source"), current)) {
+                    const content = try std.json.Stringify.valueAlloc(a, value, .{});
+                    const reference = try alloc.print("command-receipt:{s}", .{try workspace.hash(a, content)});
+                    try receipts.put(alloc, reference, try alloc.dupe(u8, model.text(value, "evidence_id")));
                 }
             }
+        }
+        for (assessment.obligations) |obligation| {
+            if (!std.mem.eql(u8, obligation.id, "coding_validation") or obligation.status != .met) continue;
+            const supported = for (obligation.evidence) |id| {
+                if (validations.contains(id)) break true;
+                if (receipts.get(id)) |source| if (validations.contains(source)) break true;
+            } else false;
             if (!supported) return false;
         }
         return true;

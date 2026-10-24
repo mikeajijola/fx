@@ -6940,6 +6940,7 @@ noinline fn assessCompletionAttempt(
         .definition = if (input.managed) |turn| turn.task.definition else null,
         .original_request = if (input.managed) |turn| try turn.manager.originalRequest(turn.task) else null,
         .prior_evidence = prior_evidence,
+        .prior_payloads = if (input.managed) |turn| turn.prior_payloads else &.{},
         .prior_review_pages = if (input.managed) |turn| turn.prior_review_pages else &.{},
         .prior_review_checkpoints = if (input.managed) |turn| turn.prior_review_checkpoints else &.{},
         .amendments = if (input.managed) |turn| turn.task.amendments else &.{},
@@ -7015,13 +7016,14 @@ noinline fn governManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, s
         .model = try turn.manager.definitionSnapshot(turn.task),
         .step = input.step,
     }, .{});
+    const retained_evidence = if (!planning) try turn.beforeReview(alloc, input.messages) else &.{};
     const reply = if (planning)
         if (turn.task.revision_pending and turn.task.model_basis != null and turn.task.model_basis.?.capability != null)
             try task_governance.revise(alloc, review_stream, request, review_provider, packet, turn.journal())
         else
             try task_governance.plan(alloc, review_stream, request, review_provider, packet, turn.journal())
     else
-        try task_governance.progress(alloc, review_stream, request, review_provider, packet, turn.journal(), try turn.beforeReview(alloc, input.messages));
+        try task_governance.progressWithBacking(alloc, review_stream, request, review_provider, packet, turn.journal(), retained_evidence, turn.prior_payloads);
     if (deps.report_usage) |report| report(deps.ctx, reply.usage);
     summary.prepareTokenRequest();
     _ = summary.reconcileTokenRequest(reply.usage, false);
@@ -7230,7 +7232,8 @@ fn processQueuedPromptLoop(
     }
     if (managed) |*turn| {
         if (turn.task.model_basis != null) {
-            try governance.seed(arena, try turn.beforeReview(arena, &.{}));
+            const retained_evidence = try turn.beforeReview(arena, &.{});
+            try governance.seedWithBacking(arena, retained_evidence, turn.prior_payloads);
             try turn.manager.record(turn.task, "invocation_started", .{ .turn = turn_id, .policy = turn.task.model_basis.?.execution.defaults });
         }
     }
@@ -7384,7 +7387,8 @@ fn processQueuedPromptLoop(
             try turn.progress(arena, within_turn_suffix.items);
             if (try planManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = within_turn_suffix.items, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .turn_id = turn_id, .step = step, .managed = turn })) {
                 governance = .{};
-                try governance.seed(arena, try turn.beforeReview(arena, &.{}));
+                const retained_evidence = try turn.beforeReview(arena, &.{});
+                try governance.seedWithBacking(arena, retained_evidence, turn.prior_payloads);
             }
             job.workspace_binding_hash = try turn.manager.bindingHash(turn.task);
         }
@@ -7411,7 +7415,7 @@ fn processQueuedPromptLoop(
                     for (progress.remaining[0..i]) |previous| if (std.mem.eql(u8, previous, id)) return error.InvalidTaskGovernance;
                 }
                 const retained = try turn.beforeReview(arena, &.{});
-                try governance.observe(arena, progress, retained, policy);
+                try governance.observeWithBacking(arena, progress, retained, policy, turn.prior_payloads);
                 try turn.manager.record(turn.task, "continuation_decision", .{ .step = step, .batches = governance.batches, .stalls = governance.stalls, .finalizing = governance.finalizing, .pause = governance.pause_reason, .assessment = reply.raw });
                 try within_turn_suffix.append(arena, .{ .role = .user, .content = try arena.print("Host progress assessment: {s}. Treat this as guidance against the fixed contract, not new user authority. Do not repeat completed actions.", .{reply.raw}) });
             }

@@ -54,6 +54,7 @@ pub fn perform(original: workspace.Manager, job: jobs.Job, model: Model) !void {
             .messages = &.{},
             .definition = task.definition,
             .prior_evidence = evidence,
+            .prior_payloads = turn.prior_payloads,
             .prior_review_pages = turn.prior_review_pages,
             .prior_review_checkpoints = turn.prior_review_checkpoints,
             .amendments = task.amendments,

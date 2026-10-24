@@ -60,8 +60,34 @@ pub const Review = struct {
     workspace_snapshot: []const u8 = "",
     assessment_record: ?[]const u8 = null,
 };
-pub const ReviewFile = struct { path: []const u8, content: []const u8, hash: []const u8 };
+pub const ReviewFile = struct { path: []const u8, hash: []const u8 };
 pub const ReviewInputs = struct { snapshot: []const u8, files: []const ReviewFile };
+pub const HistoryCursor = struct {
+    manager: Manager,
+    task: Task,
+    revision: []const u8,
+    paths: []const []const u8,
+    offset: usize = 0,
+
+    /// The caller releases each bounded batch before asking for the next one.
+    pub fn next(self: *HistoryCursor, alloc: Allocator) !?[]const []const u8 {
+        if (self.offset >= self.paths.len) return null;
+        var reader = self.manager;
+        reader.alloc = alloc;
+        const batch = self.paths[self.offset..@min(self.offset + 16, self.paths.len)];
+        if (reader.historyBatch(batch, self.revision)) |values| {
+            self.offset += batch.len;
+            return values;
+        } else |err| {
+            if (err == error.OutOfMemory) return err;
+            const value = try reader.historyRecord(self.task, batch[0], self.revision);
+            self.offset += 1;
+            const values = try alloc.alloc([]const u8, 1);
+            values[0] = value;
+            return values;
+        }
+    }
+};
 const Publication = struct {
     version: u32 = 1,
     operation: []const u8,
@@ -1716,56 +1742,68 @@ pub const Manager = struct {
     }
 
     pub fn retainedReviewCandidateAt(self: Manager, task: Task, revision_id: []const u8) !?[]const u8 {
-        var candidate: ?[]const u8 = null;
+        var candidate: std.ArrayList(u8) = .empty;
+        defer candidate.deinit(std.heap.page_allocator);
+        var have_candidate = false;
         var candidate_at: i64 = -1;
         var failure_at: i64 = -1;
         var actor_at: i64 = -1;
         var assessment_at: i64 = -1;
         var assessment_fulfilled = false;
         var candidate_stamped = false;
-        for (try self.taskHistory(task, revision_id)) |bytes| {
-            const entry = try parse(self.alloc, std.json.Value, bytes);
-            if (entry != .object) continue;
-            const kind = entry.object.get("kind") orelse continue;
-            const version_value = entry.object.get("contract_version") orelse continue;
-            if (kind != .string or version_value != .integer or version_value.integer != task.definition.version) continue;
-            const recorded = entry.object.get("recorded_at_ms");
-            if (std.mem.eql(u8, kind.string, "action_intent")) {
-                if (recorded) |at| if (at == .integer) {
-                    actor_at = @max(actor_at, at.integer);
-                };
-                continue;
-            }
-            const value = entry.object.get("value") orelse continue;
-            if (value != .object) continue;
-            const at = value.object.get("at_ms") orelse continue;
-            if (at != .integer) continue;
-            if (std.mem.eql(u8, kind.string, "review_assessment") and at.integer >= assessment_at) {
-                const decision = (std.json.parseFromSlice(std.json.Value, self.alloc, model.text(value, "data"), .{}) catch continue).value;
-                const obligations = model.items(decision, "obligations");
-                assessment_fulfilled = obligations.len > 0;
-                for (obligations) |obligation| if (!std.mem.eql(u8, model.text(obligation, "status"), "met")) {
-                    assessment_fulfilled = false;
-                };
-                assessment_at = at.integer;
-            }
-            if (std.mem.eql(u8, kind.string, "review_failure")) {
-                failure_at = @max(failure_at, at.integer);
-            } else if (std.mem.eql(u8, kind.string, "review_candidate") and at.integer >= candidate_at) {
-                const text = value.object.get("text") orelse continue;
-                if (text != .string) continue;
-                candidate = text.string;
-                candidate_at = at.integer;
-                candidate_stamped = recorded != null and recorded.? == .integer;
+        var cursor = try self.historyCursor(task, revision_id);
+        while (cursor.offset < cursor.paths.len) {
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            var reader = self;
+            reader.alloc = scratch.allocator();
+            const batch = (try cursor.next(reader.alloc)) orelse break;
+            for (batch) |bytes| {
+                const entry = try parse(reader.alloc, std.json.Value, bytes);
+                if (entry != .object) continue;
+                const kind = entry.object.get("kind") orelse continue;
+                const version_value = entry.object.get("contract_version") orelse continue;
+                if (kind != .string or version_value != .integer or version_value.integer != task.definition.version) continue;
+                const recorded = entry.object.get("recorded_at_ms");
+                if (std.mem.eql(u8, kind.string, "action_intent")) {
+                    if (recorded) |at| if (at == .integer) {
+                        actor_at = @max(actor_at, at.integer);
+                    };
+                    continue;
+                }
+                const value = entry.object.get("value") orelse continue;
+                if (value != .object) continue;
+                const at = value.object.get("at_ms") orelse continue;
+                if (at != .integer) continue;
+                if (std.mem.eql(u8, kind.string, "review_assessment") and at.integer >= assessment_at) {
+                    const decision = (std.json.parseFromSlice(std.json.Value, reader.alloc, model.text(value, "data"), .{}) catch continue).value;
+                    const obligations = model.items(decision, "obligations");
+                    assessment_fulfilled = obligations.len > 0;
+                    for (obligations) |obligation| if (!std.mem.eql(u8, model.text(obligation, "status"), "met")) {
+                        assessment_fulfilled = false;
+                    };
+                    assessment_at = at.integer;
+                }
+                if (std.mem.eql(u8, kind.string, "review_failure")) {
+                    failure_at = @max(failure_at, at.integer);
+                } else if (std.mem.eql(u8, kind.string, "review_candidate") and at.integer >= candidate_at) {
+                    const text = value.object.get("text") orelse continue;
+                    if (text != .string) continue;
+                    candidate.clearRetainingCapacity();
+                    try candidate.appendSlice(std.heap.page_allocator, text.string);
+                    have_candidate = true;
+                    candidate_at = at.integer;
+                    candidate_stamped = recorded != null and recorded.? == .integer;
+                }
             }
         }
-        if (candidate == null or actor_at > candidate_at) return null;
-        if (failure_at >= candidate_at) return candidate;
+        if (!have_candidate or actor_at > candidate_at) return null;
+        if (failure_at >= candidate_at) return try self.alloc.dupe(u8, candidate.items);
         // An abrupt stop can precede both the assessment and its failure
         // record. Resume that retained answer through independent verification.
         // A completed non-fulfilled verdict still sends unfinished work back
         // to the actor; a candidate alone can never establish completion.
-        if (candidate_stamped and (assessment_at < candidate_at or assessment_fulfilled)) return candidate;
+        if (candidate_stamped and (assessment_at < candidate_at or assessment_fulfilled)) return try self.alloc.dupe(u8, candidate.items);
         return null;
     }
 
@@ -1883,14 +1921,30 @@ pub const Manager = struct {
         return records.toOwnedSlice(self.alloc);
     }
 
-    pub fn taskHistory(self: Manager, task: Task, revision_id: []const u8) ![]const []const u8 {
+    pub fn taskHistoryPaths(self: Manager, task: Task, revision_id: []const u8) ![]const []const u8 {
         const prefix = try self.alloc.print("history/{s}/", .{task.id});
         var paths: std.ArrayList([]const u8) = .empty;
         for (try self.inventory(revision_id)) |path| if (std.mem.startsWith(u8, path, prefix)) try paths.append(self.alloc, path);
+        return paths.toOwnedSlice(self.alloc);
+    }
+
+    pub fn historyCursor(self: Manager, task: Task, revision_id: []const u8) !HistoryCursor {
+        return .{ .manager = self, .task = task, .revision = revision_id, .paths = try self.taskHistoryPaths(task, revision_id) };
+    }
+
+    pub fn historyRecord(self: Manager, task: Task, path: []const u8, revision_id: []const u8) ![]const u8 {
+        if (!std.mem.startsWith(u8, path, try self.alloc.print("history/{s}/", .{task.id}))) return error.InvalidWorkspaceJournal;
+        const bytes = try self.contentAt(path, revision_id);
+        try self.checkHistoryHash(path, bytes);
+        return bytes;
+    }
+
+    pub fn taskHistory(self: Manager, task: Task, revision_id: []const u8) ![]const []const u8 {
+        const history_paths = try self.taskHistoryPaths(task, revision_id);
         var records: std.ArrayList([]const u8) = .empty;
         var record_start: usize = 0;
-        while (record_start < paths.items.len) : (record_start += 16) {
-            const batch = paths.items[record_start..@min(record_start + 16, paths.items.len)];
+        while (record_start < history_paths.len) : (record_start += 16) {
+            const batch = history_paths[record_start..@min(record_start + 16, history_paths.len)];
             if (self.historyBatch(batch, revision_id)) |values| {
                 try records.appendSlice(self.alloc, values);
             } else |err| {
@@ -2446,11 +2500,15 @@ pub const Manager = struct {
                 try reads.append(self.alloc, .{ .path = dependency.path, .observed_hash = dependency.observed_hash, .reviewed_hash = null, .bytes = 0, .reviewed_content = "", .complete = true, .deleted = true });
                 continue;
             }
-            const bytes = try self.contentAt(dependency.path, revision_id);
-            const digest = try hash(self.alloc, bytes);
-            const preview = @import("../agent/runtime/review_evidence.zig").View.prefix(bytes, 1024);
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            var reader = self;
+            reader.alloc = scratch.allocator();
+            const bytes = try reader.contentAt(dependency.path, revision_id);
+            const digest = try self.alloc.dupe(u8, try hash(reader.alloc, bytes));
+            const preview = try self.alloc.dupe(u8, @import("../agent/runtime/review_evidence.zig").View.prefix(bytes, 1024));
             try reads.append(self.alloc, .{ .path = dependency.path, .observed_hash = dependency.observed_hash, .reviewed_hash = digest, .bytes = bytes.len, .reviewed_content = preview, .complete = preview.len == bytes.len });
-            try files.append(self.alloc, .{ .path = dependency.path, .content = bytes, .hash = digest });
+            try files.append(self.alloc, .{ .path = dependency.path, .hash = digest });
         }
         if (task.authority != null) {
             for (try self.changedPaths(task.base_revision, revision_id)) |path| {
@@ -2459,12 +2517,16 @@ pub const Manager = struct {
                     if (std.mem.eql(u8, path, current)) break true;
                 } else false;
                 if (!present) continue;
-                const bytes = try self.contentAt(path, revision_id);
-                const digest = try hash(self.alloc, bytes);
+                var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer scratch.deinit();
+                var reader = self;
+                reader.alloc = scratch.allocator();
+                const bytes = try reader.contentAt(path, revision_id);
+                const digest = try self.alloc.dupe(u8, try hash(reader.alloc, bytes));
                 const included = for (files.items) |file| {
                     if (std.mem.eql(u8, path, file.path)) break true;
                 } else false;
-                if (!included) try files.append(self.alloc, .{ .path = path, .content = bytes, .hash = digest });
+                if (!included) try files.append(self.alloc, .{ .path = path, .hash = digest });
             }
         }
         return .{ .snapshot = try json(self.alloc, .{ .workspace = self.manifest.id, .task = task.id, .branch = task.branch, .reviewed_revision = revision_id, .contract_version = task.definition.version, .reads = reads.items }), .files = try files.toOwnedSlice(self.alloc) };

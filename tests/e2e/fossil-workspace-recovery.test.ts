@@ -2493,6 +2493,28 @@ sys.exit(result.returncode)
     expect((await f.run(["fossil", "migrate"])).code).toBe(0);
   }, 120000);
 
+  test("does not let a progress checkpoint cite a cached large preview as fully inspected evidence", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let checks = 0;
+    const m = model(f, (_body, count) => count === 1 ? writeMemory("A long policy statement.\n".repeat(2000)) : {
+      tool_calls: [{ index: 0, id: `inspect-${count}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "read", path: "workspace.json" }) } }],
+    }, undefined, { progress: packet => {
+      checks++;
+      const large = packet.evidence.find((entry: any) => entry.kind === "tool" && entry.bytes > 2048);
+      expect(large).toBeDefined();
+      expect(large.complete).toBe(false);
+      expect(large.arguments.length).toBeLessThanOrEqual(512);
+      return { outcome: "continue_work", meaningful: true, evidence: [large.id], remaining: packet.context.contract.obligations.map((obligation: any) => obligation.id), note: "A preview alone cannot establish inspected progress." };
+    } });
+    const result = await f.run(["ask", "Save the policy and inspect the workspace for useful follow-up information", "--json"], {}, 90000);
+    expect(result.code).toBe(1);
+    expect(checks).toBe(1);
+    expect(m.counts().actors).toBe(4);
+    expect(m.counts().assessments).toBe(0);
+    expect(f.fossil("ls", "-r", "trunk")).not.toContain("memory/preference.md");
+  }, 120000);
+
   test("stops a repeated successful search after three stalled progress checks", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
@@ -2816,6 +2838,48 @@ sys.exit(result.returncode)
     expect(m.counts().actors).toBe(3);
     expect(m.packets.at(-1).evidence.filter((e: any) => e.id.startsWith("workspace-file:")).map((e: any) => e.bytes).every((bytes: number) => bytes > 150000)).toBe(true);
   }, 150000);
+
+  test("rejects a corrupted review cache and rebuilds missing payloads from pinned Fossil history without actor replay", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const content = "A retained policy document.\n".repeat(2000);
+    let corrupted = false, cacheRoot = "", expectedHash = "";
+    const m = model(f, (_body, count) => count === 1 ? writeMemory(content) : { content: "The policy document is saved." }, packet => {
+      const record = packet.evidence.find((entry: any) => entry.kind === "tool" && !entry.complete);
+      expect(record).toBeDefined();
+      expect(record.arguments.length).toBeLessThanOrEqual(512);
+      expect(record.content.length).toBeLessThanOrEqual(256);
+      const roots = join(f.home, ".fx", "fossil");
+      const directory = readdirSync(roots).map(name => join(roots, name, "review-payloads")).find(dir => existsSync(join(dir, record.sha256)))!;
+      expect(directory).toBeDefined();
+      cacheRoot = directory;
+      expectedHash = record.sha256;
+      const payload = readFileSync(join(directory, record.sha256));
+      expect(createHash("sha256").update(payload).digest("hex")).toBe(record.sha256);
+      if (!corrupted) {
+        corrupted = true;
+        const changed = Buffer.from(payload); changed[changed.length - 2] ^= 1;
+        writeFileSync(join(directory, record.sha256), changed);
+        return { name: "omos_review_evidence", args: { action: "read", id: record.id } };
+      }
+      const pages = packet.inspections.filter((page: any) => page.id === record.id && page.content);
+      const last = pages.at(-1);
+      if (!last || last.nextOffset !== null) return { name: "omos_review_evidence", args: { action: "read", id: record.id, offset: last?.nextOffset ?? 0 } };
+      return { name: "omos_contract_assessment", args: { contractId: packet.contract.id, version: packet.contract.version, obligations: packet.contract.obligations.map((obligation: any) => ({ id: obligation.id, status: "met", evidence: [record.id], note: "Inspected the complete host-recorded write arguments and result." })) } };
+    });
+    const first = await f.run(["ask", "Save the policy document", "--json"], {}, 90000);
+    expect(first.code).toBe(1);
+    expect(corrupted).toBe(true);
+    const session = JSON.parse(first.stdout).session_id;
+    expect(cacheRoot).not.toBe("");
+    rmSync(cacheRoot, { recursive: true });
+    const resumed = await f.run(["ask", "--resume-id", session, "continue", "--json"], {}, 90000);
+    expect(resumed.code, resumed.stderr + resumed.stdout).toBe(0);
+    expect(m.counts().actors).toBe(2);
+    expect(createHash("sha256").update(readFileSync(join(cacheRoot, expectedHash))).digest("hex")).toBe(expectedHash);
+    expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe(content);
+    expect(f.fossil("ls", "-r", "trunk")).not.toContain("review-payloads");
+  }, 180000);
 
   test("continues a failed review from its retained candidate without repeating actor work", async () => {
     const f = fixture();
