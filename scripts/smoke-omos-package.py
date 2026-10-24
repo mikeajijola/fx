@@ -19,7 +19,9 @@ def run(command, cwd, env):
 
 def smoke(archive):
     with tempfile.TemporaryDirectory(prefix="omos-installation-smoke-") as directory:
-        root = Path(directory)
+        # macOS temporary paths commonly begin with /var, whose canonical
+        # location is /private/var. Compare the same absolute paths as omos.
+        root = Path(directory).resolve()
         unpacked = root / "unpacked"
         unpacked.mkdir()
         with tarfile.open(archive, "r:gz") as source:
