@@ -21,7 +21,7 @@ Supported operations:
 | `ui.install` | Install and verify the first compatible source tree without overwriting an existing interface. |
 | `ui.write` | Write task source with a revision fence; publication remains pending. |
 | `ui.import_legacy` | Retain local appearance history as an unpublished migration artifact on a paused task branch. |
-| `task.resume` | Select retained work with a current task revision fence. |
+| `task.resume` | Select retained work with a current task revision fence. Explicit `rebind_project: true` relocates eligible personal work to the host's project and requires fresh source validation. |
 
 A repeated prompt ID must identify the same request. Reconnection reads events; it never starts another invocation. If the native process stops, the external host reports retained partial work and requires explicit continuation.
 

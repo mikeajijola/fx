@@ -75,6 +75,10 @@ describe("portable Fossil workspace recovery", () => {
     const sessionResult = await restored.run(["ask", "Open a fresh local session", "--json"]);
     expect(sessionResult.code).toBe(1);
     const session = JSON.parse(sessionResult.stdout).session_id;
+    const localCache = join(restored.home, ".fx/fossil", createHash("sha256").update(repository).digest("hex"));
+    const checkpoints = join(localCache, "checkpoints");
+    mkdirSync(checkpoints, { recursive: true });
+    writeFileSync(join(checkpoints, task.id), "Private provider checkpoint retained for the old project");
     let native = new NativeClient({ binary: join(import.meta.dir, "../../zig-out/bin/fx"), project: restored.cwd, env: { ...process.env, ...restored.env, ...(interrupted ? { FX_E2E_FOSSIL_FAULT: "project-rebind-committed" } : {}) } });
     let selected: any;
     try {
@@ -104,7 +108,8 @@ describe("portable Fossil workspace recovery", () => {
     expect(relocation.value.previous_project).toBe(original.cwd);
     expect(relocation.value.project).toBe(restored.cwd);
     expect(relocation.value.previous_contract).toEqual(task.definition);
-    const localCache = join(restored.home, ".fx/fossil", createHash("sha256").update(repository).digest("hex"));
+    expect(existsSync(join(checkpoints, task.id))).toBe(false);
+    expect(readFileSync(join(checkpoints, `${task.id}.project-${selected.definition.version}.invalidated`), "utf8")).toBe("Private provider checkpoint retained for the old project");
     rmSync(join(localCache, "tasks"), { recursive: true });
     rmSync(join(localCache, "sessions"), { recursive: true });
     const rebuilt = JSON.parse((await restored.run(["fossil", "status", "--json"])).stdout).tasks.find((item: any) => item.id === task.id);
@@ -125,6 +130,31 @@ describe("portable Fossil workspace recovery", () => {
     expect(producer.counts().actors).toBe(3);
     expect(JSON.parse((await original.run(["fossil", "tasks", "--json"])).stdout).tasks[0]).toEqual(task);
   }, 240000);
+
+  test("fences the old project after a relocation commits before its cache update", async () => {
+    const f = fixture();
+    const inference = model(f, () => ({ content: "The retained answer remains blocked." }), () => "blocked");
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const initial = await f.run(["ask", "Retain this task for explicit relocation", "--json"]);
+    expect(initial.code).toBe(1);
+    const session = JSON.parse(initial.stdout).session_id;
+    const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    const project = join(f.home, "relocated-project");
+    mkdirSync(project);
+    const native = new NativeClient({ binary: join(import.meta.dir, "../../zig-out/bin/fx"), project, env: { ...process.env, ...f.env, FX_E2E_FOSSIL_FAULT: "project-rebind-committed" } });
+    try {
+      const revision = f.fossil("timeline", "ancestors", task.branch, "--limit", "1", "--format", "%H", "--quiet").split("\n")[0].trim();
+      await expect(native.request("task.resume", { session, task: task.id, revision, rebind_project: true })).rejects.toThrow("WorkspaceInjectedFailure");
+    } finally { await native.close(); }
+    const calls = inference.counts();
+    const oldProject = await f.run(["ask", "--resume-id", session, "continue", "--json"]);
+    expect(oldProject.code, oldProject.stdout + oldProject.stderr).toBe(1);
+    expect(oldProject.stdout + oldProject.stderr).toContain("TaskProjectMismatch");
+    expect(inference.counts()).toEqual(calls);
+    const refreshed = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    expect(refreshed.project_root).toBe(project);
+    expect(refreshed.definition.version).toBe(task.definition.version + 1);
+  }, 90000);
 
   test("requires successful integrity reports and preserves private branches in a portable export", async () => {
     const f = fixture();

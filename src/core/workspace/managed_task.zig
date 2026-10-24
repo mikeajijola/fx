@@ -29,11 +29,13 @@ pub const Turn = struct {
         const manager = try workspace.Manager.ensureBound(alloc);
         const parent = if (parent_session) |id| try manager.active(id) else null;
         var task = if (try manager.active(session)) |active| active else try manager.start(session, project, prompt, parent);
+        var turn: Turn = .{ .manager = manager, .task = task, .execution_lease = (try manager.tryTaskExecutionLease(task.id)) orelse return error.WorkspaceExecutionBusy };
+        errdefer turn.release();
+        task = try manager.refreshTaskContext(task);
+        turn.task = task;
         if (task.authority != null) return error.CompanyExecutionIsolationRequired;
         if (!std.mem.eql(u8, project, task.project_root)) return error.TaskProjectMismatch;
         try manager.validateTaskBasis(task);
-        var turn: Turn = .{ .manager = manager, .task = task, .execution_lease = (try manager.tryTaskExecutionLease(task.id)) orelse return error.WorkspaceExecutionBusy };
-        errdefer turn.release();
         var invocation: [16]u8 = undefined;
         @import("../shared/io.zig").getIo().random(&invocation);
         turn.invocation_id = try workspace.hash(alloc, &invocation);

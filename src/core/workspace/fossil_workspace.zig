@@ -1503,23 +1503,44 @@ pub const Manager = struct {
         return self.resumeTaskInProject(session, id, project, false);
     }
 
+    /// The caller holds execution ownership before restoring actor context.
+    pub fn refreshTaskContext(self: Manager, previous: Task) !Task {
+        const lease = try self.writerLease();
+        defer lease.release();
+        return self.refreshTaskContextLocked(previous);
+    }
+
+    fn refreshTaskContextLocked(self: Manager, previous: Task) !Task {
+        const canonical = try self.decodeTask(previous.id, try self.content(previous, try self.taskPath(previous.id)));
+        if (canonical.definition.version < previous.definition.version) return error.WorkspaceRecoveryRequired;
+        if (canonical.definition.version == previous.definition.version) return previous;
+        if ((canonical.source_validation_version orelse 0) > (previous.source_validation_version orelse 0)) try self.archiveProjectCheckpoint(canonical);
+        try self.saveTask(canonical);
+        return canonical;
+    }
+
+    fn archiveProjectCheckpoint(self: Manager, task: Task) !void {
+        var folder = io_mod.openDirAbsoluteNoFollow(try join(self.alloc, self.root, "checkpoints"), .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer folder.close(io_mod.getIo());
+        const archive = try self.alloc.print("{s}.project-{d}.invalidated", .{ task.id, task.source_validation_version.? });
+        folder.renamePreserve(task.id, folder, archive, io_mod.getIo()) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        const handle: std.Io.File = .{ .handle = folder.handle, .flags = .{ .nonblocking = false } };
+        try handle.sync(io_mod.getIo());
+    }
+
     pub fn resumeTaskInProject(self: Manager, session: []const u8, id: []const u8, project: []const u8, rebind_project: bool) !Task {
         const lease = try self.writerLease();
         defer lease.release();
         const task_lease = (try self.tryTaskExecutionLease(id)) orelse return error.WorkspaceExecutionBusy;
         defer task_lease.release();
-        var task = try self.loadTask(id);
+        var task = try self.refreshTaskContextLocked(try self.loadTask(id));
         try self.checkExpectedRevision(task.branch);
-        if (rebind_project) {
-            // Recover a committed relocation after interruption before the
-            // replaceable task cache was updated. Never repeat its transition.
-            const canonical = try self.decodeTask(id, try self.content(task, try self.taskPath(id)));
-            if ((canonical.source_validation_version orelse 0) > (task.source_validation_version orelse 0)) {
-                if (canonical.definition.version < task.definition.version) return error.WorkspaceRecoveryRequired;
-                task = canonical;
-                try self.saveTask(task);
-            }
-        }
         if (!std.mem.eql(u8, project, task.project_root)) {
             if (!rebind_project) return error.TaskProjectMismatch;
             task = try self.rebindProject(task, project);
@@ -1554,6 +1575,7 @@ pub const Manager = struct {
         try atomicWrite(self.alloc, try join(self.alloc, tree, try self.alloc.print("history/{s}/{s}.json", .{ task.id, try hash(self.alloc, entry) })), entry);
         _ = try self.commit(tree, "Record explicit project relocation and validation boundary");
         try fault("project-rebind-committed");
+        try self.archiveProjectCheckpoint(task);
         try self.saveTask(task);
         return task;
     }
