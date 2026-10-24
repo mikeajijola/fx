@@ -12,6 +12,8 @@ const Descriptor = struct {
     epoch: u64,
     public_key: []const u8,
     seed_file: []const u8,
+    control_revision: ?[]const u8 = null,
+    accepted_revision: ?[]const u8 = null,
 };
 
 pub fn directory(manager: workspace.Manager) ![]const u8 {
@@ -37,7 +39,28 @@ fn descriptor(manager: workspace.Manager, dir: std.Io.Dir) !?Descriptor {
     if (!std.mem.eql(u8, value.version, "omos.company-issuer/v1") or !std.mem.eql(u8, value.workspace, manager.manifest.id) or value.public_key.len != 64 or value.epoch == 0) return error.CompanyIssuerRecoveryRequired;
     for (value.public_key) |ch| if (!std.ascii.isHex(ch)) return error.CompanyIssuerRecoveryRequired;
     if (!std.mem.eql(u8, value.seed_file, try manager.alloc.print("issuer-{s}.seed", .{value.public_key}))) return error.CompanyIssuerRecoveryRequired;
+    if ((value.control_revision == null) != (value.accepted_revision == null)) return error.CompanyIssuerRecoveryRequired;
+    if (value.control_revision) |head| if (!@import("fossil_manifest.zig").validHash(head)) return error.CompanyIssuerRecoveryRequired;
+    if (value.accepted_revision) |head| if (!@import("fossil_manifest.zig").validHash(head)) return error.CompanyIssuerRecoveryRequired;
     return value;
+}
+
+fn issuerLock(dir: std.Io.Dir) !workspace.ExecutionLease {
+    const file = dir.openFile(io.getIo(), "issuer.lock", .{ .mode = .read_write, .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => dir.createFile(io.getIo(), "issuer.lock", .{ .exclusive = true, .truncate = false, .permissions = .fromMode(0o600) }) catch |created| switch (created) {
+            error.PathAlreadyExists => try dir.openFile(io.getIo(), "issuer.lock", .{ .mode = .read_write, .follow_symlinks = false }),
+            else => return created,
+        },
+        else => return err,
+    };
+    errdefer file.close(io.getIo());
+    var attempts: usize = 0;
+    while (!try file.tryLock(io.getIo(), .exclusive)) {
+        if (attempts >= 3000) return error.WorkspaceBusy;
+        attempts += 1;
+        io.sleep(10 * std.time.ns_per_ms);
+    }
+    return .{ .file = file };
 }
 
 fn readKey(manager: workspace.Manager, dir: std.Io.Dir, value: Descriptor) !Ed25519.KeyPair {
@@ -55,11 +78,31 @@ fn readKey(manager: workspace.Manager, dir: std.Io.Dir, value: Descriptor) !Ed25
 pub fn current(manager: workspace.Manager, epoch: u64, public_key: []const u8) !Ed25519.KeyPair {
     var dir = try open(manager);
     defer dir.close();
-    const value = (try descriptor(manager, dir.dir)) orelse return error.CompanyIssuerRecoveryRequired;
+    const lease = try issuerLock(dir.dir);
+    defer lease.release();
+    var value = (try descriptor(manager, dir.dir)) orelse return error.CompanyIssuerRecoveryRequired;
     if (!std.mem.eql(u8, value.repository, manager.repository)) return error.CompanyIssuerBoundElsewhere;
     if (value.epoch > epoch) return error.CompanyAuthorityRollbackDetected;
     if (value.epoch != epoch or !std.mem.eql(u8, value.public_key, public_key)) return error.CompanyIssuerRecoveryRequired;
-    return readKey(manager, dir.dir, value);
+    const key = try readKey(manager, dir.dir, value);
+    const control = (try manager.companyRevision()) orelse return error.CompanyNotInitialized;
+    const accepted = try manager.revision("trunk");
+    if (value.control_revision) |previous| if (!try manager.revisionDescendsFrom(control, previous)) return error.CompanyAuthorityRollbackDetected;
+    if (value.accepted_revision) |previous| if (!try manager.revisionDescendsFrom(accepted, previous)) return error.CompanyAuthorityRollbackDetected;
+    if (value.control_revision == null or !std.mem.eql(u8, value.control_revision.?, control) or !std.mem.eql(u8, value.accepted_revision.?, accepted)) {
+        value.control_revision = control;
+        value.accepted_revision = accepted;
+        try io.durableReplaceVerified(manager.alloc, &dir, "issuer.json", try std.json.Stringify.valueAlloc(manager.alloc, value, .{}));
+    }
+    return key;
+}
+
+/// Advance protected observed heads after a committed company effect and
+/// before acknowledging it. A crash between these writes catches up only
+/// along retained ancestry; restoring an older repository requires recovery.
+pub fn observe(manager: workspace.Manager) !void {
+    const authority = try records.decode(@import("company_authority.zig").State, manager.alloc, try manager.companyContent("authority/state.json"), .{});
+    _ = try current(manager, authority.epoch, authority.issuer);
 }
 
 pub fn nextEpoch(manager: workspace.Manager, canonical: u64) !u64 {
@@ -89,6 +132,8 @@ pub fn recoveryLease(manager: workspace.Manager) !?workspace.ExecutionLease {
 pub fn prepare(manager: workspace.Manager, epoch: u64, replace: bool) !Ed25519.KeyPair {
     var dir = try open(manager);
     defer dir.close();
+    const lease = try issuerLock(dir.dir);
+    defer lease.release();
     if (try descriptor(manager, dir.dir)) |previous| {
         if (previous.epoch == epoch and std.mem.eql(u8, previous.repository, manager.repository)) return readKey(manager, dir.dir, previous);
         if (!replace) return error.CompanyIssuerBoundElsewhere;

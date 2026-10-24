@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync, appendFileSync, statSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync, appendFileSync, statSync, rmSync, copyFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createHash, generateKeyPairSync, sign, verify, createPublicKey, createPrivateKey } from "node:crypto";
@@ -642,6 +642,95 @@ sys.exit(result.returncode)
     } finally {
       service.child.kill(); await service.child.exited;
     }
+  }, 180000);
+
+  test("fences an in-place authority rollback and an accepted-branch rewind using protected observed heads", async () => {
+    const f = fixture();
+    const inference = model(f, () => ({ content: "No actor execution is needed for this server review." }));
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const admin = async (body: object) => {
+      const file = join(f.home, "operator.json");
+      writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+      const result = await f.run(["fossil", "company", file, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    const initialized = await admin({ action: "initialize" });
+    const key = generateKeyPairSync("ed25519");
+    const publicKey = key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex");
+    let control = await admin({ action: "grant", revision: initialized.revision, grant: { id: "reader", actor: "reader", public_key: publicKey, paths: ["memory/"], actions: ["discover"], expires_ms: Date.now() + 3600000 } });
+    let service = await startWorkspaceService(f, true);
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const descriptorFile = join(f.home, ".fx/authority", boot.workspace, "issuer.json");
+    const descriptor = () => JSON.parse(readFileSync(descriptorFile, "utf8"));
+    const post = (action: string, params: object = {}, grant = "reader") => {
+      const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "reader", grant, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action, ...params });
+      return fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", connection: "close" }, body: JSON.stringify({ payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") }) });
+    };
+    const send = async (action: string, params: object = {}) => {
+      const response = await post(action, params, "reader-v2");
+      const body = await response.json() as any;
+      expect(response.status, JSON.stringify(body)).toBe(200);
+      return JSON.parse(body.payload).result;
+    };
+    try {
+      expect(descriptor().control_revision).toBe(control.revision);
+      expect(descriptor().accepted_revision).toBe(boot.revision);
+      const snapshot = join(f.home, "before-revocation.fossil");
+      const cloned = spawnSync("fossil", ["clone", "--private", join(f.cwd, "omos.fossil"), snapshot], { env: { ...process.env, ...f.env, FOSSIL_HOME: f.home, XDG_CONFIG_HOME: f.home }, encoding: "utf8" });
+      expect(cloned.status, cloned.stderr).toBe(0);
+      control = await admin({ action: "revoke", revision: control.revision, id: "reader" });
+      expect((await post("discover")).status).toBe(403);
+      const remembered = descriptor().control_revision;
+      expect(remembered).toBe(control.revision);
+      service.child.kill(); await service.child.exited;
+      copyFileSync(snapshot, join(f.cwd, "omos.fossil"));
+      service = await startWorkspaceService(f, true);
+      const rejected = await post("discover");
+      expect(rejected.status).toBe(409);
+      expect((await rejected.json() as any).error).toBe("CompanyAuthorityRollbackDetected");
+      expect(descriptor().control_revision).toBe(remembered);
+      expect((await fetch(service.url + "/v1/company")).status).toBe(409);
+      control = await admin({ action: "status" });
+      expect(control.authority.grants[0].revoked).toBe(false);
+      control = await admin({ action: "rotate", revision: control.revision });
+      expect(control.authority.epoch).toBeGreaterThan(boot.epoch);
+      expect(control.authority.issuer).not.toBe(boot.issuer);
+      expect(control.authority.grants.every((grant: any) => grant.revoked)).toBe(true);
+      expect((await fetch(service.url + "/v1/company")).status).toBe(200);
+      expect((await post("discover")).status).toBe(403);
+      await admin({ action: "grant", revision: control.revision, grant: { id: "reader-v2", actor: "reader", public_key: publicKey, paths: ["memory/"], actions: ["create_view", "checkpoint", "submit", "status"], expires_ms: Date.now() + 3600000 } });
+      const active = await (await fetch(service.url + "/v1/company")).json() as any;
+      const view = await send("create_view", { revision: active.revision, objective: "Retain memory/report.md with the reviewed company note" });
+      const saved = await send("checkpoint", { view: view.view, revision: view.revision, path: "memory/report.md", content: "Reviewed company note" });
+      await send("submit", { view: view.view, revision: saved.revision, candidate: "Saved memory/report.md with the reviewed company note." });
+      // Inspect the public local snapshot rather than a signed read: the
+      // publication itself must durably advance its protected watermark.
+      let accepted = false;
+      const deadline = Date.now() + 60000;
+      while (Date.now() < deadline) {
+        const state = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout);
+        if (state.tasks.some((task: any) => task.id === view.contract.id && task.state === "accepted")) { accepted = true; break; }
+        await Bun.sleep(30);
+      }
+      if (!accepted) {
+        const jobs = await f.run(["fossil", "query", "omos_review_job", "--json"]);
+        throw Error(`Company publication did not finish: ${jobs.stdout} ${jobs.stderr}`);
+      }
+      const publishedHead = descriptor().accepted_revision;
+      expect(publishedHead).not.toBe(active.revision);
+      expect(f.fossil("whatis", "--type", "ci", "trunk")).toContain(publishedHead);
+      // Change only the accepted branch's tags, leaving live grants and the
+      // company control head untouched. This must also fence the server.
+      f.fossil("--user", "omos", "tag", "cancel", "--raw", "sym-trunk", publishedHead);
+      f.fossil("--user", "omos", "tag", "cancel", "--raw", "branch", publishedHead);
+      expect(f.fossil("whatis", "--type", "ci", "trunk")).not.toContain(publishedHead);
+      const rewound = await fetch(service.url + "/v1/company");
+      expect(rewound.status).toBe(409);
+      expect((await rewound.json() as any).error).toBe("CompanyAuthorityRollbackDetected");
+      expect(descriptor().accepted_revision).toBe(publishedHead);
+      expect(inference.counts().actors).toBe(0);
+    } finally { service.child.kill(); await service.child.exited; }
   }, 180000);
 
   test("publishes issuer keys atomically and recovers interrupted company initialization", async () => {

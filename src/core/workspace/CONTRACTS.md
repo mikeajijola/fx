@@ -413,6 +413,21 @@ repository path, workspace identity, and authority epoch. Interrupted creation
 can retry without adopting a partial seed. All company mutations and publication
 share a per-workspace operation lease on the host.
 
+The protected descriptor also records the last observed company control and
+accepted revisions. Issuer use requires both current heads to descend from those
+observations. The host advances these observations after committed mutations
+and publication, before acknowledging success. An older repository restored at
+the same path, or an accepted branch moved backwards, returns
+`CompanyAuthorityRollbackDetected`. Explicit recovery rotates the key and
+revokes existing grants. A descriptor from an earlier installation records its
+first observed heads when the upgraded runtime uses it.
+
+Stored heads constrain issuer use; authority policies remain versioned in
+Fossil. The descriptor and its seeds are protected recovery material rather than
+disposable caches. Restore both the repository and protected issuer material
+through explicit rotation: local observations cannot detect a rollback of both
+together and do not replace an external authority or distributed coordination.
+
 Copying a repository does not restore issuer power. Explicit operator rotation
 advances the epoch, creates a new key, and revokes existing grants. When the
 protected descriptor names another local repository, recovery compares committed

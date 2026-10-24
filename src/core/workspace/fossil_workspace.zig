@@ -466,23 +466,32 @@ pub const Manager = struct {
         const heads = [_][]const u8{ try self.revision("trunk"), if (task) |selected| try self.currentRevision(selected) else try self.revision("trunk") };
         for (heads, 0..) |head, index| {
             if (index == 1 and std.mem.eql(u8, heads[0], head)) continue;
-            if (revisionMatches(candidate, head)) return head;
-            var offset: usize = 0;
-            while (true) {
-                const ancestors = try self.run(null, &.{ "timeline", "ancestors", head, "--type", "ci", "--limit", "128", "--offset", try self.alloc.print("{d}", .{offset}), "--format", "%H", "-R", self.repository });
-                var lines = std.mem.splitScalar(u8, ancestors, '\n');
-                var count: usize = 0;
-                while (lines.next()) |raw| {
-                    const line = std.mem.trim(u8, raw, " \r\t");
-                    if (!immutableRevision(line)) continue;
-                    count += 1;
-                    if (revisionMatches(candidate, line)) return line;
-                }
-                if (count < 128) break;
-                offset += count;
-            }
+            if (try self.ancestorRevision(head, candidate)) |found| return found;
         }
         return null;
+    }
+
+    pub fn revisionDescendsFrom(self: Manager, head: []const u8, ancestor: []const u8) !bool {
+        if (!immutableRevision(head) or !immutableRevision(ancestor)) return error.InvalidFossilRevision;
+        return (try self.ancestorRevision(head, ancestor)) != null;
+    }
+
+    fn ancestorRevision(self: Manager, head: []const u8, candidate: []const u8) !?[]const u8 {
+        if (revisionMatches(candidate, head)) return head;
+        var offset: usize = 0;
+        while (true) {
+            const ancestors = try self.run(null, &.{ "timeline", "ancestors", head, "--type", "ci", "--limit", "128", "--offset", try self.alloc.print("{d}", .{offset}), "--format", "%H", "-R", self.repository });
+            var lines = std.mem.splitScalar(u8, ancestors, '\n');
+            var count: usize = 0;
+            while (lines.next()) |raw| {
+                const line = std.mem.trim(u8, raw, " \r\t");
+                if (!immutableRevision(line)) continue;
+                count += 1;
+                if (revisionMatches(candidate, line)) return line;
+            }
+            if (count < 128) return null;
+            offset += count;
+        }
     }
 
     pub fn companyContent(self: Manager, path: []const u8) ![]const u8 {
@@ -513,8 +522,9 @@ pub const Manager = struct {
             defer parent.close(io_mod.getIo());
             try atomicWriteAt(self.alloc, parent, std.Io.Dir.path.basename(file.path), file.content);
         }
-        if ((try self.run(tree, &.{ "changes", "--hash", "--differ" })).len == 0 and (try self.run(tree, &.{ "extras", "--dotfiles" })).len == 0) return self.revision(company_branch);
-        return self.commit(tree, "Record company operation outcome");
+        const revision_id = if ((try self.run(tree, &.{ "changes", "--hash", "--differ" })).len == 0 and (try self.run(tree, &.{ "extras", "--dotfiles" })).len == 0) try self.revision(company_branch) else try self.commit(tree, "Record company operation outcome");
+        try @import("company_keys.zig").observe(self);
+        return revision_id;
     }
 
     pub fn companyOperationLease(self: Manager) !ExecutionLease {
@@ -2840,6 +2850,7 @@ pub const Manager = struct {
             const committed = try self.run(null, &.{ "cat", receipt, "-r", accepted_revision, "-R", self.repository });
             if (!std.mem.eql(u8, committed, try json(self.alloc, publication))) return error.WorkspaceVerificationFailed;
         }
+        if (try self.companyRevision() != null) try @import("company_keys.zig").observe(self);
         try fault("publication-committed");
         var task = publication.task;
         task.state = .accepted;
