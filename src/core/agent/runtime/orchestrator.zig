@@ -6875,7 +6875,7 @@ noinline fn assessCompletionContract(
     const policy = if (input.managed) |turn| if (turn.task.model_basis) |basis| basis.execution.review else @import("../../workspace/definition.zig").ReviewPolicy{} else @import("../../workspace/definition.zig").ReviewPolicy{};
     const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
     const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(policy.total_timeout_ms) });
-    var previous_progress: ?[]const u8 = null;
+    var previous_progress: ?[]const u8 = if (input.managed) |turn| try turn.reviewProgress() else null;
     var token_spent: u64 = 0;
     for (0..policy.max_attempts) |attempt| {
         const result = assessCompletionAttempt(deps, arena, summary, input, deadline, &token_spent) catch |err| switch (err) {
@@ -6918,9 +6918,10 @@ noinline fn assessCompletionAttempt(
     var evidence: agent_stream_provider.AttemptEvidence = .{};
     var event_context: u8 = 0;
     if (input.managed) |turn| try turn.manager.record(turn.task, "review_candidate", .{ .at_ms = io_mod.milliTimestamp(), .text = input.candidate });
-    const prior_evidence = if (input.managed) |turn| try turn.beforeReview(arena, input.messages) else &.{};
     const policy = if (input.managed) |turn| if (turn.task.model_basis) |basis| basis.execution.review else @import("../../workspace/definition.zig").ReviewPolicy{} else @import("../../workspace/definition.zig").ReviewPolicy{};
     const attempt_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(policy.attempt_timeout_ms) });
+    const collection_deadline = if (std.Io.Clock.Timestamp.compare(attempt_deadline, .lt, total_deadline)) attempt_deadline else total_deadline;
+    const prior_evidence = if (input.managed) |turn| try turn.beforeReviewControlled(arena, input.messages, input.config.cancel_flag, collection_deadline) else &.{};
     var attempt_usage: types.Usage = .{};
     defer if (attempt_usage.input_tokens != null or attempt_usage.output_tokens != null) {
         if (deps.report_usage) |report| report(deps.ctx, attempt_usage);

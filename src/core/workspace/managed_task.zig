@@ -17,6 +17,8 @@ pub const Turn = struct {
     prior_review_pages: []const []const u8 = &.{},
     prior_payloads: []const @import("../agent/runtime/review_evidence.zig").PayloadRef = &.{},
     prior_review_checkpoints: []const []const u8 = &.{},
+    review_seen: std.StringHashMapUnmanaged(void) = .empty,
+    review_progress_count: usize = 0,
     recorded_evidence: std.ArrayList([]const u8) = .empty,
     invocation_id: ?[]const u8 = null,
     assessment_record: ?[]const u8 = null,
@@ -143,6 +145,31 @@ pub const Turn = struct {
         self.prior_review_pages = &.{};
         self.prior_payloads = &.{};
         self.prior_review_checkpoints = &.{};
+        self.review_seen = .empty;
+        self.review_progress_count = 0;
+    }
+
+    /// The caller owns a turn arena. The bounded operation joins its worker
+    /// before returning, including when collection times out or is cancelled.
+    pub fn beforeReviewControlled(self: *Turn, alloc: std.mem.Allocator, messages: []const types.ChatMessage, cancel: *std.atomic.Value(bool), deadline: std.Io.Clock.Timestamp) ![]const review.Evidence {
+        const Result = struct {
+            records: []const review.Evidence,
+            pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
+        };
+        const Operation = struct {
+            turn: *Turn,
+            alloc: std.mem.Allocator,
+            messages: []const types.ChatMessage,
+            control: @import("../shared/bounded_operation.zig").Control,
+            pub fn run(value: @This()) !Result {
+                const previous = value.turn.manager.operation_control;
+                value.turn.manager.operation_control = value.control;
+                defer value.turn.manager.operation_control = previous;
+                return .{ .records = try value.turn.beforeReview(value.alloc, value.messages) };
+            }
+        };
+        const result = try @import("../shared/bounded_operation.zig").run(Result, alloc, cancel, deadline, Operation{ .turn = self, .alloc = alloc, .messages = messages, .control = .{ .cancel = cancel, .deadline = deadline } });
+        return result.records;
     }
 
     fn appendReviewEvidence(self: *Turn, alloc: std.mem.Allocator, rows: *std.ArrayList(review.Evidence), payloads: *std.ArrayList(@import("../agent/runtime/review_evidence.zig").PayloadRef), record: review.Evidence) !void {
@@ -195,6 +222,9 @@ pub const Turn = struct {
                 const Entry = struct { kind: []const u8, task: []const u8, contract_version: u32, value: std.json.Value };
                 const entry = (try std.json.parseFromSlice(Entry, a, bytes, .{ .ignore_unknown_fields = true })).value;
                 if (!std.mem.eql(u8, entry.task, self.task.id)) return error.InvalidWorkspaceJournal;
+                if (entry.contract_version == self.task.definition.version and (std.mem.eql(u8, entry.kind, "review_request") or std.mem.eql(u8, entry.kind, "review_evidence_page") or std.mem.eql(u8, entry.kind, "review_segment_assessment"))) {
+                    if (entry.value == .object) if (entry.value.object.get("data")) |data| if (data == .string) try self.trackReview(entry.kind, data.string, false);
+                }
                 if (std.mem.eql(u8, entry.kind, "command_receipt") or std.mem.eql(u8, entry.kind, "ui_source_validation")) {
                     const content = try std.json.Stringify.valueAlloc(a, entry.value, .{});
                     try self.appendReviewEvidence(alloc, &evidence, &payloads, .{
@@ -258,40 +288,58 @@ pub const Turn = struct {
         return alloc.print("{s}:{d}:{s}", .{ invocation, assistant_index, try workspace.hash(alloc, call) });
     }
 
-    /// Only distinct inspected bytes or independent segment findings establish
-    /// review progress. Repeated queries and failed verdicts cannot renew budgets.
+    /// Only distinct delivered byte ranges or independent segment findings
+    /// renew an attempt. This query performs no I/O after a deadline expires.
     pub fn reviewProgress(self: *Turn) ![]const u8 {
-        const revision = try self.manager.checkpoint(self.task);
-        var identities: std.StringHashMapUnmanaged(void) = .empty;
-        var history = try self.manager.historyCursor(self.task, revision);
-        while (history.offset < history.paths.len) {
-            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-            defer scratch.deinit();
-            var reader = self.manager;
-            reader.alloc = scratch.allocator();
-            const batch = (try history.next(reader.alloc)) orelse break;
-            for (batch) |raw| {
-                const model = @import("definition.zig");
-                const row = (try std.json.parseFromSlice(std.json.Value, reader.alloc, raw, .{})).value;
-                const kind = model.text(row, "kind");
-                if (!std.mem.eql(u8, kind, "review_evidence_page") and !std.mem.eql(u8, kind, "review_segment_assessment")) continue;
-                const version = model.field(row, "contract_version") orelse continue;
-                if (version != .integer or version.integer != self.task.definition.version) continue;
-                const value = model.field(row, "value") orelse continue;
-                const data = model.text(value, "data");
-                const page = (std.json.parseFromSlice(std.json.Value, reader.alloc, data, .{}) catch continue).value;
-                if (std.mem.eql(u8, kind, "review_evidence_page") and model.text(page, "id").len == 0) continue;
-                try identities.put(self.manager.alloc, try workspace.hash(self.manager.alloc, data), {});
-            }
+        return self.manager.alloc.print("{d}", .{self.review_progress_count});
+    }
+
+    fn inspectionKey(self: *Turn, scratch: std.mem.Allocator, id: []const u8, payload: []const u8, offset: usize, bytes: usize, segment: []const u8, advance: bool) !void {
+        const raw = try std.json.Stringify.valueAlloc(scratch, .{ .id = id, .payload = payload, .offset = offset, .bytes = bytes, .segment = segment }, .{});
+        const key = try workspace.hash(self.manager.alloc, raw);
+        const slot = try self.review_seen.getOrPut(self.manager.alloc, key);
+        if (!slot.found_existing and advance) self.review_progress_count += 1;
+    }
+
+    fn trackReview(self: *Turn, kind: []const u8, raw: []const u8, advance: bool) !void {
+        const segment = std.mem.eql(u8, kind, "review_segment_assessment");
+        const page = std.mem.eql(u8, kind, "review_evidence_page");
+        const initial = std.mem.eql(u8, kind, "review_request");
+        if (!segment and !page and !initial) return;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const model = @import("definition.zig");
+        const value = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch return;
+        if (segment) {
+            const key = try self.manager.alloc.print("assessment:{s}", .{try workspace.hash(a, raw)});
+            const slot = try self.review_seen.getOrPut(self.manager.alloc, key);
+            if (!slot.found_existing and advance) self.review_progress_count += 1;
+            return;
         }
-        // Count distinct immutable pages; repeated identical pages do not advance.
-        return self.manager.alloc.print("{d}", .{identities.count()});
+        const id = model.text(value, "id");
+        const hash = model.text(value, "sha256");
+        const content = model.text(value, "content");
+        if (page and id.len > 0 and hash.len == 64 and content.len > 0) {
+            if (model.field(value, "offset")) |offset| if (offset == .integer and offset.integer >= 0) try self.inspectionKey(a, id, hash, @intCast(offset.integer), content.len, try workspace.hash(a, content), advance);
+        }
+        for (model.items(value, "evidence")) |entry| {
+            const complete = model.field(entry, "complete") orelse continue;
+            const bytes = model.field(entry, "bytes") orelse continue;
+            const entry_id = model.text(entry, "id");
+            const entry_hash = model.text(entry, "sha256");
+            if (complete != .bool or !complete.bool or bytes != .integer or bytes.integer < 0 or entry_id.len == 0 or entry_hash.len != 64) continue;
+            // Inline complete records are delivered too. Initial packet records
+            // seed deduplication without granting a retry for generated metadata.
+            try self.inspectionKey(a, entry_id, entry_hash, 0, @intCast(bytes.integer), entry_hash, advance and !initial);
+        }
     }
 
     fn recordReview(raw: *anyopaque, kind: []const u8, bytes: []const u8) !void {
         const self: *Turn = @ptrCast(@alignCast(raw));
         const id = try self.manager.recordReceipt(self.task, kind, .{ .at_ms = @import("../shared/io.zig").milliTimestamp(), .data = bytes });
         if (std.mem.eql(u8, kind, "review_assessment")) self.assessment_record = id;
+        try self.trackReview(kind, bytes, true);
     }
 
     pub fn sealReview(self: *Turn) !void {

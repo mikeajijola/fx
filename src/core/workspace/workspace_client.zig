@@ -13,10 +13,7 @@ pub const Company = struct {
     epoch: u64,
 };
 
-pub const Control = struct {
-    deadline: std.Io.Clock.Timestamp,
-    cancel: *std.atomic.Value(bool),
-};
+pub const Control = @import("../shared/bounded_operation.zig").Control;
 
 pub fn companyBootstrap(alloc: std.mem.Allocator, base_url: []const u8) !Company {
     return companyBootstrapControlled(alloc, base_url, null);
@@ -116,7 +113,7 @@ fn httpControlled(alloc: std.mem.Allocator, base_url: []const u8, endpoint: []co
             return .{ .bytes = try httpBody(self.alloc, self.base_url, self.endpoint, self.body, self.token) };
         }
     };
-    var result = try @import("../../gateway/client.zig").runBoundedHttpOperation(Body, alloc, if (control) |value| value.cancel else &cancelled, deadline, Operation{ .alloc = alloc, .base_url = base_url, .endpoint = endpoint, .body = body, .token = token });
+    var result = try @import("../shared/bounded_operation.zig").run(Body, alloc, if (control) |value| value.cancel else &cancelled, deadline, Operation{ .alloc = alloc, .base_url = base_url, .endpoint = endpoint, .body = body, .token = token });
     defer result.deinit(alloc);
     return std.json.parseFromSliceLeaky(std.json.Value, alloc, result.bytes, .{ .allocate = .alloc_always });
 }

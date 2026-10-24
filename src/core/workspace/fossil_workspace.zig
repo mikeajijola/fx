@@ -74,12 +74,14 @@ pub const HistoryCursor = struct {
         if (self.offset >= self.paths.len) return null;
         var reader = self.manager;
         reader.alloc = alloc;
+        try reader.checkOperation();
         const batch = self.paths[self.offset..@min(self.offset + 16, self.paths.len)];
         if (reader.historyBatch(batch, self.revision)) |values| {
             self.offset += batch.len;
             return values;
         } else |err| {
-            if (err == error.OutOfMemory) return err;
+            if (err == error.OutOfMemory or err == error.Cancelled or err == error.Timeout) return err;
+            try reader.checkOperation();
             const value = try reader.historyRecord(self.task, batch[0], self.revision);
             self.offset += 1;
             const values = try alloc.alloc([]const u8, 1);
@@ -357,16 +359,21 @@ const Lease = struct {
         return acquireNamed(alloc, root, "writer.lock");
     }
     fn acquireNamed(alloc: Allocator, root: []const u8, name: []const u8) !Lease {
+        return acquireControlled(alloc, root, name, null);
+    }
+    fn acquireControlled(alloc: Allocator, root: []const u8, name: []const u8, control: ?@import("../shared/bounded_operation.zig").Control) !Lease {
         if (comptime builtin.target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
+        if (control) |value| try value.check();
         try mkdir(root);
         const path = try join(alloc, root, name);
         const file = try std.Io.Dir.cwd().createFile(io_mod.getIo(), path, .{ .truncate = false, .permissions = .fromMode(0o600) });
         errdefer file.close(io_mod.getIo());
         var attempts: usize = 0;
         while (!try file.tryLock(io_mod.getIo(), .exclusive)) {
+            if (control) |value| try value.check();
             if (attempts >= 3000) return error.WorkspaceBusy;
             attempts += 1;
-            io_mod.sleep(10 * std.time.ns_per_ms);
+            if (control != null) try io_mod.getIo().sleep(.fromMilliseconds(10), .awake) else io_mod.sleep(10 * std.time.ns_per_ms);
         }
         return .{ .file = file };
     }
@@ -415,11 +422,20 @@ pub const Manager = struct {
     expected_revision: ?[]const u8 = null,
     review_fence: ?@import("review_job.zig").Fence = null,
     company_operation_held: bool = false,
+    operation_control: ?@import("../shared/bounded_operation.zig").Control = null,
 
     alloc: Allocator,
     repository: []const u8,
     root: []const u8,
     manifest: Manifest,
+
+    fn checkOperation(self: Manager) !void {
+        if (self.operation_control) |control| try control.check();
+    }
+
+    fn writerLease(self: Manager) !Lease {
+        return Lease.acquireControlled(self.alloc, self.root, "writer.lock", self.operation_control);
+    }
 
     fn checkExpectedRevision(self: Manager, branch: []const u8) !void {
         if (self.expected_revision) |expected| if (!try self.sameRevision(expected, try self.revision(branch))) return error.WorkspaceRevisionChanged;
@@ -529,7 +545,7 @@ pub const Manager = struct {
     /// Company control records are host-owned and never enter actor checkouts.
     pub fn companyWrite(self: Manager, expected: ?[]const u8, files: []const CompanyFile) ![]const u8 {
         if (!self.company_operation_held) return error.CompanyOperationLeaseRequired;
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         const current = try self.companyRevision();
         if (!optionalEqual(current, expected)) return error.WorkspaceRevisionChanged;
@@ -556,13 +572,13 @@ pub const Manager = struct {
     }
 
     pub fn companyOperationLease(self: Manager) !ExecutionLease {
-        const lease = try Lease.acquireNamed(self.alloc, try @import("company_keys.zig").directory(self), "operation.lock");
+        const lease = try Lease.acquireControlled(self.alloc, try @import("company_keys.zig").directory(self), "operation.lock", self.operation_control);
         return .{ .file = lease.file };
     }
 
     /// Recovery holds the source writer boundary until issuer activation ends.
     pub fn snapshotLease(self: Manager) !ExecutionLease {
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         return .{ .file = lease.file };
     }
 
@@ -586,7 +602,7 @@ pub const Manager = struct {
     }
 
     pub fn bindCompanyTask(self: Manager, previous: Task, authority: @import("company_authority.zig").Binding) !Task {
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         var task = try self.loadTask(previous.id);
         if (task.authority) |existing| {
@@ -604,7 +620,7 @@ pub const Manager = struct {
     pub fn freezeCompanyReads(self: Manager, previous: Task, references: []const @import("company_reads.zig").Reference) !Task {
         if (!self.company_operation_held) return error.CompanyOperationLeaseRequired;
         if (references.len > 100) return error.CompanyReadSetTooLarge;
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         var task = try self.loadTask(previous.id);
         if (task.authority == null) return error.CompanyAccessDenied;
@@ -673,7 +689,7 @@ pub const Manager = struct {
 
     pub fn scheduleSnapshot(self: Manager, request: scheduling.Request) !scheduling.Snapshot {
         try scheduling.validate(request);
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         const before = try self.scheduleRevision();
         if (request.revision) |expected| if (!std.mem.eql(u8, expected, before)) return error.WorkspaceRevisionChanged;
@@ -757,7 +773,7 @@ pub const Manager = struct {
     }
 
     pub fn hasDueSchedules(self: Manager) !bool {
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         const now = io_mod.milliTimestamp();
         for ((try self.loadSchedules()).schedules) |schedule| {
@@ -769,7 +785,7 @@ pub const Manager = struct {
 
     pub fn claimSchedule(self: Manager, owner: []const u8) !?scheduling.Schedule {
         if (!scheduling.validOwner(owner)) return error.InvalidScheduleOwner;
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         var store = try self.loadSchedules();
         const values = try self.alloc.dupe(scheduling.Schedule, store.schedules);
@@ -820,7 +836,7 @@ pub const Manager = struct {
     }
 
     pub fn renewSchedule(self: Manager, previous: scheduling.Schedule) !void {
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         var store = try self.loadSchedules();
         const values = try self.alloc.dupe(scheduling.Schedule, store.schedules);
@@ -837,7 +853,7 @@ pub const Manager = struct {
 
     pub fn finishSchedule(self: Manager, previous: scheduling.Schedule, state: scheduling.State, reason: []const u8) !void {
         if (state != .waiting and state != .failed and state != .completed) return error.InvalidScheduleTransition;
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         var store = try self.loadSchedules();
         const values = try self.alloc.dupe(scheduling.Schedule, store.schedules);
@@ -889,7 +905,7 @@ pub const Manager = struct {
     }
 
     pub fn queueReview(self: Manager, previous: Task) !@import("review_job.zig").Job {
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         var task = try self.loadTask(previous.id);
         try self.checkExpectedRevision(task.branch);
@@ -916,7 +932,7 @@ pub const Manager = struct {
     pub fn claimReview(self: Manager, owner: []const u8) !?@import("review_job.zig").Job {
         const authority_lease: ?ExecutionLease = if (self.company_operation_held) null else try self.companyOperationLease();
         defer if (authority_lease) |held| held.release();
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         const now = io_mod.milliTimestamp();
         for (try self.tasks()) |loaded| {
@@ -975,7 +991,7 @@ pub const Manager = struct {
     }
 
     pub fn finishReviewJob(self: Manager, previous: @import("review_job.zig").Job, state: @FieldType(@import("review_job.zig").Job, "state"), reason: []const u8) !void {
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         const task = try self.loadTask(previous.task);
         var job = try self.loadReviewJob(task, previous.id);
@@ -990,7 +1006,7 @@ pub const Manager = struct {
 
     pub fn beginReviewAttempt(self: Manager, previous: @import("review_job.zig").Job) !bool {
         if (self.review_fence == null) return error.StaleReviewLease;
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         var task = try self.loadTask(previous.task);
         var job = try self.loadReviewJob(task, previous.id);
@@ -1033,10 +1049,11 @@ pub const Manager = struct {
 
     fn run(self: Manager, cwd: ?[]const u8, arguments: []const []const u8) ![]const u8 {
         if (comptime builtin.target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
+        try self.checkOperation();
         // Fossil read commands can also take SQLite locks. Serialize each CLI
         // process separately from the enclosing writer transaction, so status
         // readers cannot abort a branch creation or checkpoint.
-        const command_lease = try Lease.acquireNamed(self.alloc, self.root, "command.lock");
+        const command_lease = try Lease.acquireControlled(self.alloc, self.root, "command.lock", self.operation_control);
         defer command_lease.release();
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.appendSlice(self.alloc, &.{ try @import("fossil_executable.zig").resolve(self.alloc), "--user", "omos" });
@@ -1052,12 +1069,14 @@ pub const Manager = struct {
         try environment.put("USER", "omos");
         try environment.put("LC_ALL", "C");
         try environment.put("LANG", "C");
+        try self.checkOperation();
         const result = try std.process.run(self.alloc, io_mod.getIo(), .{
             .argv = argv.items,
             .environ_map = &environment,
             .cwd = if (cwd) |path| .{ .path = path } else .inherit,
             .stdout_limit = .limited(max_bytes),
             .stderr_limit = .limited(64 * 1024),
+            .timeout = if (self.operation_control) |control| .{ .deadline = control.deadline } else .none,
         });
         switch (result.term) {
             .exited => |code| if (code != 0) {
@@ -1143,7 +1162,7 @@ pub const Manager = struct {
     }
 
     pub fn use(self: Manager) !void {
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         try self.verify();
         try self.restoreRegistry();
@@ -1412,7 +1431,7 @@ pub const Manager = struct {
 
     fn startBound(self: Manager, session: []const u8, project: []const u8, goal: []const u8, parent: ?Task, authority: ?@import("company_authority.zig").Binding) !Task {
         if (goal.len > max_bytes or !std.unicode.utf8ValidateSlice(goal)) return error.WorkspaceGoalTooLarge;
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         try self.pauseSelectedTask(session, null);
         var nonce: [16]u8 = undefined;
@@ -1460,7 +1479,7 @@ pub const Manager = struct {
     }
 
     pub fn resumeTask(self: Manager, session: []const u8, id: []const u8, project: []const u8) !Task {
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         const task_lease = (try self.tryTaskExecutionLease(id)) orelse return error.WorkspaceExecutionBusy;
         defer task_lease.release();
@@ -1495,7 +1514,7 @@ pub const Manager = struct {
     }
 
     pub fn storeLocalCheckpoint(self: Manager, task: Task, bytes: []const u8) !void {
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         const path = try join(self.alloc, self.root, "checkpoints");
         try mkdir(path);
@@ -1513,7 +1532,7 @@ pub const Manager = struct {
 
     pub fn setState(self: Manager, id: []const u8, state: @FieldType(Task, "state")) !Task {
         if (state == .accepted or state == .publication_pending or state == .conflict) return error.ProtectedTaskTransition;
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         var task = try self.loadTask(id);
         if (task.state == .accepted or task.state == .publication_pending or task.state == .conflict) return task;
@@ -1525,7 +1544,7 @@ pub const Manager = struct {
     pub fn amend(self: Manager, previous: Task, input_text: []const u8) !Task {
         const text = try text_utils.maskSecrets(self.alloc, input_text);
         if (text.len == 0 or std.ascii.eqlIgnoreCase(std.mem.trim(u8, text, " \t\r\n"), "continue")) return previous;
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         var task = try self.loadTask(previous.id);
         if (std.mem.eql(u8, text, task.definition.objective)) return task;
@@ -1589,7 +1608,7 @@ pub const Manager = struct {
 
     // The durable journal path is independent of the caller's payload type.
     noinline fn recordJson(self: Manager, task: Task, kind: []const u8, raw: []const u8) ![]const u8 {
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         try self.checkExpectedRevision(task.branch);
         const current = try self.loadTask(task.id);
@@ -1698,7 +1717,7 @@ pub const Manager = struct {
     }
 
     pub fn checkpoint(self: Manager, task: Task) ![]const u8 {
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         try self.drain(task);
         const latest = try self.loadTask(task.id);
@@ -1810,7 +1829,7 @@ pub const Manager = struct {
     pub fn readContent(self: Manager, task: Task, path: []const u8) ![]const u8 {
         const bytes = try self.content(task, path);
         if (!allowedMutablePath(path) and !std.mem.startsWith(u8, path, "records/")) return bytes;
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         var current = try self.loadTask(task.id);
         if (current.state == .accepted or current.state == .publication_pending) return bytes;
@@ -1826,7 +1845,7 @@ pub const Manager = struct {
     }
 
     pub fn refresh(self: Manager, previous: Task) !Task {
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         var task = try self.loadTask(previous.id);
         if (task.state == .publication_pending or task.state == .accepted) return error.TaskIsReadOnly;
@@ -2017,7 +2036,7 @@ pub const Manager = struct {
         const source_files = try self.inventory(source);
         const manifest = try self.contentAt("ui/manifest.json", source);
         _ = try parse(self.alloc, std.json.Value, manifest);
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         try self.checkExpectedRevision(task.branch);
         const current = try self.loadTask(task.id);
@@ -2122,7 +2141,7 @@ pub const Manager = struct {
             }
         }
         if (!has_manifest) return error.InvalidUiManifest;
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         if (!std.mem.eql(u8, expected, try self.revision("trunk"))) return error.WorkspaceRevisionChanged;
         for (try self.inventory("trunk")) |path| if (std.mem.startsWith(u8, path, "ui/")) return error.UiAlreadyInstalled;
@@ -2147,7 +2166,7 @@ pub const Manager = struct {
             for (files[0..i]) |previous| if (std.mem.eql(u8, file.path, previous.path)) return error.InvalidUiManifest;
         }
         if (total > max_bytes) return error.UiSourceTooLarge;
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         try self.checkExpectedRevision(task.branch);
         const current = try self.loadTask(task.id);
@@ -2174,7 +2193,7 @@ pub const Manager = struct {
 
     fn writeContentInternal(self: Manager, task: Task, path: []const u8, bytes: []const u8) !void {
         if (std.mem.startsWith(u8, path, "artifacts/") and !std.mem.eql(u8, path[10..], try hash(self.alloc, bytes))) return error.InvalidArtifactIdentity;
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         try self.checkExpectedRevision(task.branch);
         const current = try self.loadTask(task.id);
@@ -2269,7 +2288,7 @@ pub const Manager = struct {
     }
 
     fn checkpointContentInternal(self: Manager, task: Task, changes: []const ContentChange, operation: ?[]const u8, action: @import("company_authority.zig").Action) ![]const u8 {
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         if (operation) |id| if (try self.companyCheckpointRevision(task, id)) |revision_id| return revision_id;
         try self.checkExpectedRevision(task.branch);
@@ -2358,7 +2377,7 @@ pub const Manager = struct {
         const entity_path = "records/omos_profile/local-owner.json";
         if (update) {
             const photo = if (encoded) |content_bytes| try @import("profile_photo.zig").decode(self.alloc, content_bytes) else null;
-            const lease = try Lease.acquire(self.alloc, self.root);
+            const lease = try self.writerLease();
             defer lease.release();
             const data = try json(self.alloc, .{ .id = "local-owner", .photo_hash = if (photo) |image| image.sha256 else "", .mime = if (photo) |image| image.mime else "" });
             if (try self.modelBasis("trunk")) |basis| {
@@ -2782,7 +2801,7 @@ pub const Manager = struct {
     pub fn publish(self: Manager, task: Task, review: Review) ![]const u8 {
         const authority_lease: ?ExecutionLease = if (self.company_operation_held) null else try self.companyOperationLease();
         defer if (authority_lease) |held| held.release();
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         const latest = try self.loadTask(task.id);
         try @import("company_authority.zig").authorizeTask(self, latest);
@@ -2970,7 +2989,7 @@ pub const Manager = struct {
     }
 
     pub fn reopenUnpublished(self: Manager, previous: Task) !Task {
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         if (try self.publicationCommitted(previous)) return error.TaskAlreadyAccepted;
         var task = try self.loadTask(previous.id);
@@ -2987,7 +3006,7 @@ pub const Manager = struct {
     }
 
     pub fn acknowledge(self: Manager, task: Task) !void {
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         if ((try self.loadTask(task.id)).state != .accepted) return error.WorkspacePublicationRequired;
         try remove(try self.publicationPath(task.id));
@@ -2996,7 +3015,7 @@ pub const Manager = struct {
     pub fn retryPublication(self: Manager, task: Task) !?[]const u8 {
         const authority_lease: ?ExecutionLease = if (self.company_operation_held) null else try self.companyOperationLease();
         defer if (authority_lease) |held| held.release();
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         const bytes = read(self.alloc, try self.publicationPath(task.id)) catch |err| switch (err) {
             error.FileNotFound => return null,
@@ -3028,7 +3047,7 @@ pub const Manager = struct {
     /// Archive only public conversation fields from legacy sessions. Never copy
     /// provider credentials, recovery checkpoints, settings, or runtime files.
     pub fn importHistory(self: Manager) !struct { imported: usize, skipped: usize } {
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         const sessions = try join(self.alloc, try profile(self.alloc), "sessions");
         var directory = std.Io.Dir.cwd().openDir(io_mod.getIo(), sessions, .{ .iterate = true }) catch |err| switch (err) {
@@ -3239,7 +3258,7 @@ pub const Manager = struct {
         // A portable verified backup is made before the first model write.
         const backup = try self.alloc.print("{s}.pre-omniform-{d}.fossil", .{ self.repository, io_mod.milliTimestamp() });
         try self.exportRepository(backup);
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         const tree = try self.checkout("trunk");
         var manifest = self.manifest;
@@ -3265,7 +3284,7 @@ pub const Manager = struct {
         try self.exportRepository(backup);
         const backup_manager = try Manager.open(self.alloc, backup);
         const backed_up_base = try backup_manager.revision("trunk");
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         // Export may commit the portable registry. Fence the actual exported
         // revision, while requiring the governing definition to remain unchanged.
@@ -3294,7 +3313,7 @@ pub const Manager = struct {
 
     pub fn proposeDefinition(self: Manager, task: ?Task, bytes: []const u8, execution_bytes: ?[]const u8) ![]const u8 {
         const proposed = try model.parse(self.alloc, bytes);
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         try self.checkExpectedRevision(if (task) |selected| selected.branch else "trunk");
         const base = try self.revision("trunk");
@@ -3343,7 +3362,7 @@ pub const Manager = struct {
     }
 
     fn applyPlan(self: Manager, previous: Task, capability: []const u8, summary: []const u8, obligations: []const contract.Obligation, checks: []const []const u8, superseded: ?[]const []const u8) !Task {
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         var current = try self.loadTask(previous.id);
         if (current.definition.version != previous.definition.version or current.state != .active) return error.StaleWorkContract;
@@ -3593,7 +3612,7 @@ pub const Manager = struct {
     }
 
     pub fn exportRepository(self: Manager, destination: []const u8) !void {
-        const lease = try Lease.acquire(self.alloc, self.root);
+        const lease = try self.writerLease();
         defer lease.release();
         if (exists(destination)) return error.WorkspaceAlreadyExists;
         for (try self.tasks()) |task| try self.drain(task);

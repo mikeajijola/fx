@@ -2839,6 +2839,70 @@ sys.exit(result.returncode)
     expect(m.packets.at(-1).evidence.filter((e: any) => e.id.startsWith("workspace-file:")).map((e: any) => e.bytes).every((bytes: number) => bytes > 150000)).toBe(true);
   }, 150000);
 
+  test("does not renew the review allowance by repeatedly retrieving an already delivered record", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let repeat = true;
+    const m = model(f, () => ({ content: "A retained informational answer." }), packet => {
+      if (!repeat) return "met";
+      const candidate = packet.evidence.find((entry: any) => entry.kind === "candidate");
+      expect(candidate.complete).toBe(true);
+      return { name: "omos_review_evidence", args: { action: "read", id: candidate.id } };
+    });
+    const first = await f.run(["ask", "Give a brief informational answer", "--json"], {}, 90000);
+    expect(first.code).toBe(1);
+    expect(first.stderr).toContain("Verification is pending");
+    expect(m.counts().assessments).toBeGreaterThan(3);
+    expect(m.counts().assessments).toBeLessThanOrEqual(8);
+    expect(m.counts().actors).toBe(1);
+    repeat = false;
+    const resumed = await f.run(["ask", "--resume-id", JSON.parse(first.stdout).session_id, "continue", "--json"], {}, 90000);
+    expect(resumed.code, resumed.stderr).toBe(0);
+    expect(m.counts().actors).toBe(1);
+  }, 180000);
+
+  test("bounds host evidence collection by the review deadline and resumes its retained answer without actor replay", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const declaration = join(f.home, "definition.json"), execution = join(f.home, "execution.json");
+    writeFileSync(declaration, readFileSync(join(import.meta.dir, "../../src/core/workspace/standard/omos.json")));
+    writeFileSync(execution, JSON.stringify({ review: { response_timeout_ms: 3000, attempt_timeout_ms: 3000, total_timeout_ms: 3000, max_attempts: 1 } }));
+    expect((await f.run(["fossil", "definition", "propose", declaration, "--execution", execution, "--json"])).code).toBe(0);
+    const flag = join(f.home, "slow-history.flag"), helper = join(f.home, "bounded-fossil.py");
+    const executable = Bun.which("fossil")!;
+    // Delay bulk inspection; single-record durability acknowledgements remain
+    // available so the timeout outcome itself can be checkpointed.
+    writeFileSync(helper, `#!/usr/bin/env python3
+import os, pathlib, sys, time
+args = sys.argv[1:]
+if pathlib.Path(${JSON.stringify(flag)}).exists() and "cat" in args and sum(arg.startswith("history/") for arg in args) > 1:
+    time.sleep(15)
+os.execv(${JSON.stringify(executable)}, [${JSON.stringify(executable)}, *args])
+`, { mode: 0o700 });
+    let flaggedAt = 0;
+    const m = model(f, (_body, count) => {
+      if (count === 1) return writeMemory("Retained workspace content.");
+      writeFileSync(flag, "Delay read-only history retrieval for the deadline fixture.");
+      flaggedAt = performance.now();
+      return { content: "A retained informational answer." };
+    });
+    const first = await f.run(["ask", "Save the workspace note and give a brief informational answer", "--json"], { OMOS_FOSSIL_BIN: helper }, 45000);
+    expect(first.code, first.stderr).toBe(1);
+    expect(first.stderr).toContain("Verification is pending");
+    expect(flaggedAt).toBeGreaterThan(0);
+    expect(performance.now() - flaggedAt).toBeLessThan(10000);
+    expect(m.counts().actors).toBe(2);
+    expect(m.counts().assessments).toBe(0);
+    const session = JSON.parse(first.stdout).session_id;
+    rmSync(flag);
+    const resumed = await f.run(["ask", "--resume-id", session, "continue", "--json"], { OMOS_FOSSIL_BIN: helper }, 45000);
+    expect(resumed.code, resumed.stderr + resumed.stdout).toBe(0);
+    expect(resumed.stdout).toContain("A retained informational answer.");
+    expect(m.counts().actors).toBe(2);
+    expect(m.counts().assessments).toBeGreaterThan(0);
+    expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Retained workspace content.");
+  }, 120000);
+
   test("rejects a corrupted review cache and rebuilds missing payloads from pinned Fossil history without actor replay", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);

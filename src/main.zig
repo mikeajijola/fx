@@ -4897,6 +4897,7 @@ test {
     _ = @import("core/workspace/company_reads.zig");
     _ = @import("core/workspace/workspace_client.zig");
     _ = @import("core/workspace/review_spool.zig");
+    _ = @import("core/shared/bounded_operation.zig");
     _ = @import("core/workspace/task_governance.zig");
     _ = @import("core/agent/runtime/review_evidence.zig");
     _ = @import("core/agent/runtime/review_checkpoints.zig");

@@ -139,6 +139,20 @@ timeout and the remaining attempt allowance. Automatic continuation reuses
 retained evidence and stops when inspection stops advancing or the total
 allowance expires. Continuing a paused task creates another bounded invocation.
 
+The attempt deadline also covers host evidence collection. Fossil processes and
+command, writer and authority lock waits inherit that deadline. A timed-out or
+cancelled history batch stops instead of falling back to more reads. The host
+drains the collection worker before releasing its turn memory. Timeout handling
+uses an in-memory progress counter rather than another history scan.
+
+Canonical history seeds byte-range deduplication without renewing an attempt.
+Newly delivered ranges, complete records retrieved beyond the initial packet,
+and valid independent segment assessments advance that counter. Repeating the
+same bytes does not. A collection timeout retains verification as pending;
+it does not replay actor actions or classify a server review as completed.
+Saving and acknowledging the pending outcome remains a separate durability
+step; the review budget cannot turn an unacknowledged write into a success.
+
 Exhausted verification leaves the task paused with its candidate and review
 progress retained. It does not publish the task or return to actor execution.
 Other review failures preserve their specific failure diagnostics. Optional

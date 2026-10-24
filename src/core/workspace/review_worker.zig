@@ -36,16 +36,21 @@ pub fn perform(original: workspace.Manager, job: jobs.Job, model: Model) !void {
     const policy = if (task.model_basis) |basis| basis.execution.review else @import("definition.zig").ReviewPolicy.legacy;
     const remaining_ms = @max(1, @as(i64, policy.total_timeout_ms) - @max(0, io.milliTimestamp() - job.started_ms));
     const deadline = std.Io.Clock.Timestamp.fromNow(io.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(remaining_ms) });
-    var previous_progress: ?[]const u8 = null;
+    var previous_progress: ?[]const u8 = try turn.reviewProgress();
     var token_spent: u64 = job.reported_tokens;
     for (0..policy.max_attempts) |_| {
         if (!try manager.beginReviewAttempt(job)) return;
-        const evidence = try turn.beforeReview(manager.alloc, &.{});
+        const attempt_deadline = std.Io.Clock.Timestamp.fromNow(io.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(policy.attempt_timeout_ms) });
+        const collection_deadline = if (std.Io.Clock.Timestamp.compare(deadline, .lt, attempt_deadline)) deadline else attempt_deadline;
+        const evidence = turn.beforeReviewControlled(manager.alloc, &.{}, model.cancel, collection_deadline) catch |err| {
+            try manager.record(task, "review_failure", .{ .at_ms = io.milliTimestamp(), .reason = @errorName(err), .candidate_retained = true, .stage = "evidence_collection" });
+            if (err == error.Timeout) break;
+            return err;
+        };
         try manager.record(task, "review_attempt", .{ .job = job.id, .generation = job.generation, .model = model.model, .policy = policy });
         var delivery: streams.DeliveryCertainty = .init();
         var attempts: streams.AttemptEvidence = .{};
         var context: u8 = 0;
-        const attempt_deadline = std.Io.Clock.Timestamp.fromNow(io.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(policy.attempt_timeout_ms) });
         const result = review.assess(manager.alloc, model.provider, .{
             .prompt = task.definition.objective,
             .original_request = try manager.originalRequest(task),
