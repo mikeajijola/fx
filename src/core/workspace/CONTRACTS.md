@@ -318,6 +318,11 @@ The bounded verification cache can discard entries and repeat checks. File
 reads use batches of at most 32 files with a 4 MiB target and the existing
 8 MiB individual record limit. Canonical symbolic links are unsupported.
 
+File comparisons use the immutable check-in manifests, including executable
+flags. `omos fossil diff` reports a mode change even when the file's content
+object is unchanged. Historical 40-character SHA-3 abbreviations are resolved
+to complete check-in identities before manifest verification.
+
 Index reconstruction loads publication receipts once per parent revision. An
 accepted task must match its receipt's task, contract version, source revision,
 and publication target. Portable repository exports explicitly include private

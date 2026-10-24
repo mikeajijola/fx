@@ -2628,19 +2628,33 @@ pub const Manager = struct {
     }
 
     pub fn changedPaths(self: Manager, from: []const u8, to: []const u8) ![]const []const u8 {
-        const output = try self.run(null, &.{ "diff", "--internal", "--brief", "--from", from, "--to", to, "-R", self.repository });
         var paths: std.ArrayList([]const u8) = .empty;
-        var lines = std.mem.splitScalar(u8, output, '\n');
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-            const separator = std.mem.findScalar(u8, line, ' ') orelse return error.InvalidFossilDiff;
-            try paths.append(self.alloc, std.mem.trimStart(u8, line[separator..], " "));
-        }
+        for (try self.compareFiles(from, to)) |change| try paths.append(self.alloc, change.path);
         return paths.items;
     }
 
     pub fn diff(self: Manager, task: Task) ![]const u8 {
-        return self.run(null, &.{ "diff", "--internal", "--from", task.base_revision, "--to", task.branch, "-R", self.repository });
+        var result: std.Io.Writer.Allocating = .init(self.alloc);
+        defer result.deinit();
+        for (try self.compareFiles(task.base_revision, task.branch)) |change| {
+            if (change.before) |before| if (change.after) |after| if (before.mode != after.mode) {
+                try result.writer.print("Mode {s}: {s} -> {s}\n", .{ change.path, @tagName(before.mode), @tagName(after.mode) });
+            };
+        }
+        try result.writer.writeAll(try self.run(null, &.{ "diff", "--internal", "--from", task.base_revision, "--to", task.branch, "-R", self.repository }));
+        return result.toOwnedSlice();
+    }
+
+    fn compareFiles(self: Manager, from: []const u8, to: []const u8) ![]const fossil_manifest.Change {
+        // A historical 40-character reference can abbreviate a SHA-3 check-in.
+        // Resolve it before selecting the manifest verification hash algorithm.
+        const before = try self.fileEntries(if (from.len == 64 and fossil_manifest.validHash(from)) from else try self.revision(from), true);
+        const after = try self.fileEntries(if (to.len == 64 and fossil_manifest.validHash(to)) to else try self.revision(to), true);
+        return fossil_manifest.compare(self.alloc, before, after);
+    }
+
+    pub fn fileManifest(self: Manager, revision_id: []const u8) ![]const fossil_manifest.File {
+        return self.fileEntries(revision_id, true);
     }
 
     pub fn history(self: Manager) ![]const u8 {

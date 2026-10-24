@@ -9,6 +9,34 @@ pub const File = struct {
 };
 pub const Manifest = struct { baseline: ?[]const u8 = null, files: []const File };
 pub const SizedFile = struct { path: []const u8, bytes: usize };
+pub const Change = struct { path: []const u8, before: ?File, after: ?File };
+
+/// Compare resolved inventories, including modes that Fossil's brief textual
+/// diff omits when the content object remains unchanged.
+pub fn compare(alloc: std.mem.Allocator, before: []const File, after: []const File) ![]const Change {
+    var previous = std.StringHashMap(File).init(alloc);
+    defer previous.deinit();
+    var changes: std.ArrayList(Change) = .empty;
+    for (before) |file| {
+        if (file.artifact == null or (try previous.getOrPut(file.path)).found_existing) return error.InvalidFossilManifest;
+        try previous.put(file.path, file);
+    }
+    for (after) |file| {
+        if (file.artifact == null) return error.InvalidFossilManifest;
+        if (previous.fetchRemove(file.path)) |old| {
+            if (old.value.mode == file.mode and std.mem.eql(u8, old.value.artifact.?, file.artifact.?)) continue;
+            try changes.append(alloc, .{ .path = file.path, .before = old.value, .after = file });
+        } else try changes.append(alloc, .{ .path = file.path, .before = null, .after = file });
+    }
+    var deleted = previous.valueIterator();
+    while (deleted.next()) |file| try changes.append(alloc, .{ .path = file.path, .before = file.*, .after = null });
+    std.mem.sort(Change, changes.items, {}, struct {
+        fn less(_: void, a: Change, b: Change) bool {
+            return std.mem.lessThan(u8, a.path, b.path);
+        }
+    }.less);
+    return changes.toOwnedSlice(alloc);
+}
 
 /// `branch list --all` has three fixed status columns. Strip the status,
 /// never marker-like characters that are part of an actual branch name.
@@ -188,6 +216,34 @@ pub fn resolve(alloc: std.mem.Allocator, baseline: ?Manifest, changes: Manifest)
 const h = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const envelope = "C test\nD 2026-01-01T00:00:00\n";
 const end = "Z 0123456789abcdef0123456789abcdef\n";
+
+test "Fossil manifest comparison includes content mode additions and deletions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const before = [_]File{
+        .{ .path = "memory/unchanged", .artifact = h },
+        .{ .path = "skills/run.sh", .artifact = h },
+        .{ .path = "documents/changed", .artifact = h },
+        .{ .path = "memory/deleted", .artifact = h },
+    };
+    const after = [_]File{
+        .{ .path = "memory/unchanged", .artifact = h },
+        .{ .path = "skills/run.sh", .artifact = h, .mode = .executable },
+        .{ .path = "documents/changed", .artifact = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+        .{ .path = "memory/added", .artifact = h },
+    };
+    const changes = try compare(arena.allocator(), &before, &after);
+    try std.testing.expectEqual(@as(usize, 4), changes.len);
+    try std.testing.expectEqualStrings("documents/changed", changes[0].path);
+    try std.testing.expectEqualStrings("memory/added", changes[1].path);
+    try std.testing.expect(changes[1].before == null);
+    try std.testing.expectEqualStrings("memory/deleted", changes[2].path);
+    try std.testing.expect(changes[2].after == null);
+    try std.testing.expectEqualStrings("skills/run.sh", changes[3].path);
+    try std.testing.expectEqual(.regular, changes[3].before.?.mode);
+    try std.testing.expectEqual(.executable, changes[3].after.?.mode);
+    try std.testing.expectEqualStrings(changes[3].before.?.artifact.?, changes[3].after.?.artifact.?);
+}
 
 test "Fossil manifest resolves escaped names and executable and symlink metadata" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

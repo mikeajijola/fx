@@ -47,6 +47,46 @@ async function startWorkspaceService(f: ReturnType<typeof fixture>, writable = f
 
 // These fault, boundary, migration, and authority cases qualify the candidate without training it.
 describe("portable Fossil workspace recovery", () => {
+  test("reports executable flag changes from immutable manifests when Fossil's brief diff is empty", async () => {
+    const f = fixture();
+    let phase = "seed", seeded = false;
+    const content = "#!/bin/sh\nprintf portable\\n\n";
+    model(f, () => phase === "seed" && !seeded ? (seeded = true, { tool_calls: [{ index: 0, id: "seed-script", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", path: "skills/run.sh", content }) } }] }) : { content: "The portable script is retained." }, () => phase === "seed" ? "met" : "blocked");
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    expect((await f.run(["ask", "Save the portable script", "--json"])).code).toBe(0);
+    phase = "mode";
+    expect((await f.run(["ask", "Retain a pending executable flag change", "--json"])).code).toBe(1);
+    const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks.find((task: any) => task.state !== "accepted");
+    const tree = join(f.home, "mode-checkout");
+    mkdirSync(tree);
+    const command = (...args: string[]) => {
+      const helper = join(import.meta.dir, "../../zig-out/libexec/fossil");
+      const result = spawnSync(existsSync(helper) ? helper : "fossil", ["--user", "omos", ...args], { cwd: tree, env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, XDG_CONFIG_HOME: f.home, USER: "fixture", LC_ALL: "C" }, encoding: "utf8" });
+      expect(result.status, result.stderr).toBe(0);
+      return result.stdout;
+    };
+    command("open", join(f.cwd, "omos.fossil"), task.branch, "--nosync");
+    chmodSync(join(tree, "skills/run.sh"), 0o700);
+    expect(command("changes", "--hash", "--differ")).toContain("EXECUTABLE");
+    command("commit", "--nosign", "--nosync", "-m", "Record executable flag in the fixture");
+    expect(command("diff", "--internal", "--brief", "--from", task.base_revision, "--to", "current")).not.toContain("skills/run.sh");
+    const diff = await f.run(["fossil", "diff", task.id, "--json"]);
+    expect(diff.code, diff.stderr).toBe(0);
+    expect(JSON.parse(diff.stdout).detail).toContain("Mode skills/run.sh: regular -> executable");
+    expect(f.fossil("cat", "skills/run.sh", "-r", task.branch)).toBe(content);
+    // Historical hosts saved the 40-character SHA-3 display abbreviation.
+    const taskPath = join(tree, "tasks", `${task.id}.json`);
+    const legacy = JSON.parse(readFileSync(taskPath, "utf8"));
+    legacy.base_revision = legacy.base_revision.slice(0, 40);
+    writeFileSync(taskPath, JSON.stringify(legacy));
+    command("commit", "--nosign", "--nosync", "-m", "Retain a historical abbreviated task base in the fixture");
+    const cache = join(f.home, ".fx/fossil", createHash("sha256").update(join(f.cwd, "omos.fossil")).digest("hex"));
+    rmSync(join(cache, "tasks"), { recursive: true });
+    const legacyDiff = await f.run(["fossil", "diff", task.id, "--json"]);
+    expect(legacyDiff.code, legacyDiff.stderr).toBe(0);
+    expect(JSON.parse(legacyDiff.stdout).detail).toContain("Mode skills/run.sh: regular -> executable");
+  }, 90000);
+
   for (const interrupted of [false, true]) test(`explicitly relocates copied personal work and requires validation in the new project${interrupted ? " after interruption" : ""}`, async () => {
     const original = fixture();
     const producer = model(original, (_body, count) => count <= 2 ? { tool_calls: [{ index: 0, id: `original-check-${count}`, type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", command: "printf 'Original source checked'", timeout_ms: 1000 } }) } }] } : { content: "The original source check passed; the task remains paused." }, () => "blocked", {
