@@ -195,13 +195,29 @@ pub fn validateInstance(manager: workspace.Manager) !void {
     _ = try keys.current(manager, current.epoch, current.issuer);
 }
 
+fn operationProperties(declaration: model.Declaration) std.json.Value {
+    for (model.items(model.spec(declaration.value), "operations")) |operation| {
+        if (!std.mem.eql(u8, model.text(operation, "id"), "omos_company_operation")) continue;
+        return model.field(model.field(operation, "input") orelse return .null, "properties") orelse .null;
+    }
+    return .null;
+}
+
+fn fileAttributesDeclared(properties: std.json.Value) bool {
+    const version = model.field(properties, "version") orelse return false;
+    if (std.mem.eql(u8, model.text(version, "const"), "omos.company/v2")) return true;
+    for (model.items(version, "enum")) |value| if (value == .string and std.mem.eql(u8, value.string, "omos.company/v2")) return true;
+    return false;
+}
+
 pub fn bootstrap(manager: workspace.Manager) ![]const u8 {
     const lease = try manager.companyOperationLease();
     defer lease.release();
     const current = try state(manager);
     _ = try keys.current(manager, current.epoch, current.issuer);
     const declaration = try manager.loadDeclaration(((try manager.modelBasis("trunk")) orelse return error.WorkspaceMigrationRequired).revision);
-    return encode(manager.alloc, .{ .version = "omos.company/v1", .workspace = current.workspace, .issuer = current.issuer, .epoch = current.epoch, .revision = try manager.revision("trunk"), .features = .{ .scope = "path", .merge = "record_or_file", .typed_records = "custom_entities", .scoped_export = "manifest", .file_attributes = "omos.company/v2", .read_dependencies = read_dependencies.supported(declaration), .operator_approvals = model.hasOperation(declaration, "omos_company_admin"), .hosted_execution = false, .max_request_bytes = 1024 * 1024, .max_read_bytes = 16384, .max_object_bytes = 8 * 1024 * 1024 } });
+    const properties = operationProperties(declaration);
+    return encode(manager.alloc, .{ .version = "omos.company/v1", .workspace = current.workspace, .issuer = current.issuer, .epoch = current.epoch, .revision = try manager.revision("trunk"), .features = .{ .scope = "path", .merge = "record_or_file", .typed_records = "custom_entities", .scoped_export = "manifest", .file_attributes = if (fileAttributesDeclared(properties)) @as(?[]const u8, "omos.company/v2") else null, .checkpoint_attributes = model.field(properties, "executable") != null and model.field(properties, "previous_executable") != null, .read_dependencies = read_dependencies.supported(declaration), .operator_approvals = model.hasOperation(declaration, "omos_company_admin"), .hosted_execution = false, .max_request_bytes = 1024 * 1024, .max_read_bytes = 16384, .max_object_bytes = 8 * 1024 * 1024 } });
 }
 
 pub fn execute(original: workspace.Manager, raw: []const u8, writable: bool) ![]const u8 {
@@ -423,6 +439,7 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
         if (try manager.companyCheckpointRevision(view.task, operation_hash)) |committed| return encode(alloc, .{ .view = view.view.id, .revision = committed, .state = "checkpointed" });
         if (request.revision == null or !std.mem.eql(u8, request.revision.?, revision_id)) return error.WorkspaceRevisionChanged;
         const path = request.path orelse return error.MissingPath;
+        if ((request.remove and request.executable != null) or (request.previous_executable != null and request.previous_hash == null) or (request.executable != null and request.previous_hash != null and request.previous_executable == null)) return error.InvalidCompanyFileAttributes;
         if (!authority.permitsPath(grant, path)) return error.CompanyAccessDenied;
         const bytes: ?[]const u8 = if (request.remove) null else if (request.encoding == .utf8) request.content orelse return error.MissingContent else blk: {
             const encoded = request.content orelse return error.MissingContent;
@@ -431,7 +448,7 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
             break :blk result;
         };
         manager.expected_revision = request.revision;
-        const revision = try manager.checkpointCompanyContent(view.task, &.{.{ .path = path, .content = bytes, .previous_hash = request.previous_hash }}, operation_hash);
+        const revision = try manager.checkpointCompanyContent(view.task, &.{.{ .path = path, .content = bytes, .previous_hash = request.previous_hash, .executable = request.executable, .previous_executable = request.previous_executable }}, operation_hash);
         return encode(alloc, .{ .view = view.view.id, .revision = revision, .state = "checkpointed" });
     }
     if (request.action == .submit) {

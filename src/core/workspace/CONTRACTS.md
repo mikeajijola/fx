@@ -243,11 +243,14 @@ against their pinned operation contracts. It reports validation issues and
 legacy tasks without rewriting them or repeating actions. This is a structural
 audit, not a completion assessment.
 
-`omos fossil migrate --contracts --json` creates a verified backup, adds the
-native contracts without overwriting company-specific fields or operations,
-and adds review defaults when that policy section is missing. Existing explicit
-review settings remain intact. Active tasks keep
-their original declaration and execution basis. Repeating a current migration
+`omos fossil migrate --contracts --json` creates a verified backup and adds
+native contracts. For known native company and scoped-export transports, it also
+adds optional schema properties and extends recognized native version values.
+Company field types, required fields, operation bindings, and other constraints
+remain intact. Review defaults are added only when that policy section is
+missing. Active tasks keep their original declaration and execution basis.
+Definition proposals continue to require exact preservation of existing
+operation contracts; these transport extensions require explicit migration. Repeating a current migration
 does not create another backup. Older tasks can use the current transport API
 while their record writes and assessments retain the older task contract.
 
@@ -470,6 +473,20 @@ accepted ancestry or the caller's own view. Content reads use bounded base64
 byte ranges and SHA-256 hashes. Canonical filenames are case-sensitive even
 when the host or repository defaults to case-insensitive lookup. Checkpoints
 reject new ASCII case collisions before changing working files.
+When declared, version 1 `checkpoint` requests can set an `executable` boolean.
+Changing an existing file's flag requires its `previous_hash` and
+`previous_executable`. New files have no previous flag; deletions cannot specify
+a desired executable flag. Omitting `executable` preserves the existing flag for
+text or binary updates. The whole-view revision fence still applies. Saved flags
+are verified in the same checkpoint receipt as content and deletions. Conflicting
+flags fail without changing the source branch, and retries retain the original
+operation outcome.
+
+Public discovery derives `file_attributes` and `checkpoint_attributes` from the
+accepted operation declaration. An older declaration does not advertise these
+features. Read clients fail with `CompanyDefinitionUpdateRequired` when the
+signed attribute representation is unavailable; they do not silently discard it.
+
 `export_scope` returns a paginated content manifest, or bounded base64 content
 when `path` is supplied. An export-only grant needs no separate `read` action.
 Export transfers inspect content without changing a task's observed input set.

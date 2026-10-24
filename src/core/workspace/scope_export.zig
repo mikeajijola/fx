@@ -100,7 +100,7 @@ const Session = struct {
             .view = self.config.view,
             .path = path,
             .offset = offset,
-        }, .{});
+        }, .{ .emit_null_optional_fields = false });
         const signature = try self.key.sign(payload, null);
         const raw = try std.json.Stringify.valueAlloc(alloc, authority.Envelope{ .payload = payload, .signature = &std.fmt.bytesToHex(signature.toBytes(), .lower) }, .{});
         const response = try client.companyCallControlled(alloc, self.config.endpoint, self.company, raw, self.control);
@@ -300,6 +300,8 @@ pub fn write(alloc: std.mem.Allocator, raw: []const u8, destination: []const u8)
     defer std.crypto.secureZero(u8, std.mem.asBytes(&key));
     const company = try client.companyBootstrapControlled(alloc, config.endpoint, control);
     if (!std.mem.eql(u8, company.workspace, config.workspace) or !std.mem.eql(u8, company.issuer, config.issuer)) return error.WorkspaceIdentityMismatch;
+    const features = company.features orelse return error.CompanyDefinitionUpdateRequired;
+    if (!std.mem.eql(u8, features.file_attributes orelse return error.CompanyDefinitionUpdateRequired, "omos.company/v2")) return error.CompanyDefinitionUpdateRequired;
     const session: Session = .{ .config = config, .company = company, .key = key, .control = control };
     var entries: std.ArrayList(Entry) = .empty;
     var receipts: std.ArrayList(std.json.Value) = .empty;

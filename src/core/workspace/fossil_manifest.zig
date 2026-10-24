@@ -119,6 +119,18 @@ pub fn verifyObject(identity: []const u8, bytes: []const u8) !void {
     }
 }
 
+/// Legacy task records can contain Fossil's 40-character SHA-3 display prefix.
+/// Only check-in references allow this form; file-object identities stay exact.
+pub fn verifyCheckinReference(identity: []const u8, bytes: []const u8) !void {
+    if (identity.len == 40 and validHash(identity)) {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha3.Sha3_256.hash(bytes, &digest, .{});
+        const full = std.fmt.bytesToHex(&digest, .lower);
+        if (std.mem.eql(u8, identity, full[0..40])) return;
+    }
+    try verifyObject(identity, bytes);
+}
+
 fn path(alloc: std.mem.Allocator, encoded: []const u8) ![]const u8 {
     var result: std.ArrayList(u8) = .empty;
     var index: usize = 0;
@@ -331,4 +343,16 @@ test "Fossil branch status preserves names and recognizes private and current ma
     try std.testing.expectEqualStrings("trunk", try branchName(" * trunk"));
     try std.testing.expectEqualStrings("#task/example", try branchName("#  #task/example"));
     try std.testing.expectError(error.InvalidFossilBranchList, branchName("#task/example"));
+}
+
+test "Fossil object legacy check-in prefixes preserve strict file identities" {
+    const content = "D 2026-10-24T00:00:00\n";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha3.Sha3_256.hash(content, &digest, .{});
+    const full = std.fmt.bytesToHex(&digest, .lower);
+    try verifyCheckinReference(full[0..40], content);
+    try verifyCheckinReference(&full, content);
+    try std.testing.expectError(error.WorkspaceVerificationFailed, verifyCheckinReference(full[0..40], "changed"));
+    try std.testing.expectError(error.WorkspaceVerificationFailed, verifyObject(full[0..40], content));
+    try std.testing.expectError(error.InvalidFossilManifest, verifyCheckinReference(full[0..39], content));
 }

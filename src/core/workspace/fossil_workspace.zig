@@ -2724,7 +2724,7 @@ pub const Manager = struct {
     fn fileEntries(self: Manager, identity: []const u8, verify_objects: bool) ![]const fossil_manifest.File {
         if (!fossil_manifest.validHash(identity)) return error.InvalidFossilRevision;
         const raw = try self.run(null, &.{ "artifact", identity, "-R", self.repository });
-        if (verify_objects) try fossil_manifest.verifyObject(identity, raw);
+        if (verify_objects) try fossil_manifest.verifyCheckinReference(identity, raw);
         const current = try fossil_manifest.parse(self.alloc, raw);
         const baseline = if (current.baseline) |id| base: {
             const bytes = try self.run(null, &.{ "artifact", id, "-R", self.repository });
@@ -3397,7 +3397,7 @@ pub const Manager = struct {
         try atomicWrite(self.alloc, try join(self.alloc, tree, model.execution_path), try json(self.alloc, execution));
         const receipt = try json(self.alloc, .{ .version = "omos.contract-migration/v1", .previous = previous.hash, .definition_hash = next.hash, .base = backed_up_base, .backup = std.Io.Dir.path.basename(backup), .active_tasks = "preserved", .verified_by = "omos-native-contract-migration" });
         try atomicWrite(self.alloc, try join(self.alloc, tree, try self.alloc.print("activations/{s}.json", .{try hash(self.alloc, receipt)})), receipt);
-        _ = try self.commit(tree, "Upgrade compatible workspace contracts for future tasks");
+        _ = try self.commit(tree, "Upgrade workspace contracts for future tasks");
         return self.alloc.print("Upgraded workspace contracts for future tasks. Active tasks retain their pinned declaration and execution policy. Verified backup: {s}", .{backup});
     }
 

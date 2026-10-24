@@ -980,6 +980,18 @@
                 "string",
                 "null"
               ]
+            },
+            "executable": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "previous_executable": {
+              "type": [
+                "boolean",
+                "null"
+              ]
             }
           },
           "required": [

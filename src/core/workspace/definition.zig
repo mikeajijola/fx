@@ -280,15 +280,29 @@ pub fn hasOperation(declaration: Declaration, id: []const u8) bool {
     return named(items(spec(declaration.value), "operations"), id) != null;
 }
 
-/// Merge native additive contracts without overwriting a company's existing
-/// fields, operations or relationships. Active task bases are never rewritten.
+/// Explicit migration adds native contracts and extends known transport schemas.
+/// Existing task bases and the strict proposal compatibility rule stay unchanged.
 pub fn upgrade(alloc: Allocator, previous: Declaration) !Declaration {
     var value = (try std.json.parseFromSlice(Value, alloc, try canonical(alloc, previous.value), .{})).value;
     const native = try parse(alloc, seed);
+    var comparison = (try std.json.parseFromSlice(Value, alloc, try canonical(alloc, previous.value), .{})).value;
+    const comparison_operations = comparison.object.getPtr("spec").?.object.getPtr("operations").?;
     const root = value.object.getPtr("spec").?;
     const operations = root.object.getPtr("operations").?;
     for (items(spec(native.value), "operations")) |operation| {
-        if (named(operations.array.items, text(operation, "id")) == null) try operations.array.append(operation);
+        const existing = for (operations.array.items, 0..) |row, index| {
+            if (std.mem.eql(u8, text(row, "id"), text(operation, "id"))) break index;
+        } else null;
+        if (existing) |index| {
+            if (try extendNativeTransport(alloc, &operations.array.items[index], operation)) {
+                // Only the explicit migrator permits these bounded transport
+                // extensions. Definition proposals still compare whole schemas.
+                for (comparison_operations.array.items) |*row| if (std.mem.eql(u8, text(row.*, "id"), text(operation, "id"))) {
+                    row.* = operations.array.items[index];
+                    break;
+                };
+            }
+        } else try operations.array.append(operation);
     }
     if (root.object.get("semantic") == null) try root.object.put(alloc, "semantic", .{ .object = .empty });
     const semantic = root.object.getPtr("semantic").?;
@@ -310,8 +324,53 @@ pub fn upgrade(alloc: Allocator, previous: Declaration) !Declaration {
         }
     }
     const result = try parse(alloc, try canonical(alloc, value));
-    if (!try compatible(alloc, previous, result)) return error.IncompatibleContractMigration;
+    if (!try compatible(alloc, try parse(alloc, try canonical(alloc, comparison)), result)) return error.IncompatibleContractMigration;
     return result;
+}
+
+fn extendNativeTransport(alloc: Allocator, operation: *Value, native: Value) !bool {
+    const id = text(operation.*, "id");
+    if (!std.mem.eql(u8, id, "omos_company_operation") and !std.mem.eql(u8, id, "omos_export_scope") and !std.mem.eql(u8, id, "omos_verify_scope")) return false;
+    var changed = false;
+    for ([_][]const u8{ "input", "output" }) |direction| {
+        const shape = operation.object.getPtr(direction) orelse continue;
+        const native_shape = field(native, direction) orelse continue;
+        if (!std.mem.eql(u8, text(shape.*, "type"), "object")) continue;
+        const properties = shape.object.getPtr("properties") orelse continue;
+        const native_properties = field(native_shape, "properties") orelse continue;
+        if (properties.* != .object or native_properties != .object) continue;
+        var entries = native_properties.object.iterator();
+        while (entries.next()) |entry| {
+            const key = entry.key_ptr.*;
+            if (properties.object.getPtr(key)) |existing| {
+                // Recognize only the minimal native version constraints. Other
+                // constraints, company field types and required lists survive.
+                if (!std.mem.eql(u8, key, "version") or existing.* != .object or existing.object.count() != 1) continue;
+                const versions = field(entry.value_ptr.*, "enum") orelse continue;
+                if (versions != .array) continue;
+                var recognized = false;
+                if (field(existing.*, "const")) |old_version| {
+                    recognized = old_version == .string and contains(versions.array.items, old_version.string);
+                } else if (field(existing.*, "enum")) |old_versions| {
+                    if (old_versions == .array and old_versions.array.items.len > 0) {
+                        recognized = true;
+                        for (old_versions.array.items) |old_version| if (old_version != .string or !contains(versions.array.items, old_version.string)) {
+                            recognized = false;
+                            break;
+                        };
+                    }
+                }
+                if (recognized and !std.mem.eql(u8, try canonical(alloc, existing.*), try canonical(alloc, entry.value_ptr.*))) {
+                    existing.* = entry.value_ptr.*;
+                    changed = true;
+                }
+            } else if (!contains(items(native_shape, "required"), key) and !contains(items(shape.*, "required"), key)) {
+                try properties.object.put(alloc, key, entry.value_ptr.*);
+                changed = true;
+            }
+        }
+    }
+    return changed;
 }
 
 fn publicData(value: Value) anyerror!void {
@@ -693,7 +752,12 @@ test "workspace declaration compatible changes preserve every existing contract"
     defer arena.deinit();
     const alloc = arena.allocator();
     const old = try parse(alloc, seed);
-    const next = try parse(alloc, try std.mem.replaceOwned(u8, alloc, seed, "\"objective\": \"string\"", "\"objective\": \"boolean\""));
+    var changed = (try std.json.parseFromSlice(Value, alloc, seed, .{})).value;
+    for (changed.object.getPtr("spec").?.object.getPtr("semantic").?.object.getPtr("entityTypes").?.array.items) |*entity| {
+        if (!std.mem.eql(u8, text(entity.*, "id"), "omos_task")) continue;
+        try entity.object.getPtr("fields").?.object.put(alloc, "objective", .{ .string = "boolean" });
+    }
+    const next = try parse(alloc, try canonical(alloc, changed));
     try std.testing.expect(try compatible(alloc, old, old));
     try std.testing.expect(!try compatible(alloc, old, next));
 }
@@ -717,4 +781,29 @@ test "workspace declaration bounds server review capacity and preserves legacy p
     }) |raw| {
         if (parseExecution(a, raw)) |_| return error.ExpectedInvalidPolicy else |_| {}
     }
+}
+
+test "workspace declaration explicit transport upgrades preserve company constraints and proposal rules" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var value = (try std.json.parseFromSlice(Value, alloc, seed, .{})).value;
+    var legacy_operation: ?*Value = null;
+    for (value.object.getPtr("spec").?.object.getPtr("operations").?.array.items) |*operation| {
+        if (std.mem.eql(u8, text(operation.*, "id"), "omos_company_operation")) legacy_operation = operation;
+    }
+    const properties = legacy_operation.?.object.getPtr("input").?.object.getPtr("properties").?;
+    try properties.object.put(alloc, "version", (try std.json.parseFromSlice(Value, alloc, "{\"const\":\"omos.company/v1\"}", .{})).value);
+    _ = properties.object.swapRemove("executable");
+    _ = properties.object.swapRemove("previous_executable");
+    try properties.object.put(alloc, "company_note", (try std.json.parseFromSlice(Value, alloc, "{\"type\":\"string\",\"maxLength\":7}", .{})).value);
+    const old = try parse(alloc, try canonical(alloc, value));
+    const next = try upgrade(alloc, old);
+    const operation = named(items(spec(next.value), "operations"), "omos_company_operation").?;
+    const upgraded = field(field(operation, "input").?, "properties").?;
+    try std.testing.expect(field(upgraded, "executable") != null);
+    try std.testing.expect(contains(items(field(upgraded, "version").?, "enum"), "omos.company/v2"));
+    try std.testing.expectEqualStrings(try canonical(alloc, field(properties.*, "company_note").?), try canonical(alloc, field(upgraded, "company_note").?));
+    try std.testing.expect(!try compatible(alloc, old, next));
+    try std.testing.expectEqualStrings(next.hash, (try upgrade(alloc, next)).hash);
 }

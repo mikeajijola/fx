@@ -596,6 +596,25 @@ sys.exit(result.returncode)
       expect(attributes.files[0].executable).toBe(false);
       const modeRead = await unpack(await post(envelope("read", { version: "omos.company/v2", view: view.view, revision: successful.revision, path: inventory.files[0].path, limit: 4 })));
       expect(modeRead.executable).toBe(false);
+      expect(boot.features.checkpoint_attributes).toBe(true);
+      const file = inventory.files[0], originalContent = JSON.parse(acceptedRequest.payload).content;
+      const missingMode = envelope("checkpoint", { view: view.view, revision: successful.revision, path: file.path, content: originalContent, previous_hash: file.sha256, executable: true });
+      const invalidMode = await post(missingMode);
+      expect(invalidMode.status).toBe(400);
+      expect((await invalidMode.json() as any).error).toBe("InvalidCompanyFileAttributes");
+      expect((await unpack(await post(envelope("status", { outcome: JSON.parse(missingMode.payload).operation })))).state).toBe("failed");
+      const modeRequest = envelope("checkpoint", { view: view.view, revision: successful.revision, path: file.path, content: originalContent, previous_hash: file.sha256, executable: true, previous_executable: false });
+      const modeSaved = await unpack(await post(modeRequest));
+      expect(await unpack(await post(modeRequest))).toEqual(modeSaved);
+      expect((await unpack(await post(envelope("read", { version: "omos.company/v2", view: view.view, revision: modeSaved.revision, path: file.path })))).executable).toBe(true);
+      const mismatchedMode = await post(envelope("checkpoint", { view: view.view, revision: modeSaved.revision, path: file.path, content: originalContent, previous_hash: file.sha256, executable: false, previous_executable: false }));
+      expect(mismatchedMode.status).toBe(409);
+      expect((await mismatchedMode.json() as any).error).toBe("WorkspaceProjectionConflict");
+      const editedContent = originalContent + " updated";
+      const legacyEdit = await unpack(await post(envelope("checkpoint", { view: view.view, revision: modeSaved.revision, path: file.path, content: editedContent, previous_hash: file.sha256 })));
+      expect((await unpack(await post(envelope("read", { version: "omos.company/v2", view: view.view, revision: legacyEdit.revision, path: file.path })))).executable).toBe(true);
+      const modeRemoved = await unpack(await post(envelope("checkpoint", { view: view.view, revision: legacyEdit.revision, path: file.path, content: editedContent, previous_hash: createHash("sha256").update(editedContent).digest("hex"), executable: false, previous_executable: true })));
+      expect((await unpack(await post(envelope("read", { version: "omos.company/v2", view: view.view, revision: modeRemoved.revision, path: file.path })))).executable).toBe(false);
       expect((await post(envelope("checkpoint", { version: "omos.company/v2", view: view.view, revision: successful.revision, path: "documents/team/forbidden-v2.md", content: "Unsupported mutation representation" }))).status).toBe(403);
       const read = await unpack(await post(envelope("read", { view: view.view, revision: successful.revision, path: inventory.files[0].path, limit: 4 })));
       expect(read.next_offset).toBe(4);
@@ -1076,6 +1095,10 @@ sys.exit(result.returncode)
     const legacy = JSON.parse(f.fossil("cat", "omniform/company.json", "-r", "trunk"));
     legacy.spec.semantic.entityTypes = legacy.spec.semantic.entityTypes.filter((entity: any) => !["omos_company_read", "omos_company_submission"].includes(entity.id));
     delete legacy.spec.semantic.entityTypes.find((entity: any) => entity.id === "omos_workspace_view").fields.reads;
+    const legacyInput = legacy.spec.operations.find((operation: any) => operation.id === "omos_company_operation").input.properties;
+    legacyInput.version = { const: "omos.company/v1" };
+    delete legacyInput.executable;
+    delete legacyInput.previous_executable;
     const tree = join(f.home, "legacy-declaration");
     mkdirSync(tree);
     const fossil = (...args: string[]) => {
@@ -1111,6 +1134,8 @@ sys.exit(result.returncode)
     };
     try {
       expect(boot.features.read_dependencies).toBe(false);
+      expect(boot.features.file_attributes).toBeNull();
+      expect(boot.features.checkpoint_attributes).toBe(false);
       const view = await send("create_view", { revision: boot.revision, objective: "Retain the company report while upgrading its input model" });
       const saved = await send("checkpoint", { view: view.view, revision: view.revision, path: "documents/team/report.md", content: "Retained legacy report" });
       expect(JSON.parse(f.fossil("cat", `company/views/${view.view}.json`, "-r", "omos-company")).reads).toBeUndefined();
@@ -1127,6 +1152,9 @@ sys.exit(result.returncode)
       const migration = await f.run(["fossil", "migrate", "--contracts", "--json"]);
       expect(migration.code, migration.stderr).toBe(0);
       expect((await (await fetch(service.url + "/v1/company")).json() as any).features.read_dependencies).toBe(true);
+      const upgraded = await (await fetch(service.url + "/v1/company")).json() as any;
+      expect(upgraded.features.file_attributes).toBe("omos.company/v2");
+      expect(upgraded.features.checkpoint_attributes).toBe(true);
       const read = await send("read", { view: view.view, path: "documents/team/report.md" });
       expect(read.read_tracking).toBe("recorded");
       expect(Buffer.from(read.content, "base64").toString()).toBe("Retained legacy report");
@@ -1743,7 +1771,8 @@ sys.exit(result.returncode)
     };
     try {
       const view = await data(await send(seal("create_view", { revision: boot.revision, objective: "Save an interrupted report" })));
-      const original = seal("checkpoint", { view: view.view, revision: view.revision, path: "documents/report.md", content: "Saved once", previous_hash: null });
+      const content = "#!/bin/sh\nprintf 'saved once\\n'\n";
+      const original = seal("checkpoint", { view: view.view, revision: view.revision, path: "documents/run.sh", content, previous_hash: null, executable: true });
       const failure = await send(original);
       expect(failure.status).toBe(400);
       expect((await failure.json() as any).error).toBe("WorkspaceInjectedFailure");
@@ -1757,10 +1786,13 @@ sys.exit(result.returncode)
       expect(await data(await send(original))).toEqual(resumed);
       const completed = await data(await send(seal("status", { outcome: operation })));
       expect(completed.state).toBe("completed");
-      const snapshot = await data(await send(seal("discover", { view: view.view, revision: resumed.revision })));
+      const snapshot = await data(await send(seal("discover", { version: "omos.company/v2", view: view.view, revision: resumed.revision })));
       expect(snapshot.files).toHaveLength(1);
-      expect(snapshot.files[0].sha256).toBe(createHash("sha256").update("Saved once").digest("hex"));
-      expect(f.fossil("ls", "-r", resumed.revision).split("\n").filter(path => path.startsWith("company/checkpoints/"))).toHaveLength(1);
+      expect(snapshot.files[0].sha256).toBe(createHash("sha256").update(content).digest("hex"));
+      expect(snapshot.files[0].executable).toBe(true);
+      const checkpoints = f.fossil("ls", "-r", resumed.revision).split("\n").filter(path => path.startsWith("company/checkpoints/"));
+      expect(checkpoints).toHaveLength(1);
+      expect(JSON.parse(f.fossil("cat", checkpoints[0], "-r", resumed.revision)).files[0].executable).toBe(true);
     } finally {
       service.child.kill(); await service.child.exited;
     }
@@ -2075,10 +2107,12 @@ sys.exit(result.returncode)
     let mode = "hash", posts = 0, contentCalls = 0, inventoryCalls = 0;
     const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
       if (mode === "stall") return new Promise<Response>(() => {});
-      if (request.method === "GET") return Response.json({ version: "omos.company/v1", workspace: "company", issuer: public_key, epoch: 1 });
+      if (request.method === "GET") return Response.json({ version: "omos.company/v1", workspace: "company", issuer: public_key, epoch: 1, features: mode === "legacy-server" ? undefined : { file_attributes: "omos.company/v2" } });
       posts++;
       expect(request.headers.get("authorization")).toBe(null);
       const envelope = await request.json() as any, query = JSON.parse(envelope.payload);
+      expect(query.executable).toBeUndefined();
+      expect(query.previous_executable).toBeUndefined();
       let result: any;
       if (!query.path) {
         inventoryCalls++;
@@ -2106,6 +2140,13 @@ sys.exit(result.returncode)
         expect(rejected.stdout + rejected.stderr).toContain(expected);
         expect(existsSync(output)).toBe(false);
       }
+      mode = "legacy-server";
+      const beforeLegacy = posts;
+      const unsupported = await f.run(["fossil", "export-scope", input, output, "--json"]);
+      expect(unsupported.code).toBe(1);
+      expect(unsupported.stderr + unsupported.stdout).toContain("CompanyDefinitionUpdateRequired");
+      expect(posts).toBe(beforeLegacy);
+      expect(existsSync(output)).toBe(false);
       mode = "valid";
       writeFileSync(input, JSON.stringify({ ...config, max_bytes: content.length - 1 }));
       const before = posts;
@@ -3529,6 +3570,7 @@ sys.exit(result.returncode)
     const inference = model(f, (_body, count) => count === 1 ? writeMemory("Preserve the original publication.") : { content: "The preference remains saved." });
     const stopped = await f.run(["ask", "Remember the preference", "--json"], { OMOS_FOSSIL_BIN: helper, FX_E2E_FOSSIL_FAULT: "publication-committed" });
     expect(stopped.code).toBe(1);
+    expect(stopped.stderr + stopped.stdout).toContain("WorkspaceInjectedFailure");
     const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
     expect(task.base_revision).toHaveLength(40);
     const receiptPath = f.fossil("ls", "-r", "trunk").trim().split("\n").find((path: string) => path.startsWith("acceptances/"))!;
