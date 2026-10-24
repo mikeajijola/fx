@@ -10,8 +10,8 @@ pub const profile_id = "omos.workspace/v1";
 pub const standard_version = "1.0.0-alpha.7";
 pub const declaration_path = "omniform/company.json";
 pub const execution_path = "execution/omos.json";
-pub const seed = @embedFile("standard/omos.json");
-pub const initial_declaration = compactJson(seed);
+pub const seed = compactJson(@embedFile("standard/omos.json"));
+pub const initial_declaration = seed;
 const standard_schema = compactJson(@embedFile("standard/omniform.schema.json"));
 
 // Keep the pinned source files readable while embedding only JSON token bytes.
@@ -571,7 +571,7 @@ test "workspace declaration compact embeds preserve pinned JSON values" {
     defer arena.deinit();
     const alloc = arena.allocator();
     for ([_][2][]const u8{
-        .{ seed, initial_declaration },
+        .{ @embedFile("standard/omos.json"), seed },
         .{ @embedFile("standard/omniform.schema.json"), standard_schema },
     }) |pair| {
         const original = (try std.json.parseFromSlice(Value, alloc, pair[0], .{})).value;

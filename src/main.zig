@@ -4892,6 +4892,7 @@ test {
     _ = @import("core/auth/auth_transition.zig");
     _ = @import("core/app/provider_picker_runtime.zig");
     _ = @import("core/workspace/context_contract.zig");
+    _ = @import("core/workspace/definition.zig");
     _ = @import("core/workspace/company_authority.zig");
     _ = @import("core/workspace/company_records.zig");
     _ = @import("core/workspace/company_reads.zig");
