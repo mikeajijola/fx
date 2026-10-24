@@ -22,6 +22,7 @@ pub const Claims = struct {
     authority_revision: []const u8,
     epoch: u64,
     issued_ms: i64,
+    approval_sha256: ?[]const u8 = null,
 };
 pub const Proof = struct { payload: []const u8, signature: []const u8, issuer: []const u8 };
 
@@ -50,5 +51,6 @@ pub fn verify(manager: workspace.Manager, proof: Proof) !Claims {
     signature.verifyStrict(proof.payload, public) catch return error.CompanySignatureRejected;
     const grant = try authority.liveGrant(retained, claims.grant, claims.issued_ms);
     if (!std.mem.eql(u8, grant.actor, claims.actor) or !authority.permitsAction(grant, .submit)) return error.CompanyAccessDenied;
+    if (grant.human_approval and claims.approval_sha256 == null) return error.CompanyApprovalRequired;
     return claims;
 }

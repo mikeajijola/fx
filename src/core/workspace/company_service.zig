@@ -25,10 +25,13 @@ const Journal = struct {
 const View = struct { id: []const u8, actor: []const u8, grant: []const u8, task: []const u8, base: []const u8, pending: ?[]const u8 = null };
 const Admin = struct {
     version: []const u8,
-    action: enum { initialize, status, grant, revoke, rotate },
+    action: enum { initialize, status, grant, revoke, rotate, inspect_proposal, approve, deny },
     revision: ?[]const u8 = null,
     grant: ?authority.Grant = null,
     id: ?[]const u8 = null,
+    view: ?[]const u8 = null,
+    candidate_hash: ?[]const u8 = null,
+    expires_ms: ?i64 = null,
 };
 fn encode(alloc: std.mem.Allocator, value: anytype) ![]const u8 {
     return std.json.Stringify.valueAlloc(alloc, value, .{});
@@ -51,12 +54,42 @@ pub fn administer(original: workspace.Manager, raw: []const u8) ![]const u8 {
     const lease = try manager.companyOperationLease();
     defer lease.release();
     manager.company_operation_held = true;
+    const declaration = try manager.loadDeclaration(((try manager.modelBasis("trunk")) orelse return error.WorkspaceMigrationRequired).revision);
+    if (model.hasOperation(declaration, "omos_company_admin")) {
+        try model.validateOperation(manager.alloc, declaration, "omos_company_admin", try parse(manager.alloc, raw), .input);
+    } else if (request.action == .inspect_proposal or request.action == .approve or request.action == .deny) {
+        // Older profiles retain their administrative recovery interface. New
+        // decisions require the declared operation and protected record type.
+        return error.CompanyDefinitionUpdateRequired;
+    }
     const recovery_lease = if (request.action == .rotate) try keys.recoveryLease(manager) else null;
     defer if (recovery_lease) |held| held.release();
     const revision_id = try manager.companyRevision();
     if (request.action == .status) return encode(manager.alloc, .{ .revision = revision_id, .authority = try state(manager) });
     if (request.action != .initialize and request.action != .rotate) try validateInstance(manager);
     if (!equal(request.revision, revision_id)) return error.WorkspaceRevisionChanged;
+    if (request.action == .inspect_proposal or request.action == .approve or request.action == .deny) {
+        const approval = @import("company_approval.zig");
+        const id = request.view orelse return error.CompanyViewRequired;
+        if (!authority.safeIdentity(id)) return error.InvalidCompanyIdentity;
+        const view = try records.decode(View, manager.alloc, try manager.companyContent(try manager.alloc.print("company/views/{s}.json", .{id})), .{});
+        if (view.pending != null) return error.CompanyOperationRecoveryRequired;
+        const execution = (try manager.tryTaskExecutionLease(view.task)) orelse return error.WorkspaceExecutionBusy;
+        defer execution.release();
+        const task = try manager.loadTask(view.task);
+        const current = try state(manager);
+        const grant = try authority.liveGrant(current, view.grant, io.milliTimestamp());
+        if (!std.mem.eql(u8, grant.actor, view.actor) or task.authority == null or !std.mem.eql(u8, task.authority.?.actor, view.actor) or !std.mem.eql(u8, task.authority.?.grant, view.grant)) return error.CompanyAccessDenied;
+        const candidate = try approval.candidate(manager, task, try manager.currentRevision(task), current);
+        const candidate_hash = try workspace.hash(manager.alloc, try encode(manager.alloc, candidate));
+        if (request.action == .inspect_proposal) return encode(manager.alloc, .{ .revision = revision_id, .candidate = candidate, .candidate_hash = candidate_hash, .approval_required = grant.human_approval });
+        const decision = try approval.decide(manager, task, current, request.candidate_hash orelse return error.MissingContent, request.action == .approve, request.expires_ms orelse return error.InvalidCompanyApprovalExpiry);
+        const revision = try manager.companyWrite(revision_id, &.{.{ .path = try approval.path(manager.alloc, task.id), .content = try encode(manager.alloc, decision) }});
+        // A decision changes authority only. A new verification invocation can
+        // reuse retained evidence and never dispatches the actor's actions.
+        const job = if (request.action == .approve) try manager.queueReview(task) else null;
+        return encode(manager.alloc, .{ .revision = revision, .decision = decision, .job = if (job) |value| value.id else null });
+    }
     var current: authority.State = undefined;
     if (request.action == .initialize) {
         if (revision_id != null) return error.CompanyAlreadyInitialized;
@@ -320,6 +353,8 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
     }
     if (request.action == .submit) {
         const view = selected orelse return error.CompanyViewRequired;
+        const execution = (try manager.tryTaskExecutionLease(view.task.id)) orelse return error.WorkspaceExecutionBusy;
+        defer execution.release();
         const candidate = request.candidate orelse return error.MissingContent;
         if (candidate.len == 0 or candidate.len > 32768) return error.InvalidCompanyCandidate;
         var retained_proposal = false;
@@ -336,7 +371,8 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
         }
         if (request.revision == null or !std.mem.eql(u8, request.revision.?, revision_id)) return error.WorkspaceRevisionChanged;
         const integrated = try manager.refresh(view.task);
-        try manager.record(integrated, "company_proposal", .{ .actor = grant.actor, .grant = grant.id, .candidate_revision = revision_id, .operation = request.operation });
+        const integration_revision = try manager.currentRevision(integrated);
+        try manager.record(integrated, "company_proposal", .{ .actor = grant.actor, .grant = grant.id, .candidate_revision = revision_id, .integration_revision = integration_revision, .operation = request.operation });
         try manager.record(integrated, "review_candidate", .{ .text = candidate, .at_ms = io.milliTimestamp() });
         try manager.record(integrated, "review_failure", .{ .code = "IndependentCompanyReviewRequired", .at_ms = io.milliTimestamp() + 1 });
         _ = try manager.checkpoint(integrated);

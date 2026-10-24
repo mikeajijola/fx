@@ -589,6 +589,191 @@ sys.exit(result.returncode)
     } finally { service.child.kill(); await service.child.exited; }
   }, 120000);
 
+  test("requires an exact unexpired operator approval and still independently verifies company publication", async () => {
+    const f = fixture();
+    const inference = model(f, () => ({ content: "The original actor must not run during approval or verification." }));
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const adminResult = async (body: object) => {
+      const file = join(f.home, "operator.json");
+      writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+      return f.run(["fossil", "company", file, "--json"]);
+    };
+    const admin = async (body: object) => {
+      const result = await adminResult(body);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    const initialized = await admin({ action: "initialize" });
+    const key = generateKeyPairSync("ed25519");
+    await admin({ action: "grant", revision: initialized.revision, grant: { id: "approval-worker", actor: "worker", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["documents/team/"], actions: ["create_view", "checkpoint", "submit", "status"], expires_ms: Date.now() + 3600000, human_approval: true } });
+    let service = await startWorkspaceService(f, true);
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const send = async (action: string, params: object = {}) => {
+      const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "worker", grant: "approval-worker", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action, ...params });
+      const response = await fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", connection: "close" }, body: JSON.stringify({ payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") }) });
+      const body = await response.json() as any;
+      expect(response.status, JSON.stringify({ action, body })).toBe(200);
+      return JSON.parse(body.payload).result;
+    };
+    const stop = async () => { service.child.kill(); await service.child.exited; };
+    const inspect = async (view: string) => admin({ action: "inspect_proposal", revision: (await admin({ action: "status" })).revision, view });
+    const decide = async (action: string, view: string, candidate_hash: string, expires_ms = Date.now() + 300000) => admin({ action, revision: (await admin({ action: "status" })).revision, view, candidate_hash, expires_ms });
+    const waitJob = async (view: string, state: string, reason?: string) => {
+      const deadline = Date.now() + 60000;
+      let observed: any;
+      while (Date.now() < deadline) {
+        observed = await send("status", { view });
+        if (observed.job?.state === state && (reason === undefined || observed.job.reason === reason)) return observed;
+        await Bun.sleep(30);
+      }
+      throw Error(`Company review did not reach ${state}/${reason}: ${JSON.stringify(observed)}`);
+    };
+    try {
+      const view = await send("create_view", { revision: boot.revision, objective: "Save the team report with local operator approval" });
+      let saved = await send("checkpoint", { view: view.view, revision: view.revision, path: "documents/team/report.md", content: "First company report" });
+      await send("submit", { view: view.view, revision: saved.revision, candidate: "Saved the first team report." });
+      await waitJob(view.view, "blocked", "CompanyApprovalRequired");
+      expect(inference.counts()).toEqual({ actors: 0, assessments: 0 });
+      expect(f.fossil("ls", "-r", "trunk")).not.toContain("documents/team/report.md");
+      await stop();
+      let inspected = await inspect(view.view);
+      expect(inspected.candidate.proposal_revision).toBe(saved.revision);
+      expect(inspected.candidate.integration_revision).toBe(saved.revision);
+      expect(inspected.approval_required).toBe(true);
+      const stale = await adminResult({ action: "approve", revision: inspected.revision, view: view.view, candidate_hash: "0".repeat(64), expires_ms: Date.now() + 300000 });
+      expect(stale.code).toBe(1);
+      expect(stale.stderr + stale.stdout).toContain("CompanyApprovalStale");
+      const invalidExpiry = await adminResult({ action: "approve", revision: inspected.revision, view: view.view, candidate_hash: inspected.candidate_hash, expires_ms: Date.now() + 25 * 3600000 });
+      expect(invalidExpiry.code).toBe(1);
+      expect(invalidExpiry.stderr + invalidExpiry.stdout).toContain("InvalidCompanyApprovalExpiry");
+      await decide("approve", view.view, inspected.candidate_hash);
+      // The later operator decision fences even an already queued review.
+      await decide("deny", view.view, inspected.candidate_hash);
+      service = await startWorkspaceService(f, true);
+      await waitJob(view.view, "blocked", "CompanyApprovalDenied");
+      expect(inference.counts().assessments).toBe(0);
+      await stop();
+      const expiry = Date.now() + 2500;
+      await decide("approve", view.view, inspected.candidate_hash, expiry);
+      if (Date.now() <= expiry) await Bun.sleep(expiry - Date.now() + 1);
+      service = await startWorkspaceService(f, true);
+      await waitJob(view.view, "blocked", "CompanyApprovalExpired");
+      expect(inference.counts().assessments).toBe(0);
+      const current = await send("status", { view: view.view });
+      saved = await send("checkpoint", { view: view.view, revision: current.revision, path: "documents/team/report.md", content: "Revised company report", previous_hash: createHash("sha256").update("First company report").digest("hex") });
+      await send("submit", { view: view.view, revision: saved.revision, candidate: "Saved the revised team report." });
+      // Even renewing the old approval cannot authorize changed proposal bytes.
+      await stop();
+      const changed = await adminResult({ action: "approve", revision: (await admin({ action: "status" })).revision, view: view.view, candidate_hash: inspected.candidate_hash, expires_ms: Date.now() + 300000 });
+      expect(changed.code).toBe(1);
+      expect(changed.stderr + changed.stdout).toContain("CompanyApprovalStale");
+      inspected = await inspect(view.view);
+      const approved = await decide("approve", view.view, inspected.candidate_hash);
+      const decision = JSON.parse(approved.decision.payload);
+      expect(decision.candidate).toEqual(inspected.candidate);
+      expect(decision.approved).toBe(true);
+      const issuer = createPublicKey({ key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(boot.issuer, "hex")]), format: "der", type: "spki" });
+      expect(verify(null, Buffer.from(approved.decision.payload), issuer, Buffer.from(approved.decision.signature, "hex"))).toBe(true);
+      service = await startWorkspaceService(f, true);
+      const published = await waitJob(view.view, "published");
+      expect(published.state).toBe("accepted");
+      expect(inference.counts().actors).toBe(0);
+      expect(inference.counts().assessments).toBeGreaterThan(0);
+      expect(f.fossil("cat", "documents/team/report.md", "-r", "trunk")).toBe("Revised company report");
+      const claims = JSON.parse(published.publication.issuer_proof.payload);
+      const approvalBytes = f.fossil("cat", `company/approvals/${view.contract.id}.json`, "-r", claims.authority_revision);
+      expect(claims.approval_sha256).toBe(createHash("sha256").update(approvalBytes).digest("hex"));
+      await stop();
+      const control = await admin({ action: "status" });
+      await admin({ action: "revoke", revision: control.revision, id: "approval-worker" });
+      const exported = join(f.home, "approved-company.fossil");
+      const exportResult = await f.run(["fossil", "export", exported, "--json"]);
+      expect(exportResult.code, exportResult.stderr).toBe(0);
+      const restored = fixture();
+      expect((await restored.run(["fossil", "use", exported, "--json"])).code).toBe(0);
+      const verified = await restored.run(["fossil", "verify", "--json"]);
+      expect(verified.code, verified.stderr).toBe(0);
+      expect(existsSync(join(restored.home, ".fx/authority", boot.workspace))).toBe(false);
+    } finally { await stop(); }
+  }, 180000);
+
+  test("requires a new operator decision after reconciling an approved proposal onto a newer accepted base", async () => {
+    const f = fixture();
+    const inference = model(f, (_body, count) => count === 1 ? writeMemory("Independent accepted company change") : { content: "Saved the independent memory change." });
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const admin = async (body: object, failure?: string) => {
+      const file = join(f.home, "operator.json");
+      writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+      const result = await f.run(["fossil", "company", file, "--json"]);
+      if (failure) {
+        expect(result.code).toBe(1);
+        expect(result.stdout + result.stderr).toContain(failure);
+        return null;
+      }
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    const initialized = await admin({ action: "initialize" });
+    const key = generateKeyPairSync("ed25519");
+    await admin({ action: "grant", revision: initialized.revision, grant: { id: "approval-worker", actor: "worker", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["documents/team/"], actions: ["create_view", "checkpoint", "submit", "status"], expires_ms: Date.now() + 3600000, human_approval: true } });
+    let service = await startWorkspaceService(f, true);
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const send = async (action: string, params: object = {}) => {
+      const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "worker", grant: "approval-worker", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action, ...params });
+      const response = await fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", connection: "close" }, body: JSON.stringify({ payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") }) });
+      const body = await response.json() as any;
+      expect(response.status, JSON.stringify({ action, body })).toBe(200);
+      return JSON.parse(body.payload).result;
+    };
+    const stop = async () => { service.child.kill(); await service.child.exited; };
+    const waitJob = async (view: string, state: string, reason?: string) => {
+      const deadline = Date.now() + 60000;
+      let observed: any;
+      while (Date.now() < deadline) {
+        observed = await send("status", { view });
+        if (observed.job?.state === state && (reason === undefined || observed.job.reason === reason)) return observed;
+        await Bun.sleep(30);
+      }
+      throw Error(`Company review did not reach ${state}/${reason}: ${JSON.stringify(observed)}`);
+    };
+    const inspect = async (view: string) => admin({ action: "inspect_proposal", revision: (await admin({ action: "status" })).revision, view });
+    const approve = async (view: string, candidate_hash: string, failure?: string) => admin({ action: "approve", revision: (await admin({ action: "status" })).revision, view, candidate_hash, expires_ms: Date.now() + 300000 }, failure);
+    try {
+      const view = await send("create_view", { revision: boot.revision, objective: "Save the approved company report" });
+      const saved = await send("checkpoint", { view: view.view, revision: view.revision, path: "documents/team/report.md", content: "Approved team report" });
+      const candidate = "Saved the approved team report.";
+      await send("submit", { view: view.view, revision: saved.revision, candidate });
+      await waitJob(view.view, "blocked", "CompanyApprovalRequired");
+      await stop();
+      const original = await inspect(view.view);
+      await approve(view.view, original.candidate_hash);
+      const independent = await f.run(["ask", "Save an independent company memory note", "--json"]);
+      expect(independent.code, independent.stderr).toBe(0);
+      const actorCount = inference.counts().actors;
+      expect(actorCount).toBe(2);
+      service = await startWorkspaceService(f, true);
+      await waitJob(view.view, "changes_required", "CompanyReconciliationRequired");
+      await stop();
+      await approve(view.view, original.candidate_hash, "CompanyReconciliationRequired");
+      service = await startWorkspaceService(f, true);
+      const current = await send("status", { view: view.view });
+      await send("submit", { view: view.view, revision: current.revision, candidate });
+      await waitJob(view.view, "blocked", "CompanyApprovalStale");
+      await stop();
+      const integrated = await inspect(view.view);
+      expect(integrated.candidate_hash).not.toBe(original.candidate_hash);
+      expect(integrated.candidate.base_revision).not.toBe(original.candidate.base_revision);
+      expect(integrated.candidate.changes_sha256).toBe(original.candidate.changes_sha256);
+      await approve(view.view, integrated.candidate_hash);
+      service = await startWorkspaceService(f, true);
+      const published = await waitJob(view.view, "published");
+      expect(published.state).toBe("accepted");
+      expect(inference.counts().actors).toBe(actorCount);
+      expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Independent accepted company change");
+      expect(f.fossil("cat", "documents/team/report.md", "-r", "trunk")).toBe("Approved team report");
+    } finally { await stop(); }
+  }, 180000);
+
   test("keeps company drafts isolated without copying the company files for every view", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);

@@ -310,9 +310,39 @@ current declaration; existing installations must update their contracts first.
 The local operator can initialize company authority using
 `omos fossil company REQUEST.json --json`. Administrative requests use
 `omos.company-admin/v1`; actions are `initialize`, `status`, `grant`, `revoke`,
-and `rotate`. Mutations require the control revision returned by `status`.
+`rotate`, `inspect_proposal`, `approve`, and `deny`. Mutations require the
+control revision returned by `status`.
 Root grant enrollment requires local operator access. Definitions cannot grant
 server authority.
+
+For a grant with `human_approval: true`, submit the proposal normally. Its
+review job remains blocked without spending inference calls until an operator
+records a valid approval. `inspect_proposal` takes the current control
+`revision` and the `view` identity. It returns the exact proposal inputs and a
+`candidate_hash`. An `approve` or `deny` request supplies those same fields,
+the returned `candidate_hash`, and `expires_ms`. Decisions expire within
+24 hours and cannot outlive the grant. A busy task returns
+`WorkspaceExecutionBusy`; the operator can inspect it again after the current
+execution releases ownership.
+
+Approval binds the actor, grant, authority epoch, task, accepted base,
+submitted revision, integration revision, task contract, pinned model and
+policy, retained answer, and changed content. Edits or a new integration base
+require a new decision. Denial, expiry, grant revocation, and issuer recovery
+cannot be bypassed by retrying a queued review. Approving queues independent
+verification with the retained evidence; it does not run the actor or declare
+the task successful. Publication checks approval again under the writer
+boundary and includes its hash in the signed publication proof. Historical
+verification uses the decision and authority revision recorded at publication,
+so later revocation does not erase a valid historical outcome.
+
+Decisions are signed host records at `company/approvals/<task>.json` on the
+protected company branch. The local operator is the identity with privileged
+access to this installation. Scoped actors cannot call the operator interface
+or edit these records. An organization identity provider and a remote human
+approval interface require separate integration. Older profiles retain grant
+and issuer recovery commands, but proposal decisions require the updated
+`omos_company_admin` operation and `omos_company_approval` entity declaration.
 
 Authority, view bindings, and operation outcomes live on the protected
 `omos-company` branch in the same repository. Grants bind an actor's Ed25519

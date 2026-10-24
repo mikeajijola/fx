@@ -561,7 +561,7 @@ test "workspace declaration seed shares the pinned OmniForm model and validates 
     defer arena.deinit();
     const declaration = try parse(arena.allocator(), seed);
     try std.testing.expectEqual(@as(usize, 2), items(spec(declaration.value), "capabilities").len);
-    try std.testing.expectEqual(@as(usize, 20), declaration.semantic.entityTypes.len);
+    try std.testing.expectEqual(@as(usize, 21), declaration.semantic.entityTypes.len);
     try std.testing.expectEqual(@as(usize, 64), declaration.hash.len);
 }
 

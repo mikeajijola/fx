@@ -26,6 +26,7 @@ pub fn perform(original: workspace.Manager, job: jobs.Job, model: Model) !void {
     defer execution_lease.release();
     const task = try manager.loadTask(job.task);
     try manager.validateTaskBasis(task);
+    try @import("company_authority.zig").authorizeTask(manager, task);
     const candidate = (try manager.retainedReviewCandidate(task)) orelse return error.NoRetainedReviewCandidate;
     if (!std.mem.eql(u8, job.candidate_hash, try workspace.hash(manager.alloc, candidate)) or job.contract_version != task.definition.version) return error.StaleWorkContract;
     const definition_hash = if (task.model_basis) |basis| basis.definition_hash else "legacy-contract";
@@ -129,7 +130,7 @@ pub const Scheduler = struct {
             };
             if (job) |claimed| {
                 self.executor.run(self.executor.context, manager, claimed, &self.stopping) catch |err| {
-                    manager.finishReviewJob(claimed, if (err == error.Cancelled or err == error.WorkspaceExecutionBusy) .queued else if (err == error.StaleWorkContract or err == error.StaleWorkspaceDefinition or err == error.CompanyReconciliationRequired) .changes_required else .failed, @errorName(err)) catch {};
+                    manager.finishReviewJob(claimed, if (err == error.Cancelled or err == error.WorkspaceExecutionBusy) .queued else if (err == error.CompanyApprovalRequired or err == error.CompanyApprovalDenied or err == error.CompanyApprovalExpired or err == error.CompanyApprovalStale) .blocked else if (err == error.StaleWorkContract or err == error.StaleWorkspaceDefinition or err == error.CompanyReconciliationRequired) .changes_required else .failed, @errorName(err)) catch {};
                 };
             } else std.Io.sleep(io.getIo(), .fromSeconds(1), .awake) catch {};
         }

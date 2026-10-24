@@ -161,7 +161,7 @@ pub fn authorizeTask(manager: workspace.Manager, task: workspace.Task) !void {
     _ = try @import("company_keys.zig").current(manager, state.epoch, state.issuer);
     const grant = try liveGrant(state, binding.grant, @import("../shared/io.zig").milliTimestamp());
     if (!std.mem.eql(u8, binding.actor, grant.actor) or !permitsAction(grant, .submit)) return error.CompanyAccessDenied;
-    if (grant.human_approval) return error.CompanyApprovalRequired;
+    if (grant.human_approval) _ = try @import("company_approval.zig").authorize(manager, task, try manager.currentRevision(task), (try manager.companyRevision()).?, state, @import("../shared/io.zig").milliTimestamp());
     for (try manager.changedPaths(task.base_revision, try manager.currentRevision(task))) |path| {
         if (!permittedRoot(path)) continue;
         // A long signed objective is retained by the host as an immutable

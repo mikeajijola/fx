@@ -1002,6 +1002,84 @@
           "cli",
           "agent"
         ]
+      },
+      {
+        "id": "omos_company_admin",
+        "capability": "general_task",
+        "description": "Inspect retained company proposals and record local operator authority decisions.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company-admin/v1"
+            },
+            "action": {
+              "type": "string",
+              "enum": [
+                "initialize",
+                "status",
+                "grant",
+                "revoke",
+                "rotate",
+                "inspect_proposal",
+                "approve",
+                "deny"
+              ]
+            },
+            "revision": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "grant": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "view": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "candidate_hash": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "expires_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "version",
+            "action"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object"
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli"
+        ]
       }
     ],
     "semantic": {
@@ -1302,6 +1380,23 @@
             "base",
             "files",
             "outcome"
+          ]
+        },
+        {
+          "id": "omos_company_approval",
+          "fields": {
+            "version": "string",
+            "task": "string",
+            "payload": "string",
+            "signature": "string",
+            "issuer": "string"
+          },
+          "required": [
+            "version",
+            "task",
+            "payload",
+            "signature",
+            "issuer"
           ]
         }
       ],
