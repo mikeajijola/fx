@@ -244,6 +244,21 @@ before those indexes are used. A legacy export registry remains compatible;
 newer canonical task records and selection events take precedence. This rebuild
 does not restore private provider checkpoints or repeat actor actions.
 
+Repository verification uses Fossil's public check-in manifests and its full
+object integrity check. The host checks the complete integrity report, including
+error counts, missing content, and the database result; a zero process exit code
+alone does not establish integrity. Shared records reuse verification only when
+their pathname, immutable object identity, size, and validation context match.
+The bounded verification cache can discard entries and repeat checks. File
+reads use batches of at most 32 files with a 4 MiB target and the existing
+8 MiB individual record limit. Canonical symbolic links are unsupported.
+
+Index reconstruction loads publication receipts once per parent revision. An
+accepted task must match its receipt's task, contract version, source revision,
+and publication target. Portable repository exports explicitly include private
+branches and retained proposals. These checks preserve original record and
+receipt bytes.
+
 New host history entries carry a recording timestamp. If execution stops after
 retaining an answer but before recording an assessment outcome, `continue`
 resumes independent verification of that answer. Later actor intentions prevent

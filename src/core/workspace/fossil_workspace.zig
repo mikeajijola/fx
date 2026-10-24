@@ -11,6 +11,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const record_json = @import("../shared/record_json.zig");
 const scheduling = @import("scheduling.zig");
 const company_publication = @import("company_publication.zig");
+const fossil_manifest = @import("fossil_manifest.zig");
 
 const Allocator = std.mem.Allocator;
 const max_bytes = 8 * 1024 * 1024;
@@ -454,7 +455,7 @@ pub const Manager = struct {
     pub fn companyRevision(self: Manager) !?[]const u8 {
         const branches = try self.run(null, &.{ "branch", "list", "--all", "-R", self.repository });
         var lines = std.mem.splitScalar(u8, branches, '\n');
-        while (lines.next()) |line| if (std.mem.eql(u8, std.mem.trim(u8, line, " *\r\t"), company_branch)) return try self.revision(company_branch);
+        while (lines.next()) |line| if (std.mem.eql(u8, try fossil_manifest.branchName(line), company_branch)) return try self.revision(company_branch);
         return null;
     }
 
@@ -570,7 +571,7 @@ pub const Manager = struct {
     fn scheduleBranchExists(self: Manager) !bool {
         const branches = try self.run(null, &.{ "branch", "list", "--all", "-R", self.repository });
         var lines = std.mem.splitScalar(u8, branches, '\n');
-        while (lines.next()) |line| if (std.mem.eql(u8, std.mem.trim(u8, line, " *\t\r"), schedule_branch)) return true;
+        while (lines.next()) |line| if (std.mem.eql(u8, try fossil_manifest.branchName(line), schedule_branch)) return true;
         return false;
     }
 
@@ -1301,7 +1302,7 @@ pub const Manager = struct {
         const branches = try self.run(null, &.{ "branch", "list", "--all", "-R", self.repository });
         var found = false;
         var lines = std.mem.splitScalar(u8, branches, '\n');
-        while (lines.next()) |line| if (std.mem.eql(u8, std.mem.trim(u8, line, " *\r\t"), runtime_branch)) {
+        while (lines.next()) |line| if (std.mem.eql(u8, try fossil_manifest.branchName(line), runtime_branch)) {
             found = true;
             break;
         };
@@ -1319,7 +1320,7 @@ pub const Manager = struct {
     fn restoreSessionBindings(self: Manager) !void {
         const branches = try self.run(null, &.{ "branch", "list", "--all", "-R", self.repository });
         var lines = std.mem.splitScalar(u8, branches, '\n');
-        while (lines.next()) |line| if (std.mem.eql(u8, std.mem.trim(u8, line, " *\r\t"), runtime_branch)) {
+        while (lines.next()) |line| if (std.mem.eql(u8, try fossil_manifest.branchName(line), runtime_branch)) {
             for (try self.inventory(runtime_branch)) |path| {
                 if (!std.mem.startsWith(u8, path, "runtime/sessions/")) continue;
                 const binding = try parse(self.alloc, SessionBinding, try self.contentAt(path, runtime_branch));
@@ -2499,52 +2500,173 @@ pub const Manager = struct {
         return .{ .repository = self.repository, .workspace_id = self.manifest.id, .trunk_revision = try self.revision("trunk"), .tasks = all, .files = try self.inventory("trunk"), .pending_journals = pending, .publication = if (pending_publication) "pending" else if (pending_delivery) "pending_delivery" else if (pending > 0) "local_pending" else "checkpointed", .detail = detail };
     }
 
-    pub fn verify(self: Manager) !void {
-        _ = try self.run(null, &.{ "test-integrity", "-R", self.repository });
-        const bytes = try self.run(null, &.{ "cat", manifest_path, "-r", "trunk", "-R", self.repository });
-        const manifest = try parse(self.alloc, Manifest, bytes);
-        if (!std.mem.eql(u8, manifest.id, self.manifest.id) or (manifest.format != 1 and manifest.format != 2)) return error.WorkspaceBindingMismatch;
-        if (manifest.format == 2 and try self.modelBasis("trunk") == null) return error.WorkspaceDefinitionMissing;
-        const branches = try self.run(null, &.{ "branch", "list", "--all", "-R", self.repository });
-        var branch_lines = std.mem.splitScalar(u8, branches, '\n');
-        while (branch_lines.next()) |raw| {
-            const branch = std.mem.trim(u8, raw, " *\r\t");
-            if (branch.len == 0) continue;
-            if (!std.mem.eql(u8, branch, "trunk") and !std.mem.eql(u8, branch, company_branch) and !std.mem.eql(u8, branch, runtime_branch) and !std.mem.eql(u8, branch, schedule_branch) and !(std.mem.startsWith(u8, branch, "task/") and safeId(branch[5..])) and !(std.mem.startsWith(u8, branch, "definition/") and safeId(branch[11..]))) return error.UnexpectedWorkspaceBranch;
-            const listing = try self.run(null, &.{ "ls", "-r", branch, "-R", self.repository });
-            var files = std.mem.splitScalar(u8, listing, '\n');
-            while (files.next()) |raw_path| {
-                const path = std.mem.trim(u8, raw_path, "\r");
-                if (path.len == 0) continue;
-                if (!allowedPath(path) and !std.mem.eql(u8, path, "registry.json")) return unexpectedEntry("checkout inventory", path);
-                if (std.mem.startsWith(u8, path, "runtime/sessions/")) try self.validateSessionBinding(try parse(self.alloc, SessionBinding, try self.contentAt(path, branch)), path);
-                if (std.mem.eql(u8, branch, company_branch)) {
-                    const entity: ?[]const u8 = if (std.mem.eql(u8, path, "authority/state.json")) "omos_company_authority" else if (std.mem.startsWith(u8, path, "company/views/")) "omos_workspace_view" else if (std.mem.startsWith(u8, path, "company/operations/")) "omos_company_operation" else null;
-                    if (entity) |kind| {
-                        const raw_record = try self.contentAt(path, branch);
-                        const declaration = try self.loadDeclaration("trunk");
-                        try model.validateRecord(declaration.semantic, kind, try parse(self.alloc, std.json.Value, raw_record), true);
-                        if (std.mem.eql(u8, kind, "omos_company_authority")) {
-                            const authority = try record_json.decode(@import("company_authority.zig").State, self.alloc, raw_record, .{});
-                            if (!std.mem.eql(u8, authority.workspace, self.manifest.id) or !std.mem.eql(u8, authority.version, "omos.company-authority/v1") or authority.epoch == 0) return error.WorkspaceBindingMismatch;
-                        }
-                    }
-                }
-                if (std.mem.startsWith(u8, path, "artifacts/")) {
-                    const content_bytes = try self.run(null, &.{ "cat", path, "-r", branch, "-R", self.repository });
-                    if (!std.mem.eql(u8, path[10..], try hash(self.alloc, content_bytes))) return error.InvalidArtifactIdentity;
-                } else if (std.mem.startsWith(u8, path, "acceptances/")) {
-                    const publication = try parse(self.alloc, Publication, try self.contentAt(path, branch));
-                    try self.verifyPublication(publication);
-                    if (!std.mem.eql(u8, path, try self.alloc.print("acceptances/{s}.json", .{publication.operation}))) return error.WorkspaceVerificationFailed;
-                } else if (std.mem.startsWith(u8, path, "history/")) {
-                    const name = std.Io.Dir.path.basename(path);
-                    if (name.len != 69 or !std.mem.endsWith(u8, name, ".json")) return error.InvalidWorkspaceJournal;
-                    const content_bytes = try self.run(null, &.{ "cat", path, "-r", branch, "-R", self.repository });
-                    if (!std.mem.eql(u8, name[0..64], try hash(self.alloc, content_bytes))) return error.InvalidWorkspaceJournal;
+    fn fileEntries(self: Manager, identity: []const u8, verify_objects: bool) ![]const fossil_manifest.File {
+        if (!fossil_manifest.validHash(identity)) return error.InvalidFossilRevision;
+        const raw = try self.run(null, &.{ "artifact", identity, "-R", self.repository });
+        if (verify_objects) try fossil_manifest.verifyObject(identity, raw);
+        const current = try fossil_manifest.parse(self.alloc, raw);
+        const baseline = if (current.baseline) |id| base: {
+            const bytes = try self.run(null, &.{ "artifact", id, "-R", self.repository });
+            if (verify_objects) try fossil_manifest.verifyObject(id, bytes);
+            break :base try fossil_manifest.parse(self.alloc, bytes);
+        } else null;
+        return fossil_manifest.resolve(self.alloc, baseline, current);
+    }
+
+    const VerificationFile = struct { entry: fossil_manifest.File, bytes: usize };
+    const AcceptedTask = struct { id: []const u8, version: u32, source: []const u8, target: []const u8 };
+
+    fn verifyFile(self: Manager, path: []const u8, bytes: []const u8, declaration: ?model.Declaration) !void {
+        if (std.mem.startsWith(u8, path, "runtime/sessions/")) try self.validateSessionBinding(try parse(self.alloc, SessionBinding, bytes), path);
+        if (declaration) |definition| {
+            const entity: ?[]const u8 = if (std.mem.eql(u8, path, "authority/state.json")) "omos_company_authority" else if (std.mem.startsWith(u8, path, "company/views/")) "omos_workspace_view" else if (std.mem.startsWith(u8, path, "company/operations/")) "omos_company_operation" else null;
+            if (entity) |kind| {
+                try model.validateRecord(definition.semantic, kind, try parse(self.alloc, std.json.Value, bytes), true);
+                if (std.mem.eql(u8, kind, "omos_company_authority")) {
+                    const authority = try record_json.decode(@import("company_authority.zig").State, self.alloc, bytes, .{});
+                    if (!std.mem.eql(u8, authority.workspace, self.manifest.id) or !std.mem.eql(u8, authority.version, "omos.company-authority/v1") or authority.epoch == 0) return error.WorkspaceBindingMismatch;
                 }
             }
         }
+        if (std.mem.startsWith(u8, path, "artifacts/")) {
+            if (!std.mem.eql(u8, path[10..], try hash(self.alloc, bytes))) return error.InvalidArtifactIdentity;
+        } else if (std.mem.startsWith(u8, path, "acceptances/")) {
+            const publication = try parse(self.alloc, Publication, bytes);
+            try self.verifyPublication(publication);
+            if (!std.mem.eql(u8, path, try self.alloc.print("acceptances/{s}.json", .{publication.operation}))) return error.WorkspaceVerificationFailed;
+        } else if (std.mem.startsWith(u8, path, "history/")) {
+            const name = std.Io.Dir.path.basename(path);
+            if (name.len != 69 or !std.mem.endsWith(u8, name, ".json")) return error.InvalidWorkspaceJournal;
+            if (!std.mem.eql(u8, name[0..64], try hash(self.alloc, bytes))) return error.InvalidWorkspaceJournal;
+        }
+    }
+
+    fn verifyBatch(self: Manager, revision_id: []const u8, files: []const VerificationFile, declaration: ?model.Declaration, accepted: ?*std.ArrayList(AcceptedTask), verify_objects: bool) !void {
+        if (files.len == 0) return;
+        var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        defer scratch.deinit();
+        var manager = self;
+        manager.alloc = scratch.allocator();
+        var arguments: std.ArrayList([]const u8) = .empty;
+        try arguments.append(manager.alloc, "cat");
+        var total: usize = 0;
+        for (files) |file| {
+            try arguments.append(manager.alloc, file.entry.path);
+            total += file.bytes;
+        }
+        try arguments.appendSlice(manager.alloc, &.{ "-r", revision_id, "-R", self.repository });
+        const bytes = try manager.run(null, arguments.items);
+        if (bytes.len != total) return error.WorkspaceVerificationFailed;
+        var offset: usize = 0;
+        for (files) |file| {
+            const content_bytes = bytes[offset .. offset + file.bytes];
+            if (verify_objects) try fossil_manifest.verifyObject(file.entry.artifact.?, content_bytes);
+            try manager.verifyFile(file.entry.path, content_bytes, declaration);
+            if (accepted) |index| {
+                const publication = try parse(manager.alloc, Publication, content_bytes);
+                try index.append(self.alloc, .{ .id = try self.alloc.dupe(u8, publication.task.id), .version = publication.task.definition.version, .source = try self.alloc.dupe(u8, publication.source), .target = try self.alloc.dupe(u8, publication.target) });
+            }
+            offset += file.bytes;
+        }
+    }
+
+    pub fn verify(self: Manager) !void {
+        if (comptime builtin.target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
+        try fossil_manifest.verifyIntegrityReport(try self.run(null, &.{ "test-integrity", "-R", self.repository }));
+        const trunk = try self.revision("trunk");
+        const bytes = try self.contentAt(manifest_path, trunk);
+        const manifest = try parse(self.alloc, Manifest, bytes);
+        if (!std.mem.eql(u8, manifest.id, self.manifest.id) or (manifest.format != 1 and manifest.format != 2)) return error.WorkspaceBindingMismatch;
+        if (manifest.format == 2 and try self.modelBasis(trunk) == null) return error.WorkspaceDefinitionMissing;
+        const branches = try self.run(null, &.{ "branch", "list", "--all", "-R", self.repository });
+        // This bounded cache is only an optimization. Eviction repeats checks;
+        // it never treats a filename alone as proof of the bytes at a branch.
+        var verified = std.AutoHashMap([32]u8, usize).init(self.alloc);
+        defer verified.deinit();
+        var branch_lines = std.mem.splitScalar(u8, branches, '\n');
+        while (branch_lines.next()) |raw| {
+            const branch = try fossil_manifest.branchName(raw);
+            if (branch.len == 0) continue;
+            if (!std.mem.eql(u8, branch, "trunk") and !std.mem.eql(u8, branch, company_branch) and !std.mem.eql(u8, branch, runtime_branch) and !std.mem.eql(u8, branch, schedule_branch) and !(std.mem.startsWith(u8, branch, "task/") and safeId(branch[5..])) and !(std.mem.startsWith(u8, branch, "definition/") and safeId(branch[11..]))) return error.UnexpectedWorkspaceBranch;
+            var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer arena.deinit();
+            var manager = self;
+            manager.alloc = arena.allocator();
+            const revision_id = try manager.revision(branch);
+            const files = try manager.fileEntries(revision_id, false);
+            const sizes = try fossil_manifest.sizes(manager.alloc, try manager.run(null, &.{ "ls", "-v", "-r", revision_id, "-R", self.repository }));
+            if (files.len != sizes.len) return error.WorkspaceVerificationFailed;
+            var lengths = std.StringHashMap(usize).init(manager.alloc);
+            for (sizes) |file| try lengths.put(file.path, file.bytes);
+            const company = std.mem.eql(u8, branch, company_branch);
+            const declaration: ?model.Declaration = if (company) try manager.loadDeclaration(trunk) else null;
+            var batch: [32]VerificationFile = undefined;
+            var count: usize = 0;
+            var batch_bytes: usize = 0;
+            for (files) |file| {
+                const path = file.path;
+                if (!allowedPath(path) and !std.mem.eql(u8, path, "registry.json")) return unexpectedEntry("checkout inventory", path);
+                if (file.mode == .symlink) return error.WorkspaceSymlinkDenied;
+                const size = lengths.get(path) orelse return error.WorkspaceVerificationFailed;
+                const needs_body = std.mem.startsWith(u8, path, "runtime/sessions/") or std.mem.startsWith(u8, path, "artifacts/") or std.mem.startsWith(u8, path, "acceptances/") or std.mem.startsWith(u8, path, "history/") or (company and (std.mem.eql(u8, path, "authority/state.json") or std.mem.startsWith(u8, path, "company/views/") or std.mem.startsWith(u8, path, "company/operations/")));
+                if (!needs_body) continue;
+                var digest = std.crypto.hash.sha2.Sha256.init(.{});
+                digest.update(if (company) "company" else "content");
+                digest.update(&.{0});
+                digest.update(path);
+                digest.update(&.{0});
+                digest.update(file.artifact.?);
+                const key = digest.finalResult();
+                if (verified.get(key)) |known_size| {
+                    if (known_size != size) return error.WorkspaceVerificationFailed;
+                    continue;
+                }
+                if (size > max_bytes) return error.WorkspaceRecordTooLarge;
+                if (count == batch.len or (count > 0 and batch_bytes + size > max_bytes / 2)) {
+                    try manager.verifyBatch(revision_id, batch[0..count], declaration, null, false);
+                    count = 0;
+                    batch_bytes = 0;
+                }
+                batch[count] = .{ .entry = file, .bytes = size };
+                count += 1;
+                batch_bytes += size;
+                if (verified.count() >= 16384) verified.clearRetainingCapacity();
+                try verified.put(key, size);
+            }
+            try manager.verifyBatch(revision_id, batch[0..count], declaration, null, false);
+        }
+    }
+
+    fn acceptedTasks(self: Manager, parent: []const u8) ![]const AcceptedTask {
+        var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        defer scratch.deinit();
+        var manager = self;
+        manager.alloc = scratch.allocator();
+        const revision_id = try manager.revision(parent);
+        const files = try manager.fileEntries(revision_id, true);
+        const sizes = try fossil_manifest.sizes(manager.alloc, try manager.run(null, &.{ "ls", "-v", "-r", revision_id, "-R", self.repository }));
+        var lengths = std.StringHashMap(usize).init(manager.alloc);
+        for (sizes) |file| try lengths.put(file.path, file.bytes);
+        var accepted: std.ArrayList(AcceptedTask) = .empty;
+        var batch: [32]VerificationFile = undefined;
+        var count: usize = 0;
+        var batch_bytes: usize = 0;
+        for (files) |file| {
+            if (!std.mem.startsWith(u8, file.path, "acceptances/")) continue;
+            if (file.mode == .symlink) return error.WorkspaceSymlinkDenied;
+            const size = lengths.get(file.path) orelse return error.WorkspaceVerificationFailed;
+            if (size > max_bytes) return error.WorkspaceRecordTooLarge;
+            if (count == batch.len or (count > 0 and batch_bytes + size > max_bytes / 2)) {
+                try self.verifyBatch(revision_id, batch[0..count], null, &accepted, true);
+                count = 0;
+                batch_bytes = 0;
+            }
+            batch[count] = .{ .entry = file, .bytes = size };
+            count += 1;
+            batch_bytes += size;
+        }
+        try self.verifyBatch(revision_id, batch[0..count], null, &accepted, true);
+        return accepted.toOwnedSlice(self.alloc);
     }
 
     fn publicationPath(self: Manager, id: []const u8) ![]const u8 {
@@ -2912,7 +3034,7 @@ pub const Manager = struct {
         const branches = try self.run(null, &.{ "branch", "list", "--all", "-R", self.repository });
         var lines = std.mem.splitScalar(u8, branches, '\n');
         while (lines.next()) |raw| {
-            const branch = std.mem.trim(u8, raw, " *\r\t");
+            const branch = try fossil_manifest.branchName(raw);
             if (!std.mem.startsWith(u8, branch, "task/") or !safeId(branch[5..])) continue;
             const bytes = self.run(null, &.{ "cat", try self.taskPath(branch[5..]), "-r", branch, "-R", self.repository }) catch continue;
             const canonical = try parse(self.alloc, Task, bytes);
@@ -2920,14 +3042,15 @@ pub const Manager = struct {
             if (previous == null or (previous.?.definition.version <= canonical.definition.version and previous.?.state != .publication_pending)) try self.saveTask(canonical);
             try fault("registry-task-restored");
         }
+        var accepted_parents = std.StringHashMap([]const AcceptedTask).init(self.alloc);
+        defer accepted_parents.deinit();
         for (try self.tasks()) |task| {
             var current = task;
-            const listing = try self.run(null, &.{ "ls", "-r", task.parent, "-R", self.repository });
-            var files = std.mem.splitScalar(u8, listing, '\n');
-            while (files.next()) |path| {
-                if (!std.mem.startsWith(u8, path, "acceptances/")) continue;
-                const publication = try parse(self.alloc, Publication, try self.run(null, &.{ "cat", path, "-r", task.parent, "-R", self.repository }));
-                if (std.mem.eql(u8, publication.task.id, task.id)) {
+            const entry = try accepted_parents.getOrPut(task.parent);
+            if (!entry.found_existing) entry.value_ptr.* = try self.acceptedTasks(task.parent);
+            const source = try self.currentRevision(task);
+            for (entry.value_ptr.*) |publication| {
+                if (std.mem.eql(u8, publication.id, task.id) and std.mem.eql(u8, publication.target, task.parent) and publication.version == task.definition.version and revisionMatches(publication.source, source)) {
                     current.state = .accepted;
                     try self.saveTask(current);
                     break;
@@ -3206,7 +3329,7 @@ pub const Manager = struct {
         if (matches(entity, "omos_event")) {
             const branches = try self.run(null, &.{ "branch", "list", "--all", "-R", self.repository });
             var lines = std.mem.splitScalar(u8, branches, '\n');
-            while (lines.next()) |line| if (std.mem.eql(u8, std.mem.trim(u8, line, " *\r\t"), runtime_branch)) {
+            while (lines.next()) |line| if (std.mem.eql(u8, try fossil_manifest.branchName(line), runtime_branch)) {
                 const runtime_revision = try self.revision(runtime_branch);
                 for (try self.inventory(runtime_revision)) |path| {
                     if (!std.mem.startsWith(u8, path, "runtime/sessions/")) continue;
@@ -3373,7 +3496,7 @@ pub const Manager = struct {
         try mkdir(staging);
         const temporary = try join(self.alloc, staging, "workspace.fossil");
         if (exists(temporary)) return error.WorkspaceRecoveryRequired;
-        _ = try self.run(null, &.{ "clone", self.repository, temporary });
+        _ = try self.run(null, &.{ "clone", "--private", self.repository, temporary });
         const exported = try Manager.open(self.alloc, temporary);
         try exported.verify();
         var repository_file = try std.Io.Dir.cwd().openFile(io_mod.getIo(), temporary, .{});

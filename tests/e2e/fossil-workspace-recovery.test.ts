@@ -47,6 +47,112 @@ async function startWorkspaceService(f: ReturnType<typeof fixture>, writable = f
 
 // These fault, boundary, migration, and authority cases qualify the candidate without training it.
 describe("portable Fossil workspace recovery", () => {
+  test("requires successful integrity reports and preserves private branches in a portable export", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const realFossil = spawnSync("which", ["fossil"], { encoding: "utf8" }).stdout.trim();
+    const helper = join(f.home, "unsuccessful-integrity.py");
+    writeFileSync(helper, `#!/usr/bin/env python3
+import subprocess, sys
+if "test-integrity" in sys.argv[1:]:
+    print("1 non-phantom blobs (out of 1 total) checked:  1 errors")
+    print("low-level database integrity-check: ok")
+    sys.exit(0)
+result = subprocess.run([${JSON.stringify(realFossil)}, *sys.argv[1:]])
+sys.exit(result.returncode)
+`, { mode: 0o700 });
+    const refused = await f.run(["fossil", "verify", "--json"], { OMOS_FOSSIL_BIN: helper });
+    expect(refused.code).toBe(1);
+    expect(refused.stdout + refused.stderr).toContain("WorkspaceVerificationFailed");
+    const branch = `task/${"1".repeat(64)}`;
+    f.fossil("--user", "omos", "branch", "new", branch, "trunk", "--private", "--nosign");
+    const tree = join(f.home, "private-checkout");
+    mkdirSync(tree);
+    const env = { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, XDG_CONFIG_HOME: f.home, USER: "fixture", LC_ALL: "C" };
+    const command = (...args: string[]) => {
+      const result = spawnSync(realFossil, ["--user", "omos", ...args], { cwd: tree, env, encoding: "utf8", timeout: 30000 });
+      expect(result.status, result.stderr).toBe(0);
+      return result.stdout;
+    };
+    command("open", join(f.cwd, "omos.fossil"), branch);
+    mkdirSync(join(tree, "memory"));
+    writeFileSync(join(tree, "memory/private-note.md"), "Retained private proposal content.");
+    command("addremove");
+    command("commit", "--hash", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", "Retain a private fixture proposal");
+    const destination = join(f.home, "complete-private-export.fossil");
+    const exported = await f.run(["fossil", "export", destination, "--json"]);
+    expect(exported.code, exported.stderr + exported.stdout).toBe(0);
+    expect(command("cat", "memory/private-note.md", "-r", branch, "-R", destination)).toBe("Retained private proposal content.");
+    const restored = fixture();
+    const opened = await restored.run(["fossil", "use", destination, "--json"]);
+    expect(opened.code, opened.stderr + opened.stdout).toBe(0);
+    expect((await restored.run(["fossil", "verify", "--json"])).code).toBe(0);
+  }, 120000);
+
+  test("verifies large shared history through bounded batches without trusting a changed copy of a record", async () => {
+    const f = fixture();
+    const inference = model(f, () => ({ content: "The informational answer is retained." }));
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const initial = await f.run(["ask", "Give the fixture information", "--json"]);
+    expect(initial.code, initial.stderr).toBe(0);
+    const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    const tree = join(f.home, "history-checkout");
+    mkdirSync(tree);
+    const realFossil = spawnSync("which", ["fossil"], { encoding: "utf8" }).stdout.trim();
+    const environment = { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, XDG_CONFIG_HOME: f.home, USER: "fixture", LC_ALL: "C" };
+    const command = (...args: string[]) => {
+      const result = spawnSync(realFossil, ["--user", "omos", ...args], { cwd: tree, env: environment, encoding: "utf8", timeout: 30000 });
+      expect(result.status, result.stderr).toBe(0);
+      return result.stdout;
+    };
+    command("open", join(f.cwd, "omos.fossil"), task.branch);
+    const directory = join(tree, "history", task.id);
+    mkdirSync(directory, { recursive: true });
+    let firstPath = "";
+    let total = 0;
+    for (let index = 0; index < 32; index++) {
+      const bytes = JSON.stringify({ kind: "fixture_evidence", task: task.id, contract_version: task.definition.version, value: { index, content: "x".repeat(384 * 1024) } });
+      const path = `history/${task.id}/${createHash("sha256").update(bytes).digest("hex")}.json`;
+      if (index === 0) firstPath = path;
+      writeFileSync(join(tree, path), bytes);
+      total += Buffer.byteLength(bytes);
+    }
+    expect(total).toBeGreaterThan(8 * 1024 * 1024);
+    mkdirSync(join(tree, "memory"), { recursive: true });
+    writeFileSync(join(tree, "memory", "with space .md"), "A literal filename with spaces.");
+    command("addremove");
+    command("commit", "--hash", "--delta", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", "Retain fixture evidence");
+    const artifact = f.fossil("artifact", task.branch);
+    expect(artifact).toContain("B ");
+    for (let index = 1; index <= 12; index++) command("branch", "new", `task/${index.toString(16).padStart(64, "0")}`, task.branch, "--nosign");
+    const countFile = join(f.home, "verification-commands.jsonl");
+    const helper = join(f.home, "counting-fossil.py");
+    writeFileSync(helper, `#!/usr/bin/env python3
+import json, pathlib, subprocess, sys
+with pathlib.Path(${JSON.stringify(countFile)}).open("a") as log:
+    log.write(json.dumps(sys.argv[1:]) + "\\n")
+result = subprocess.run([${JSON.stringify(realFossil)}, *sys.argv[1:]])
+sys.exit(result.returncode)
+`, { mode: 0o700 });
+    const verified = await f.run(["fossil", "verify", "--json"], { OMOS_FOSSIL_BIN: helper }, 90000);
+    expect(verified.code, verified.stderr + verified.stdout).toBe(0);
+    const commands = readFileSync(countFile, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const historyReads = commands.filter(args => args.includes("cat") && args.some((arg: string) => arg.startsWith(`history/${task.id}/`)));
+    expect(historyReads.length).toBeLessThan(20);
+    expect(historyReads.some(args => args.filter((arg: string) => arg.startsWith("history/")).length > 1)).toBe(true);
+    // A different artifact under an already verified pathname must be read
+    // and rejected. A filename cache would silently accept this corruption.
+    const badBranch = `task/${"f".repeat(64)}`;
+    command("branch", "new", badBranch, task.branch, "--nosign");
+    command("update", "--nosync", badBranch);
+    writeFileSync(join(tree, firstPath), JSON.stringify({ kind: "altered_fixture_record", value: "Different bytes under the old identity" }));
+    command("commit", "--hash", "--delta", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", "Alter a fixture record");
+    const refused = await f.run(["fossil", "verify", "--json"], {}, 90000);
+    expect(refused.code).toBe(1);
+    expect(refused.stdout + refused.stderr).toContain("InvalidWorkspaceJournal");
+    expect(inference.counts().actors).toBe(1);
+  }, 180000);
+
   test("fences shared task execution across sessions and releases ownership after a crashed runtime", async () => {
     const f = fixture();
     let phase = "setup";
