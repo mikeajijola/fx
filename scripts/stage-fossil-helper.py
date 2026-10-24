@@ -12,6 +12,16 @@ import tempfile
 import urllib.request
 
 
+def matches_platform(binary, target):
+    if target.startswith("linux-"):
+        machine = {"linux-x86_64": 62, "linux-aarch64": 183}[target]
+        valid = len(binary) >= 64 and binary[:6] == b"\x7fELF\x02\x01" and struct.unpack_from("<H", binary, 18)[0] == machine
+    else:
+        machine = {"macos-x86_64": 0x1000007, "macos-aarch64": 0x100000C}[target]
+        valid = len(binary) >= 32 and binary[:4] == b"\xcf\xfa\xed\xfe" and struct.unpack_from("<I", binary, 4)[0] == machine
+    return valid
+
+
 def stage(archive, expected, target, output):
     if hashlib.sha256(archive).hexdigest() != expected["archive_sha256"]:
         raise ValueError("Fossil archive hash mismatch")
@@ -24,13 +34,7 @@ def stage(archive, expected, target, output):
         binary = source.extractfile(members[0]).read()
     if hashlib.sha256(binary).hexdigest() != expected["binary_sha256"]:
         raise ValueError("Fossil executable hash mismatch")
-    if target.startswith("linux-"):
-        machine = {"linux-x86_64": 62, "linux-aarch64": 183}[target]
-        valid = len(binary) >= 64 and binary[:6] == b"\x7fELF\x02\x01" and struct.unpack_from("<H", binary, 18)[0] == machine
-    else:
-        machine = {"macos-x86_64": 0x1000007, "macos-aarch64": 0x100000C}[target]
-        valid = len(binary) >= 32 and binary[:4] == b"\xcf\xfa\xed\xfe" and struct.unpack_from("<I", binary, 4)[0] == machine
-    if not valid:
+    if not matches_platform(binary, target):
         raise ValueError("Fossil executable platform mismatch")
     output.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=".fossil-stage-", dir=output.parent)

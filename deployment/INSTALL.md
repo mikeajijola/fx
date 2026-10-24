@@ -27,7 +27,26 @@ To package a freshly built runtime, stage the matching pinned upstream helper
 with `python3 scripts/stage-fossil-helper.py --platform PLATFORM`, then run
 `python3 scripts/package-omos.py --platform PLATFORM --output PATH.tar.gz`.
 The lock file records upstream source identity, archive hashes, executable
-hashes, and platform sizes. Packaging does not fetch or mutate personal state.
+hashes, and platform sizes. Packaging does not fetch or mutate personal state. Both
+the runtime header and helper identity must match the requested platform.
+`installation.json` marks these bundles as previews; packaging alone does not
+establish production signing or PGSO qualification.
+
+The `Preview installation bundles` workflow builds Linux Intel, Linux ARM,
+macOS Intel, and macOS Apple Silicon candidates on matching native runners.
+It stages the pinned helper and tests two fresh installations, both CLI aliases,
+unique empty instances, portable export and restoration, and repository
+verification after removing the unpacked source and making system Fossil
+unavailable through `PATH`. Each artifact retains the archive checksum, byte
+report, and installation result. It does not publish a release. Packaging and
+its smoke procedure require Python 3.12 or newer; installed clients do not.
+
+Run the same installation check locally with:
+
+```sh
+python3 scripts/smoke-omos-package.py PATH.tar.gz
+```
+
 
 Export personal state with `omos fossil export PATH`. The runtime installation
 and credentials remain separate from that portable repository. Company service
