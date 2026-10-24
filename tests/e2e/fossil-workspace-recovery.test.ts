@@ -1914,7 +1914,7 @@ sys.exit(result.returncode)
     const issuer = generateKeyPairSync("ed25519");
     const public_key = issuer.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex");
     const revision = "a".repeat(64), content = Buffer.alloc(20000, 42), hash = createHash("sha256").update(content).digest("hex");
-    let mode = "hash", posts = 0, contentCalls = 0;
+    let mode = "hash", posts = 0, contentCalls = 0, inventoryCalls = 0;
     const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
       if (mode === "stall") return new Promise<Response>(() => {});
       if (request.method === "GET") return Response.json({ version: "omos.company/v1", workspace: "company", issuer: public_key, epoch: 1 });
@@ -1922,7 +1922,11 @@ sys.exit(result.returncode)
       expect(request.headers.get("authorization")).toBe(null);
       const envelope = await request.json() as any, query = JSON.parse(envelope.payload);
       let result: any;
-      if (!query.path) result = { version: "omos.scoped-export/v1", workspace: "company", revision, actor: "reader", grant: "exporter", files: [{ path: "documents/report.md", sha256: hash, bytes: content.length }], total: 1, next_offset: null };
+      if (!query.path) {
+        inventoryCalls++;
+        if (mode === "deny-final" && inventoryCalls > 1) return Response.json({ error: "CompanyAccessDenied" }, { status: 403 });
+        result = { version: "omos.scoped-export/v1", workspace: "company", revision, actor: "reader", grant: "exporter", files: [{ path: "documents/report.md", sha256: hash, bytes: content.length }], total: 1, next_offset: null };
+      }
       else {
         contentCalls++;
         const end = Math.min(query.offset + 16384, content.length);
@@ -1955,8 +1959,22 @@ sys.exit(result.returncode)
       writeFileSync(input, JSON.stringify(config));
       const valid = await f.run(["fossil", "export-scope", input, output, "--json"]);
       expect(valid.code, valid.stderr).toBe(0);
+      expect(JSON.parse(valid.stdout).shared_cache.stored_bytes).toBe(content.length);
+      const sharedDirectory = join(f.home, ".fx/cache/company-objects");
+      const sharedObjects = readdirSync(sharedDirectory).filter(name => name.endsWith(`-${hash}`));
+      expect(sharedObjects).toHaveLength(1);
+      const sharedObject = join(sharedDirectory, sharedObjects[0]);
+      expect(statSync(sharedDirectory).mode & 0o777).toBe(0o700);
+      expect(statSync(sharedObject).mode & 0o777).toBe(0o600);
       const stage = output + ".partial-" + createHash("sha256").update(JSON.stringify(config)).digest("hex");
       expect(readFileSync(join(stage, hash)).equals(content)).toBe(true);
+      const otherOutput = join(f.home, "other-export.tar");
+      const sharedBefore = contentCalls;
+      const shared = await f.run(["fossil", "export-scope", input, otherOutput, "--json"]);
+      expect(shared.code, shared.stderr).toBe(0);
+      expect(JSON.parse(shared.stdout).shared_cache.hits).toBe(1);
+      expect(contentCalls).toBe(sharedBefore);
+      expect((await f.run(["fossil", "verify-scope", input, otherOutput, "--json"])).code).toBe(0);
       rmSync(output);
       const warmBefore = contentCalls;
       const warm = await f.run(["fossil", "export-scope", input, output, "--json"]);
@@ -1964,12 +1982,30 @@ sys.exit(result.returncode)
       expect(contentCalls).toBe(warmBefore);
       rmSync(output);
       writeFileSync(join(stage, hash), Buffer.alloc(content.length, 0));
+      const sharedRepairBefore = contentCalls;
+      const sharedRepair = await f.run(["fossil", "export-scope", input, output, "--json"]);
+      expect(sharedRepair.code, sharedRepair.stderr).toBe(0);
+      expect(JSON.parse(sharedRepair.stdout).shared_cache.hits).toBe(1);
+      expect(contentCalls).toBe(sharedRepairBefore);
+      rmSync(output);
+      writeFileSync(sharedObject, Buffer.alloc(content.length, 0));
       const damagedBefore = contentCalls;
       const repaired = await f.run(["fossil", "export-scope", input, output, "--json"]);
       expect(repaired.code, repaired.stderr).toBe(0);
       expect(contentCalls - damagedBefore).toBe(2);
       expect(readFileSync(join(stage, hash)).equals(content)).toBe(true);
+      expect(readFileSync(sharedObject).equals(content)).toBe(true);
       rmSync(output);
+      mode = "deny-final";
+      inventoryCalls = 0;
+      const revokedContentCalls = contentCalls;
+      const revokedOutput = join(f.home, "revoked-export.tar");
+      const revoked = await f.run(["fossil", "export-scope", input, revokedOutput, "--json"]);
+      expect(revoked.code).toBe(1);
+      expect(revoked.stdout + revoked.stderr).toContain("WorkspaceServiceDenied");
+      expect(inventoryCalls).toBe(2);
+      expect(contentCalls).toBe(revokedContentCalls);
+      expect(existsSync(revokedOutput)).toBe(false);
       mode = "stall";
       writeFileSync(input, JSON.stringify({ ...config, deadline_ms: 100 }));
       const started = performance.now();
@@ -1979,7 +2015,7 @@ sys.exit(result.returncode)
       expect(performance.now() - started).toBeLessThan(4000);
       expect(existsSync(output)).toBe(false);
     } finally { server.stop(true); }
-  }, 30000);
+  }, 60000);
 
   test("retains signed requests and reconciles an expired checkpoint without replaying its commit", async () => {
     const f = fixture();

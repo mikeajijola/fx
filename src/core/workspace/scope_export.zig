@@ -8,6 +8,7 @@ const authority = @import("company_authority.zig");
 const identity = @import("company_identity.zig");
 const client = @import("workspace_client.zig");
 const workspace = @import("fossil_workspace.zig");
+const object_cache = @import("object_cache.zig");
 
 const Config = struct {
     version: []const u8,
@@ -67,6 +68,7 @@ pub const Snapshot = struct {
     bytes: u64,
     scope: []const u8 = "grant_file_snapshot",
     dependency_closure: []const u8 = "not_evaluated",
+    shared_cache: ?object_cache.Stats = null,
 };
 
 const Session = struct {
@@ -231,8 +233,20 @@ fn cached(alloc: std.mem.Allocator, dir: std.Io.Dir, entry: Entry) !?[]u8 {
     return bytes;
 }
 
-fn download(session: Session, alloc: std.mem.Allocator, dir: std.Io.Dir, entry: Entry) ![]u8 {
+fn cacheFailure(err: anyerror) !void {
+    switch (err) {
+        error.OutOfMemory, error.Cancelled, error.Timeout => return err,
+        else => @import("../shared/debug_trace.zig").logf("workspace", "Shared object cache unavailable: {s}", .{@errorName(err)}),
+    }
+}
+
+fn download(session: Session, alloc: std.mem.Allocator, dir: std.Io.Dir, shared_cache: ?*object_cache.Cache, entry: Entry) ![]u8 {
     if (try cached(alloc, dir, entry)) |bytes| return bytes;
+    const reference: object_cache.Reference = .{ .sha256 = entry.sha256, .bytes = entry.bytes };
+    if (shared_cache) |cache| if (cache.load(alloc, reference) catch |err| miss: {
+        try cacheFailure(err);
+        break :miss null;
+    }) |bytes| return bytes;
     const bytes = try alloc.alloc(u8, entry.bytes);
     var offset: usize = 0;
     while (true) {
@@ -253,6 +267,7 @@ fn download(session: Session, alloc: std.mem.Allocator, dir: std.Io.Dir, entry: 
         if (segment.next_offset == null or segment.next_offset.? != offset) return error.InvalidScopeExportSegment;
     }
     if (!std.mem.eql(u8, entry.sha256, try workspace.hash(alloc, bytes))) return error.ScopeExportHashMismatch;
+    if (shared_cache) |cache| cache.save(alloc, reference, bytes) catch |err| try cacheFailure(err);
     // Cache only complete, verified objects. An interrupted download is retried
     // from zero; previously completed objects are reusable after a fresh grant check.
     var nonce: [16]u8 = undefined;
@@ -325,6 +340,14 @@ pub fn write(alloc: std.mem.Allocator, raw: []const u8, destination: []const u8)
     var dir = try io.openDirAbsoluteNoFollow(try std.Io.Dir.path.resolve(alloc, &.{ try io.realpathAlloc(alloc, "."), staging }), .{ .iterate = true });
     defer dir.close(io.getIo());
     try dir.setPermissions(io.getIo(), .fromMode(0o700));
+    // The complete signed inventory above authorises each lookup. Company and
+    // issuer epoch partition immutable objects; a cache hit cannot skip the
+    // final live grant check before publishing this export.
+    var shared_cache = object_cache.Cache.open(.{ .workspace = company.workspace, .issuer = company.issuer, .epoch = company.epoch }, control) catch |err| absent: {
+        try cacheFailure(err);
+        break :absent null;
+    };
+    defer if (shared_cache) |cache| cache.close();
     var nonce: [16]u8 = undefined;
     io.getIo().random(&nonce);
     const archive_path = try alloc.print("archive-{s}.pending", .{std.fmt.bytesToHex(&nonce, .lower)});
@@ -341,7 +364,7 @@ pub fn write(alloc: std.mem.Allocator, raw: []const u8, destination: []const u8)
         if (slot.found_existing) continue;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
-        const bytes = try download(session, arena.allocator(), dir, entry);
+        const bytes = try download(session, arena.allocator(), dir, if (shared_cache) |*cache| cache else null, entry);
         try tar.writeFileBytes(try arena.allocator().print("objects/{s}", .{entry.sha256}), bytes, .{ .mode = 0o600 });
     }
     try session.check();
@@ -357,11 +380,15 @@ pub fn write(alloc: std.mem.Allocator, raw: []const u8, destination: []const u8)
     try writer.interface.flush();
     try file.sync(io.getIo());
     _ = try verify(alloc, raw, try std.Io.Dir.path.join(alloc, &.{ staging, archive_path }));
+    const snapshot: Snapshot = .{ .path = destination, .workspace = config.workspace, .revision = config.revision, .files = entries.items.len, .bytes = total_bytes, .shared_cache = if (shared_cache) |cache| cache.stats else null };
+    const model = @import("definition.zig");
+    const output = try std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, snapshot, .{}), .{});
+    try model.validateOperation(alloc, try model.parse(alloc, model.seed), "omos_export_scope", output, .output);
     try session.check();
     try std.Io.Dir.hardLink(dir, archive_path, std.Io.Dir.cwd(), destination, io.getIo(), .{});
     var parent = try std.Io.Dir.cwd().openDir(io.getIo(), std.Io.Dir.path.dirname(destination) orelse ".", .{ .iterate = true });
     defer parent.close(io.getIo());
     const parent_file: std.Io.File = .{ .handle = parent.handle, .flags = .{ .nonblocking = false } };
     try parent_file.sync(io.getIo());
-    return .{ .path = destination, .workspace = config.workspace, .revision = config.revision, .files = entries.items.len, .bytes = total_bytes };
+    return snapshot;
 }

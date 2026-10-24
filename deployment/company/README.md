@@ -92,10 +92,12 @@ successful activation. These local locks do not provide cross-host consensus.
 Company views reuse host mutation and integration checkouts while retaining
 separate canonical branches. Personal tasks still use their own native checkouts.
 Measure repository size, host checkout size, active view count, review duration,
-and storage growth when setting capacity expectations. Sparse projections,
-bounded shared caches, and continuous desired-state
-reconciliation remain required before treating this deployment as the complete
-large-company model.
+and storage growth when setting capacity expectations. Scoped export clients
+reuse verified objects through a private 256 MiB cache, bounded to 4,096 objects,
+while checking current grant authority. Their JSON summaries report cache
+activity. Sparse task projections, shared caching for those projections, and
+continuous desired-state reconciliation remain required before treating this
+deployment as the complete large-company model.
 
 ## Review capacity
 

@@ -514,6 +514,27 @@ checks access again before publication. Revocation stops subsequent service
 retrieval; previously downloaded plaintext remains with its recipient. Cache
 files can be removed when no export process is using them.
 
+Scoped exports also reuse immutable objects across output destinations through
+the private profile cache at `~/.fx/cache/company-objects/`. Its retained
+payload limit is 256 MiB and 4,096 objects. Writes share one lock and evict
+objects by approximate last use. Cache inventory scans, lock waits, and object
+reads inherit the export's cancellation and deadline controls. Files use mode
+0600; directories use mode 0700. Reads reject symlinks and verify size and the
+complete content hash.
+
+Company identity, issuer, and authority epoch partition this cache. A fresh
+signed inventory must authorise each object before lookup, including reuse by
+another grant in the same company. The final live authority check still gates
+publication when every content read was cached. Corrupt objects trigger
+verified retrieval. Cache loss affects reuse; the pinned company revision
+retains the original content. `shared_cache` reports this operation's cache
+hits, misses, stored bytes, and evictions. The host validates the export summary
+against its OmniForm operation schema before publishing the final archive.
+
+This limit covers the shared immutable object cache. Adjacent export staging
+directories retain their separate recovery files. Task filesystem views and
+private edits have their own lifetime and are not evicted by this cache.
+
 This package declares `scope: "grant_file_snapshot"` and
 `dependency_closure: "not_evaluated"`. It includes the listed files, rather than
 a company repository clone, issuer authority, execution ownership, or a verified
@@ -605,8 +626,9 @@ retrieve content through the service; they receive no access to the host's
 scratch directories. The host serializes mutations through one reusable company
 checkout and uses one integration checkout for publication. Creating more views
 does not create another complete filesystem copy for each actor. These host
-checkouts can still materialize a complete revision; sparse client files and a
-bounded shared cache require further implementation.
+checkouts can still materialize a complete revision. Sparse client files and
+caching for task projections require further implementation. Scoped exports
+use the bounded profile object cache described above.
 
 Mutations retain a request hash and pending outcome before effects. Completed
 retries return the saved result after a fresh authority check. Reusing an
