@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync, appendFileSync, statSync, rmSync, copyFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync, appendFileSync, statSync, rmSync, copyFileSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createHash, generateKeyPairSync, sign, verify, createPublicKey, createPrivateKey } from "node:crypto";
@@ -1519,6 +1519,50 @@ sys.exit(result.returncode)
       service.child.kill(); await service.child.exited;
     }
   }, 120000);
+
+  test("creates stable private actor key handles without a repository and returns only their public identity", async () => {
+    const f = fixture();
+    const results = await Promise.all(Array.from({ length: 3 }, () => f.run(["fossil", "company-key", "team-reader", "--json"])));
+    for (const result of results) expect(result.code, result.stderr).toBe(0);
+    const identities = results.map(result => JSON.parse(result.stdout));
+    expect(identities.every(identity => identity.version === "omos.company-key/v1" && identity.key_handle === "team-reader")).toBe(true);
+    expect(new Set(identities.map(identity => identity.public_key)).size).toBe(1);
+    expect(identities.filter(identity => identity.created)).toHaveLength(1);
+    const directory = join(f.home, ".fx/company-keys");
+    const file = join(directory, "team-reader.seed");
+    const seed = readFileSync(file);
+    expect(seed.length).toBe(32);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    expect(statSync(directory).mode & 0o777).toBe(0o700);
+    const privateKey = createPrivateKey({ key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seed]), type: "pkcs8", format: "der" });
+    const publicKey = createPublicKey(privateKey).export({ type: "spki", format: "der" }).subarray(-32).toString("hex");
+    expect(identities[0].public_key).toBe(publicKey);
+    expect(results.every(result => !(result.stdout + result.stderr).includes(seed.toString("hex")))).toBe(true);
+    expect(existsSync(join(f.home, ".fx/omos-workspace.json"))).toBe(false);
+    expect(existsSync(join(f.cwd, "omos.fossil"))).toBe(false);
+    const existing = await f.run(["fossil", "company-key", "team-reader"]);
+    expect(existing.code, existing.stderr).toBe(0);
+    expect(existing.stdout).toContain("Using existing local company actor key: team-reader");
+    expect(existing.stdout).toContain(publicKey);
+    expect(readFileSync(file).equals(seed)).toBe(true);
+    const escaped = await f.run(["fossil", "company-key", "../escape", "--json"]);
+    expect(escaped.code).toBe(1);
+    expect(escaped.stdout + escaped.stderr).toContain("InvalidCompanyKeyHandle");
+    expect(existsSync(join(f.home, ".fx/escape.seed"))).toBe(false);
+    chmodSync(file, 0o644);
+    const exposed = await f.run(["fossil", "company-key", "team-reader", "--json"]);
+    expect(exposed.code).toBe(1);
+    expect(exposed.stdout + exposed.stderr).toContain("CompanyKeyPermissionsUnsafe");
+    expect(readFileSync(file).equals(seed)).toBe(true);
+    chmodSync(file, 0o600);
+    const outside = join(f.home, "outside.seed");
+    writeFileSync(outside, seed, { mode: 0o600 });
+    symlinkSync(outside, join(directory, "linked.seed"));
+    const linked = await f.run(["fossil", "company-key", "linked", "--json"]);
+    expect(linked.code).toBe(1);
+    expect(readFileSync(outside).equals(seed)).toBe(true);
+    expect(readdirSync(directory).filter(name => name.startsWith("key.pending-"))).toHaveLength(0);
+  }, 30000);
 
   test("verifies signed company client receipts without forwarding the owner token or replaying mismatched replies", async () => {
     const f = fixture();

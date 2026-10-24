@@ -2,7 +2,7 @@ const std = @import("std");
 const workspace = @import("fossil_workspace.zig");
 
 pub const Options = struct {
-    action: enum { init, ensure, company, use, status, tasks, diff, history, verify, recover, migrate, definition, query, audit, serve, remote, @"export" } = .status,
+    action: enum { init, ensure, company, @"company-key", use, status, tasks, diff, history, verify, recover, migrate, definition, query, audit, serve, remote, @"export" } = .status,
     path: ?[]const u8 = null,
     definition_action: enum { show, validate, propose } = .show,
     execution_path: ?[]const u8 = null,
@@ -59,7 +59,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
             .show => if (options.path != null) return error.UnexpectedArgument,
             .validate, .propose => if (options.path == null) return error.MissingPath,
         },
-        .company => if (options.path == null) return error.MissingPath,
+        .company, .@"company-key" => if (options.path == null) return error.MissingPath,
         .init, .diff, .query, .serve => {},
         else => if (options.path != null) return error.UnexpectedArgument,
     }
@@ -71,12 +71,27 @@ pub fn parse(args: []const [:0]const u8) !Options {
     return options;
 }
 
-pub fn execute(alloc: std.mem.Allocator, options: Options) !workspace.Snapshot {
+pub const Reply = union(enum) { workspace: workspace.Snapshot, identity: @import("company_identity.zig").Snapshot };
+
+pub fn execute(alloc: std.mem.Allocator, options: Options) !Reply {
+    if (options.action == .@"company-key") {
+        const model = @import("definition.zig");
+        const declaration = try model.parse(alloc, model.seed);
+        const input = try std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, .{ .key_handle = options.path.? }, .{}), .{});
+        try model.validateOperation(alloc, declaration, "omos_create_company_key", input, .input);
+        const identity = try @import("company_identity.zig").create(alloc, options.path.?);
+        const retained_key = try @import("company_identity.zig").load(alloc, options.path.?);
+        const retained_public = std.fmt.bytesToHex(retained_key.public_key.toBytes(), .lower);
+        if (!std.mem.eql(u8, identity.public_key, &retained_public)) return error.CompanyKeyChanged;
+        const output = try std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, identity, .{}), .{});
+        try model.validateOperation(alloc, declaration, "omos_create_company_key", output, .output);
+        return .{ .identity = identity };
+    }
     if (options.action == .remote) {
         const data = try @import("workspace_client.zig").call(alloc, options.path.?, if (options.request_path) |path| try readDefinition(alloc, path) else null);
         const model = @import("definition.zig");
         const context = if (model.field(data, "payload")) |payload| if (payload == .string) try std.json.parseFromSliceLeaky(std.json.Value, alloc, payload.string, .{}) else data else data;
-        return .{ .repository = options.path.?, .workspace_id = model.text(context, "workspace"), .trunk_revision = model.text(data, "revision"), .tasks = &.{}, .pending_journals = 0, .publication = "remote", .model_data = data };
+        return .{ .workspace = .{ .repository = options.path.?, .workspace_id = model.text(context, "workspace"), .trunk_revision = model.text(data, "revision"), .tasks = &.{}, .pending_journals = 0, .publication = "remote", .model_data = data } };
     }
     const manager = switch (options.action) {
         .init => try workspace.Manager.init(alloc, options.path orelse "omos.fossil"),
@@ -128,12 +143,12 @@ pub fn execute(alloc: std.mem.Allocator, options: Options) !workspace.Snapshot {
         .query => model_data = (try std.json.parseFromSlice(std.json.Value, alloc, try manager.queryRecords(null, options.path, options.offset), .{})).value,
         .audit => model_data = (try std.json.parseFromSlice(std.json.Value, alloc, try manager.auditContracts(), .{})).value,
         .serve => return error.ServiceRequiresCliHost,
-        .remote => unreachable,
+        .remote, .@"company-key" => unreachable,
         .status, .tasks => {},
     }
     var snapshot = try manager.snapshot(detail);
     snapshot.model_data = model_data;
-    return snapshot;
+    return .{ .workspace = snapshot };
 }
 
 pub fn taskCommand(alloc: std.mem.Allocator, session: []const u8, project: []const u8, rest: []const u8) ![]const u8 {

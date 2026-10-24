@@ -315,6 +315,14 @@ control revision returned by `status`.
 Root grant enrollment requires local operator access. Definitions cannot grant
 server authority.
 
+`omos fossil company-key HANDLE --json` creates a local Ed25519 actor key and
+returns its public key. Repeating the command preserves the existing key;
+concurrent callers receive the same identity. The seed stays in the private
+profile directory `~/.fx/company-keys/` with mode `0600` and is excluded from
+workspace exports. Back up these credentials separately from company content.
+The command also works without a local repository. An operator must enroll the
+public key in a scoped company grant before it can authorize service access.
+
 For a grant with `human_approval: true`, submit the proposal normally. Its
 review job remains blocked without spending inference calls until an operator
 records a valid approval. `inspect_proposal` takes the current control

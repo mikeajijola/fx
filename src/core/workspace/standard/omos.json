@@ -1080,6 +1080,59 @@
         "interfaces": [
           "cli"
         ]
+      },
+      {
+        "id": "omos_create_company_key",
+        "capability": "general_task",
+        "description": "Create or reuse a local actor key handle and return its public identity.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "key_handle": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "required": [
+            "key_handle"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company-key/v1"
+            },
+            "key_handle": {
+              "type": "string"
+            },
+            "public_key": {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64
+            },
+            "created": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "version",
+            "key_handle",
+            "public_key",
+            "created"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli"
+        ]
       }
     ],
     "semantic": {
