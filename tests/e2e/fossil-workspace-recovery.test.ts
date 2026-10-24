@@ -2228,6 +2228,65 @@ sys.exit(result.returncode)
     expect(existsSync(join(f.home, ".fx", "instances", "personal.fossil"))).toBe(false);
   }, 60000);
 
+  test("preserves executable scripts through automatic checkpoints, text edits, restoration, and mode-only changes", async () => {
+    const f = fixture();
+    const path = "skills/portable/run.sh";
+    const original = "#!/bin/sh\nprintf 'first-version\\n'\n";
+    const updated = "#!/bin/sh\nprintf 'restored-executable\\n'\n";
+    const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+    const rootFrom = (body: any) => {
+      const context = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
+      const match = context.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/);
+      expect(match).not.toBeNull();
+      return JSON.parse(match![1]);
+    };
+    const call = (name: string, args: object) => ({ tool_calls: [{ index: 0, id: "script-operation", type: "function", function: { name, arguments: JSON.stringify(args) } }] });
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    model(f, (body, count) => {
+      const root = rootFrom(body);
+      if (count === 1) return call("shell", { request: { action: "run", command: `mkdir -p ${quote(join(root, "skills/portable"))}; printf '%s' ${quote(original)} > ${quote(join(root, path))}; chmod 700 ${quote(join(root, path))}`, timeout_ms: 10000 } });
+      if (count === 2) return call("fossil_workspace", { action: "write", path, content: updated });
+      if (count === 3) {
+        expect(statSync(join(root, path)).mode & 0o777).toBe(0o700);
+        expect(readFileSync(join(root, path), "utf8")).toBe(updated);
+        return call("fossil_workspace", { action: "write", path: "skills/portable/manifest.json", content: JSON.stringify({ files: [{ path, sha256: createHash("sha256").update(updated).digest("hex"), bytes: Buffer.byteLength(updated), executable: true }] }) });
+      }
+      if (count === 4) return call("fossil_workspace", { action: "verify_manifest", path: "skills/portable/manifest.json" });
+      expect(body.messages.some((message: any) => message.role === "tool" && typeof message.content === "string" && message.content.includes('"executable_flags":1'))).toBe(true);
+      return { content: "The script text and executable flag are verified in the portable workspace." };
+    });
+    const saved = await f.run(["ask", "Save and update a portable executable script", "--json"]);
+    expect(saved.code, saved.stderr).toBe(0);
+    const firstRevision = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout).trunk_revision;
+    expect(f.fossil("artifact", firstRevision)).toMatch(/^F skills\/portable\/run.sh [a-f0-9]+ x$/m);
+    const exported = join(f.home, "executable-package.fossil");
+    expect((await f.run(["fossil", "export", exported])).code).toBe(0);
+    const clean = fixture();
+    expect((await clean.run(["fossil", "use", exported])).code).toBe(0);
+    model(clean, (body, count) => {
+      const root = rootFrom(body);
+      if (count === 1) {
+        expect(statSync(join(root, path)).mode & 0o777).toBe(0o700);
+        return call("shell", { request: { action: "run", command: `test -x ${quote(join(root, path))} && ${quote(join(root, path))}`, timeout_ms: 10000 } });
+      }
+      if (count === 2) {
+        expect(body.messages.some((message: any) => message.role === "tool" && typeof message.content === "string" && message.content.includes("restored-executable"))).toBe(true);
+        return call("shell", { request: { action: "run", command: `chmod 600 ${quote(join(root, path))}`, timeout_ms: 10000 } });
+      }
+      if (count === 3) return call("fossil_workspace", { action: "write", path: "skills/portable/manifest.json", content: JSON.stringify({ files: [{ path, sha256: createHash("sha256").update(updated).digest("hex"), bytes: Buffer.byteLength(updated), executable: false }] }) });
+      if (count === 4) return call("fossil_workspace", { action: "verify_manifest", path: "skills/portable/manifest.json" });
+      expect(statSync(join(root, path)).mode & 0o777).toBe(0o600);
+      return { content: "The restored executable ran, and its subsequent mode-only change was verified." };
+    });
+    const restored = await clean.run(["ask", "Run the restored script, then remove and verify its executable flag", "--json"]);
+    expect(restored.code, restored.stderr).toBe(0);
+    const status = JSON.parse((await clean.run(["fossil", "status", "--json"])).stdout);
+    const helper = join(import.meta.dir, "../../zig-out/libexec/fossil");
+    const command = spawnSync(existsSync(helper) ? helper : "fossil", ["artifact", status.trunk_revision, "-R", exported], { encoding: "utf8" });
+    expect(command.status, command.stderr).toBe(0);
+    expect(command.stdout).toMatch(/^F skills\/portable\/run.sh [a-f0-9]+$/m);
+  }, 180000);
+
   test("restores a complete versioned skill package and prefers it over a legacy copy", async () => {
     const f = fixture();
     const instructions = "---\nname: portable-skill\ndescription: Read the fixture dataset using the included script\n---\nCanonical portable skill.\n" + "Retained package instructions. ".repeat(180);
@@ -3502,6 +3561,33 @@ sys.exit(result.returncode)
     const status = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout);
     expect(status.tasks).toHaveLength(0);
   }, 30000);
+
+  test("retains a file conflict when concurrent proposals change its content and executable flag", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    model(f, (_body, count) => count === 1 ? { tool_calls: [{ index: 0, id: "seed-script", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", path: "skills/shared.sh", content: "#!/bin/sh\nprintf original\n" }) } }] } : { content: "The shared regular script is saved." });
+    expect((await f.run(["ask", "Save a shared script", "--json"])).code).toBe(0);
+    let arrived = 0, release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const turns = { mode: 0, text: 0 };
+    model(f, body => {
+      const key = JSON.stringify(body.messages).includes("MODE-TASK") ? "mode" : "text";
+      if (++turns[key] > 1) return { content: `Saved the ${key} change.` };
+      if (key === "text") return { tool_calls: [{ index: 0, id: "edit-text", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", path: "skills/shared.sh", content: "#!/bin/sh\nprintf updated\n" }) } }] };
+      const context = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
+      const root = JSON.parse(context.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/)![1]);
+      return { tool_calls: [{ index: 0, id: "edit-mode", type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", command: `chmod 700 '${root}/skills/shared.sh'`, timeout_ms: 10000 } }) } }] };
+    }, async () => { if (++arrived === 2) release(); await gate; return "met"; });
+    const results = await Promise.all([
+      f.run(["ask", "MODE-TASK: make the shared script executable", "--json"]),
+      f.run(["ask", "TEXT-TASK: change the shared script output", "--json"]),
+    ]);
+    expect(results.map(result => result.code).sort(), JSON.stringify(results)).toEqual([0, 1]);
+    const tasks = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks;
+    expect(tasks.filter((task: any) => task.state === "conflict")).toHaveLength(1);
+    expect(tasks.filter((task: any) => task.state === "accepted")).toHaveLength(2);
+    for (const task of tasks) expect(f.fossil("ls", "-r", task.branch)).toContain("skills/shared.sh");
+  }, 120000);
 
   for (const conflicting of [false, true]) {
     test(conflicting ? "retains conflicting branches without forcing a merge" : "serializes independent task publications from the same base", async () => {

@@ -354,8 +354,13 @@ ownership. Files written elsewhere are not automatically workspace content.
 
 The view is not the host's Fossil checkout and contains no editable contracts,
 assessments, or publication records. A separate baseline records canonical
-hashes. Materialization compares the baseline, current files, and the selected
-revision before changing a view. Divergent changes stop with
+hashes and executable flags. Materialization compares the baseline, current
+files, and the selected revision before changing a view. Files are restored
+with private permissions: `600` for regular files and `700` for executables.
+Text edits preserve an existing executable flag; mode-only edits are checkpointed
+and verified against the committed Fossil manifest. Filesystem ACLs and special
+permission bits are not portable workspace data. Version 1 baselines are
+upgraded without discarding local drafts. Divergent changes stop with
 `WorkspaceProjectionConflict`; local drafts remain available. Deletions require
 a known baseline. A view with uncheckpointed edits must not be discarded as
 cache garbage. The current implementation materializes the mutable file tree;

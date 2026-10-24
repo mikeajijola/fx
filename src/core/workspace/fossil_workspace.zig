@@ -157,7 +157,7 @@ const CompanyCheckpoint = struct {
     task: []const u8,
     operation: []const u8,
     base: []const u8,
-    files: []const struct { path: []const u8, sha256: ?[]const u8, bytes: usize, deleted: bool },
+    files: []const struct { path: []const u8, sha256: ?[]const u8, bytes: usize, deleted: bool, executable: ?bool = null },
     outcome: []const u8,
     note: ?[]const u8 = null,
 };
@@ -315,6 +315,10 @@ fn atomicWriteAt(alloc: Allocator, directory: std.Io.Dir, name: []const u8, data
 }
 
 fn atomicWriteAtBounded(alloc: Allocator, directory: std.Io.Dir, name: []const u8, data: []const u8, limit: usize) !void {
+    return atomicWriteAtMode(alloc, directory, name, data, limit, false);
+}
+
+fn atomicWriteAtMode(alloc: Allocator, directory: std.Io.Dir, name: []const u8, data: []const u8, limit: usize, executable: bool) !void {
     if (data.len > limit) return error.WorkspaceRecordTooLarge;
     var nonce: [16]u8 = undefined;
     io_mod.getIo().random(&nonce);
@@ -323,10 +327,19 @@ fn atomicWriteAtBounded(alloc: Allocator, directory: std.Io.Dir, name: []const u
     defer file.close(io_mod.getIo());
     errdefer directory.deleteFile(io_mod.getIo(), temporary) catch {};
     try file.writeStreamingAll(io_mod.getIo(), data);
+    try file.setPermissions(io_mod.getIo(), .fromMode(if (executable) @as(u32, 0o700) else 0o600));
     try file.sync(io_mod.getIo());
     try std.Io.Dir.rename(directory, temporary, directory, name, io_mod.getIo());
     const as_file: std.Io.File = .{ .handle = directory.handle, .flags = .{ .nonblocking = false } };
     try as_file.sync(io_mod.getIo());
+}
+
+fn executableFlag(files: []const fossil_manifest.File, path: []const u8) !?bool {
+    for (files) |file| if (std.mem.eql(u8, file.path, path)) {
+        if (file.mode == .symlink) return error.WorkspaceProjectionSymlink;
+        return file.mode == .executable;
+    };
+    return null;
 }
 
 fn contentParent(alloc: Allocator, tree: []const u8, path: []const u8) !std.Io.Dir {
@@ -1963,27 +1976,20 @@ pub const Manager = struct {
         return task;
     }
 
-    fn fileHash(self: Manager, path: []const u8, revision_id: []const u8) !?[]const u8 {
-        if (comptime builtin.target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
-        const bytes = self.run(null, &.{ "cat", path, "-r", revision_id, "-R", self.repository }) catch |err| switch (err) {
-            error.FossilCommandFailed => return null,
-            else => return err,
-        };
-        return try hash(self.alloc, bytes);
-    }
-
     fn ensureMergeable(self: Manager, task: Task, source: []const u8, target: []const u8) !void {
-        const changed = try self.run(null, &.{ "diff", "--internal", "--brief", "--from", task.base_revision, "--to", source, "-R", self.repository });
-        var lines = std.mem.splitScalar(u8, changed, '\n');
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-            const separator = std.mem.findScalar(u8, line, ' ') orelse return error.InvalidFossilDiff;
-            const path = std.mem.trimStart(u8, line[separator..], " ");
-            if (!allowedPath(path) and !std.mem.eql(u8, path, "registry.json")) return error.WorkspacePathDenied;
-            const base_hash = try self.fileHash(path, task.base_revision);
-            const source_hash = try self.fileHash(path, source);
-            const target_hash = try self.fileHash(path, target);
-            if (optionalEqual(source_hash, target_hash) or optionalEqual(base_hash, target_hash)) continue;
+        var target_files = std.StringHashMap(fossil_manifest.File).init(self.alloc);
+        defer target_files.deinit();
+        for (try self.fileManifest(try self.revision(target))) |file| try target_files.put(file.path, file);
+        const same = struct {
+            fn file(a: ?fossil_manifest.File, b: ?fossil_manifest.File) bool {
+                if (a) |left| return if (b) |right| left.mode == right.mode and optionalEqual(left.artifact, right.artifact) else false;
+                return b == null;
+            }
+        }.file;
+        for (try self.compareFiles(task.base_revision, source)) |change| {
+            if (!allowedPath(change.path) and !std.mem.eql(u8, change.path, "registry.json")) return error.WorkspacePathDenied;
+            const target_file = target_files.get(change.path);
+            if (same(change.after, target_file) or same(change.before, target_file)) continue;
             var conflicted = try self.loadTask(task.id);
             conflicted.state = .conflict;
             try self.saveTask(conflicted);
@@ -2085,6 +2091,8 @@ pub const Manager = struct {
         const identity = try parse(self.alloc, Manifest, try self.contentAt("workspace.json", source));
         if (!std.mem.eql(u8, identity.id, self.manifest.id)) return error.WorkspaceIdentityMismatch;
         const source_files = try self.inventory(source);
+        const source_metadata = try self.fileManifest(try self.revision(source));
+        for (source_metadata) |file| if (@import("ui_artifact.zig").safePath(file.path) and file.mode == .symlink) return error.WorkspaceSymlinkDenied;
         const manifest = try self.contentAt("ui/manifest.json", source);
         _ = try parse(self.alloc, std.json.Value, manifest);
         const lease = try self.writerLease();
@@ -2106,7 +2114,7 @@ pub const Manager = struct {
             if (!@import("ui_artifact.zig").safePath(path)) continue;
             var directory = try contentParent(self.alloc, tree, path);
             defer directory.close(io_mod.getIo());
-            try atomicWriteAt(self.alloc, directory, std.Io.Dir.path.basename(path), try self.contentAt(path, source));
+            try atomicWriteAtMode(self.alloc, directory, std.Io.Dir.path.basename(path), try self.contentAt(path, source), max_bytes, (try executableFlag(source_metadata, path)) orelse return error.WorkspaceVerificationFailed);
             count += 1;
         }
         const changes = try self.run(tree, &.{ "changes", "--hash", "--differ" });
@@ -2116,14 +2124,7 @@ pub const Manager = struct {
     }
 
     pub fn uiChanged(self: Manager, from: []const u8, to: []const u8) !bool {
-        const changed = try self.run(null, &.{ "diff", "--internal", "--brief", "--from", from, "--to", to, "-R", self.repository });
-        var lines = std.mem.splitScalar(u8, changed, '\n');
-        while (lines.next()) |line| {
-            var fields = std.mem.tokenizeAny(u8, line, " \t");
-            _ = fields.next();
-            const path = fields.next() orelse continue;
-            if (std.mem.startsWith(u8, path, "ui/")) return true;
-        }
+        for (try self.changedPaths(from, to)) |path| if (std.mem.startsWith(u8, path, "ui/")) return true;
         return false;
     }
 
@@ -2262,16 +2263,17 @@ pub const Manager = struct {
         };
         if (current.state == .accepted or current.state == .publication_pending) return error.TaskIsReadOnly;
         if (current.definition.version != task.definition.version) return error.StaleWorkContract;
+        const executable = (try executableFlag(try self.fileManifest(try self.revision(task.branch)), path)) orelse false;
         const tree = try self.checkout(task.branch);
         var directory = try contentParent(self.alloc, tree, path);
         defer directory.close(io_mod.getIo());
-        try atomicWriteAt(self.alloc, directory, std.Io.Dir.path.basename(path), bytes);
+        try atomicWriteAtMode(self.alloc, directory, std.Io.Dir.path.basename(path), bytes, max_bytes, executable);
         const changes = try self.run(tree, &.{ "changes", "--hash", "--differ" });
         const extras = try self.run(tree, &.{"extras"});
         if (changes.len > 0 or extras.len > 0) _ = try self.commit(tree, "Update task workspace content");
     }
 
-    pub const ContentChange = struct { path: []const u8, content: ?[]const u8, previous_hash: ?[]const u8 };
+    pub const ContentChange = struct { path: []const u8, content: ?[]const u8, previous_hash: ?[]const u8, executable: ?bool = null, previous_executable: ?bool = null };
 
     /// One writer transaction fences an entire filesystem projection checkpoint.
     /// A retry recognizes the desired bytes; divergent canonical changes fail.
@@ -2289,6 +2291,7 @@ pub const Manager = struct {
             const saved_checkpoint = try parse(self.alloc, CompanyCheckpoint, bytes);
             if (!std.mem.eql(u8, saved_checkpoint.kind, "company_checkpoint") or !std.mem.eql(u8, saved_checkpoint.task, task.id) or !std.mem.eql(u8, saved_checkpoint.operation, operation) or !std.mem.eql(u8, saved_checkpoint.outcome, "checkpointed") or !immutableRevision(saved_checkpoint.base) or saved_checkpoint.files.len == 0 or saved_checkpoint.files.len > 10000) return error.WorkspaceVerificationFailed;
             const paths = try self.inventory(revision_id);
+            const metadata = try self.fileManifest(revision_id);
             for (saved_checkpoint.files, 0..) |file, index| {
                 if (!@import("company_authority.zig").validPath(file.path, false)) return error.WorkspaceVerificationFailed;
                 for (saved_checkpoint.files[0..index]) |previous| if (std.mem.eql(u8, previous.path, file.path)) return error.WorkspaceVerificationFailed;
@@ -2296,11 +2299,12 @@ pub const Manager = struct {
                     if (std.mem.eql(u8, item, file.path)) break true;
                 } else false;
                 if (file.deleted) {
-                    if (present or file.sha256 != null or file.bytes != 0) return error.WorkspaceVerificationFailed;
+                    if (present or file.sha256 != null or file.bytes != 0 or file.executable != null) return error.WorkspaceVerificationFailed;
                 } else {
                     if (!present or file.sha256 == null) return error.WorkspaceVerificationFailed;
                     const actual = try self.contentAt(file.path, revision_id);
                     if (actual.len != file.bytes or !std.mem.eql(u8, try hash(self.alloc, actual), file.sha256.?)) return error.WorkspaceVerificationFailed;
+                    if (file.executable) |expected| if ((try executableFlag(metadata, file.path)) != expected) return error.WorkspaceVerificationFailed;
                 }
             }
             for (try self.changedPaths(saved_checkpoint.base, revision_id)) |changed| {
@@ -2360,6 +2364,8 @@ pub const Manager = struct {
         if (current.definition.version != task.definition.version) return error.StaleWorkContract;
         const revision_id = try self.revision(task.branch);
         const inventory_paths = try self.inventory(revision_id);
+        const metadata = try self.fileManifest(revision_id);
+        const executable_flags = try self.alloc.alloc(bool, changes.len);
         const company_grant = if (current.authority) |binding| grant: {
             const authority_state = try record_json.decode(@import("company_authority.zig").State, self.alloc, try self.companyContent("authority/state.json"), .{});
             const live = try @import("company_authority.zig").liveGrant(authority_state, binding.grant, io_mod.milliTimestamp());
@@ -2385,15 +2391,20 @@ pub const Manager = struct {
             } else false;
             const actual = if (present) try hash(self.alloc, try self.contentAt(change.path, revision_id)) else null;
             const desired = if (change.content) |bytes| try hash(self.alloc, bytes) else null;
-            if (!optionalEqual(actual, change.previous_hash) and !optionalEqual(actual, desired)) return error.WorkspaceProjectionConflict;
+            const actual_executable = try executableFlag(metadata, change.path);
+            const desired_executable = change.executable orelse actual_executable orelse false;
+            executable_flags[index] = desired_executable;
+            const matches_previous = optionalEqual(actual, change.previous_hash) and (change.previous_executable == null or actual_executable == change.previous_executable);
+            const matches_desired = optionalEqual(actual, desired) and (change.content == null or actual_executable == desired_executable);
+            if (!matches_previous and !matches_desired) return error.WorkspaceProjectionConflict;
         }
         const tree = try self.checkout(task.branch);
         // Validate the full batch before changing any working bytes.
-        for (changes) |change| {
+        for (changes, 0..) |change, index| {
             var parent = try contentParent(self.alloc, tree, change.path);
             defer parent.close(io_mod.getIo());
             if (change.content) |bytes| {
-                try atomicWriteAt(self.alloc, parent, std.Io.Dir.path.basename(change.path), bytes);
+                try atomicWriteAtMode(self.alloc, parent, std.Io.Dir.path.basename(change.path), bytes, max_bytes, executable_flags[index]);
             } else {
                 parent.deleteFile(io_mod.getIo(), std.Io.Dir.path.basename(change.path)) catch |err| switch (err) {
                     error.FileNotFound => {},
@@ -2403,23 +2414,24 @@ pub const Manager = struct {
         }
         if (operation) |id| {
             const path = try self.alloc.print("company/checkpoints/{s}/{s}.json", .{ task.id, id });
-            var file_rows: std.ArrayList(struct { path: []const u8, sha256: ?[]const u8, bytes: usize, deleted: bool }) = .empty;
-            for (changes) |change| try file_rows.append(self.alloc, .{ .path = change.path, .sha256 = if (change.content) |bytes| try hash(self.alloc, bytes) else null, .bytes = if (change.content) |bytes| bytes.len else 0, .deleted = change.content == null });
+            var file_rows: std.ArrayList(struct { path: []const u8, sha256: ?[]const u8, bytes: usize, deleted: bool, executable: ?bool }) = .empty;
+            for (changes, 0..) |change, index| try file_rows.append(self.alloc, .{ .path = change.path, .sha256 = if (change.content) |bytes| try hash(self.alloc, bytes) else null, .bytes = if (change.content) |bytes| bytes.len else 0, .deleted = change.content == null, .executable = if (change.content != null) executable_flags[index] else null });
             var parent = try contentParent(self.alloc, tree, path);
             defer parent.close(io_mod.getIo());
-            try atomicWriteAt(self.alloc, parent, std.Io.Dir.path.basename(path), try json(self.alloc, .{ .kind = "company_checkpoint", .task = task.id, .operation = id, .base = revision_id, .files = file_rows.items, .outcome = "checkpointed", .note = "Verifies saved bytes only; behavioural success requires independent assessment." }));
+            try atomicWriteAt(self.alloc, parent, std.Io.Dir.path.basename(path), try json(self.alloc, .{ .kind = "company_checkpoint", .task = task.id, .operation = id, .base = revision_id, .files = file_rows.items, .outcome = "checkpointed", .note = "Verifies saved bytes and executable flags only; behavioural success requires independent assessment." }));
         }
         if ((try self.run(tree, &.{ "changes", "--hash", "--differ" })).len == 0 and (try self.run(tree, &.{ "extras", "--dotfiles" })).len == 0) return revision_id;
         const committed = try self.commit(tree, "Checkpoint workspace filesystem changes");
         const committed_paths = try self.inventory(committed);
-        for (changes) |change| {
+        const committed_metadata = try self.fileManifest(committed);
+        for (changes, 0..) |change, index| {
             const present = for (committed_paths) |path| {
                 if (std.mem.eql(u8, path, change.path)) break true;
             } else false;
             if (change.content) |expected| {
                 if (!present) return error.WorkspaceVerificationFailed;
                 const actual = try self.contentAt(change.path, committed);
-                if (!std.mem.eql(u8, actual, expected)) return error.WorkspaceVerificationFailed;
+                if (!std.mem.eql(u8, actual, expected) or (try executableFlag(committed_metadata, change.path)) != executable_flags[index]) return error.WorkspaceVerificationFailed;
             } else if (present) return error.WorkspaceVerificationFailed;
         }
         for (try self.changedPaths(revision_id, committed)) |path| {
@@ -2613,18 +2625,24 @@ pub const Manager = struct {
     pub fn verifyManifest(self: Manager, task: Task, path: []const u8) ![]const u8 {
         const revision_id = try self.currentRevision(task);
         const bytes = try self.contentAt(path, revision_id);
-        const File = struct { path: []const u8, sha256: []const u8, bytes: usize };
+        const File = struct { path: []const u8, sha256: []const u8, bytes: usize, executable: ?bool = null };
         const declaration = try parse(self.alloc, struct { files: []const File }, bytes);
         if (declaration.files.len == 0 or declaration.files.len > 4096) return error.InvalidArtifactManifest;
         var total: usize = 0;
+        var flags_verified: usize = 0;
+        const metadata = try self.fileManifest(revision_id);
         for (declaration.files, 0..) |file, i| {
             if (!allowedMutablePath(file.path) or !safeId(file.sha256)) return error.InvalidArtifactManifest;
             for (declaration.files[0..i]) |previous| if (std.mem.eql(u8, previous.path, file.path)) return error.InvalidArtifactManifest;
             const actual = try self.contentAt(file.path, revision_id);
             if (actual.len != file.bytes or !std.mem.eql(u8, file.sha256, try hash(self.alloc, actual))) return error.WorkspaceVerificationFailed;
+            if (file.executable) |expected| {
+                if ((try executableFlag(metadata, file.path)) != expected) return error.WorkspaceVerificationFailed;
+                flags_verified += 1;
+            }
             total = try std.math.add(usize, total, actual.len);
         }
-        return json(self.alloc, .{ .kind = "workspace_manifest_verification", .revision = revision_id, .manifest_sha256 = try hash(self.alloc, bytes), .verified = true, .files = declaration.files.len, .bytes = total, .scope = "Verifies workspace bytes against the supplied manifest; source provenance and external effects require separate evidence." });
+        return json(self.alloc, .{ .kind = "workspace_manifest_verification", .revision = revision_id, .manifest_sha256 = try hash(self.alloc, bytes), .verified = true, .files = declaration.files.len, .bytes = total, .executable_flags = flags_verified, .scope = "Verifies workspace bytes and any requested executable flags against the supplied manifest; source provenance and external effects require separate evidence." });
     }
 
     pub fn changedPaths(self: Manager, from: []const u8, to: []const u8) ![]const []const u8 {

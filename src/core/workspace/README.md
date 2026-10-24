@@ -43,8 +43,9 @@ branch.
 
 `fossil_workspace` supports `verify_manifest` with a workspace-relative `path`.
 The referenced JSON has a `files` array whose entries contain `path`, `sha256`,
-and `bytes`. The host verifies every listed file against one pinned revision
-and returns a bounded receipt. This establishes consistency with the supplied
+and `bytes`. Entries can also request an `executable` boolean check. The host
+verifies every listed file against one pinned revision and returns a bounded
+receipt with the number of executable flags checked. This establishes consistency with the supplied
 manifest. Source provenance and external effects require their own evidence.
 
 Configured-provider responses with invalid tool names are rejected before tool
