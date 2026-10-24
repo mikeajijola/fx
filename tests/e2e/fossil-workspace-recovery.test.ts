@@ -362,7 +362,13 @@ sys.exit(result.returncode)
       expect((await post(invalid)).status).toBe(403);
       expect((await post(envelope("discover"), { origin: "https://untrusted.invalid" })).status).toBe(401);
       const create = envelope("create_view", { objective: "Prepare a portable team report", revision: boot.revision });
-      const view = await unpack(await post(create));
+      const signedFile = join(f.home, "signed-company-request.json");
+      writeFileSync(signedFile, JSON.stringify(create));
+      const remote = await f.run(["fossil", "remote", service.url, signedFile, "--json"], { OMOS_WORKSPACE_TOKEN: "private-owner-token-must-not-be-forwarded" });
+      expect(remote.code, remote.stderr).toBe(0);
+      const remotePacket = JSON.parse(remote.stdout);
+      expect(remotePacket.workspace_id).toBe(boot.workspace);
+      const view = await unpack(Response.json(remotePacket.model_data));
       expect((await unpack(await post(create))).view).toBe(view.view);
       const a = envelope("checkpoint", { view: view.view, revision: view.revision, path: "documents/team/report.md", content: "Team report", previous_hash: null });
       const b = envelope("checkpoint", { view: view.view, revision: view.revision, path: "documents/team/other.md", content: "Other report", previous_hash: null });
@@ -1514,21 +1520,58 @@ sys.exit(result.returncode)
     }
   }, 120000);
 
-  test("keeps the owner bearer token out of signed company client requests", async () => {
+  test("verifies signed company client receipts without forwarding the owner token or replaying mismatched replies", async () => {
     const f = fixture();
     const requests: Array<{ path: string; authorization: string | null; body: any }> = [];
+    const issuer = generateKeyPairSync("ed25519");
+    const actor = generateKeyPairSync("ed25519");
+    const other = generateKeyPairSync("ed25519");
+    const public_key = issuer.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex");
+    let mode = "valid";
     const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
-      requests.push({ path: new URL(request.url).pathname, authorization: request.headers.get("authorization"), body: await request.json() });
-      return Response.json({ workspace: "company-fixture", revision: "fixture-revision" });
+      const body = request.method === "POST" ? await request.json() as any : null;
+      requests.push({ path: new URL(request.url).pathname, authorization: request.headers.get("authorization"), body });
+      if (request.method === "GET") {
+        if (mode === "redirect") return new Response(null, { status: 302, headers: { location: "http://127.0.0.1:1/other-company" } });
+        return Response.json({ version: "omos.company/v1", workspace: mode === "other-workspace" ? "other-company" : "company-fixture", issuer: public_key, epoch: 7 });
+      }
+      if (mode === "http-rejection") return Response.json({ error: "WorkspaceInjectedFailure" }, { status: 400 });
+      if (mode === "bad-json") return new Response("{incomplete", { headers: { "content-type": "application/json" } });
+      const original = JSON.parse(body.payload);
+      const payload = JSON.stringify({ version: "omos.company-receipt/v1", workspace: "company-fixture", actor: original.actor, grant: original.grant, operation: mode === "other-operation" ? "replayed-operation" : original.operation, request_hash: createHash("sha256").update(mode === "changed-request" ? JSON.stringify(original) : body.payload).digest("hex"), action: original.action, epoch: mode === "other-epoch" ? 8 : 7, result: { workspace: "company-fixture", revision: "fixture-revision" } });
+      const key = mode === "other-issuer" ? other : issuer;
+      return Response.json({ payload, signature: mode === "bad-signature" ? "00".repeat(64) : sign(null, Buffer.from(payload), key.privateKey).toString("hex"), issuer: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex") });
     } });
     try {
-      const request = { payload: "{}", signature: "00".repeat(64) };
+      const payload = JSON.stringify({ version: "omos.company/v1", workspace: "company-fixture", actor: "reader", grant: "scoped-reader", operation: "inspect-once", expires_ms: Date.now() + 120000, action: "discover" }) + " ";
+      const request = { payload, signature: sign(null, Buffer.from(payload), actor.privateKey).toString("hex") };
       const file = join(f.home, "signed-request.json");
       writeFileSync(file, JSON.stringify(request));
-      const result = await f.run(["fossil", "remote", `http://127.0.0.1:${server.port}`, file, "--json"], { OMOS_WORKSPACE_TOKEN: "private-owner-token-must-not-be-forwarded" });
+      const invoke = () => f.run(["fossil", "remote", `http://127.0.0.1:${server.port}`, file, "--json"], { OMOS_WORKSPACE_TOKEN: "private-owner-token-must-not-be-forwarded" });
+      const result = await invoke();
       expect(result.code, result.stderr).toBe(0);
-      expect(requests).toEqual([{ path: "/v1/company", authorization: null, body: request }]);
+      expect(requests).toEqual([{ path: "/v1/company", authorization: null, body: null }, { path: "/v1/company", authorization: null, body: request }]);
       expect(result.stdout).not.toContain("private-owner-token");
+      for (const [failure, error] of [["bad-signature", "CompanySignatureRejected"], ["other-operation", "CompanyReceiptMismatch"], ["changed-request", "CompanyReceiptMismatch"], ["other-epoch", "CompanyReceiptMismatch"], ["other-issuer", "CompanySignatureRejected"], ["other-workspace", "WorkspaceIdentityMismatch"], ["redirect", "WorkspaceServiceRejected"]]) {
+        mode = failure;
+        const before = requests.length;
+        const rejected = await invoke();
+        expect(rejected.code).toBe(1);
+        expect(rejected.stderr + rejected.stdout).toContain(error);
+        expect(requests.slice(before).filter(request => request.body !== null)).toHaveLength(["other-workspace", "redirect"].includes(mode) ? 0 : 1);
+        expect(rejected.stdout + rejected.stderr).not.toContain("private-owner-token");
+      }
+      for (const [failure, error] of [["bad-signature", "WorkspaceServiceOutcomeUnverified"], ["http-rejection", "WorkspaceServiceOutcomeUnknown"], ["bad-json", "WorkspaceServiceOutcomeUnknown"]]) {
+        mode = failure;
+        const payload = JSON.stringify({ version: "omos.company/v1", workspace: "company-fixture", actor: "reader", grant: "scoped-reader", operation: `uncertain-${failure}`, expires_ms: Date.now() + 120000, action: "create_view", objective: "Prepare the isolated company view", revision: "fixture-revision" });
+        writeFileSync(file, JSON.stringify({ payload, signature: sign(null, Buffer.from(payload), actor.privateKey).toString("hex") }));
+        const before = requests.length;
+        const uncertain = await invoke();
+        expect(uncertain.code).toBe(1);
+        expect(uncertain.stdout + uncertain.stderr).toContain(error);
+        expect(requests.slice(before).filter(request => request.body !== null)).toHaveLength(1);
+      }
+      expect(requests.every(request => request.path === "/v1/company" && request.authorization === null)).toBe(true);
     } finally { server.stop(true); }
   }, 30000);
 

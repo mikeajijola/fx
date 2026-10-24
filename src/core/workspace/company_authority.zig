@@ -5,6 +5,13 @@ const records = @import("../shared/record_json.zig");
 const workspace = @import("fossil_workspace.zig");
 
 pub const Action = enum { discover, read, create_view, checkpoint, submit, status, export_scope, delegate, reconcile, query, record };
+
+pub fn isMutation(action: Action) bool {
+    return switch (action) {
+        .create_view, .checkpoint, .submit, .delegate, .reconcile, .record => true,
+        .discover, .read, .status, .export_scope, .query => false,
+    };
+}
 pub const Grant = struct {
     id: []const u8,
     actor: []const u8,

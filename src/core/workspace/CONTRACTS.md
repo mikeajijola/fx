@@ -358,6 +358,21 @@ parameters. Requests expire within five minutes. Browser-origin requests are
 rejected; the existing shared bearer token remains a local-owner interface.
 The company transport and operation shapes are declared in OmniForm.
 
+The native `fossil remote` client discovers the company issuer through the same
+configured HTTPS or loopback endpoint before sending a signed request. It
+checks the receipt signature, issuer, epoch, workspace, actor, grant, operation,
+action, and hash of the exact request bytes. A mismatched response fails the
+command and is not retried. Discovery and actor requests never forward the
+local owner's bearer token, and redirects are not followed. The configured
+endpoint is the trust anchor for discovery; a receipt's embedded public key
+alone does not establish an organization's identity.
+
+After sending a mutation, a missing or rejected HTTP response reports
+`WorkspaceServiceOutcomeUnknown`. An unverifiable receipt reports
+`WorkspaceServiceOutcomeUnverified`. Neither establishes that the action
+failed: inspect or reconcile the original operation before retrying it. The
+client never silently sends another mutation to repair a response.
+
 Supported actions are `discover`, `read`, `create_view`, `checkpoint`, `submit`,
 `status`, `export_scope`, `delegate`, `reconcile`, `query`, and `record`. Reads
 and inventories enforce the live grant and restrict historical revisions to

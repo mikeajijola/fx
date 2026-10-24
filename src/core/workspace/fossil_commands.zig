@@ -74,7 +74,9 @@ pub fn parse(args: []const [:0]const u8) !Options {
 pub fn execute(alloc: std.mem.Allocator, options: Options) !workspace.Snapshot {
     if (options.action == .remote) {
         const data = try @import("workspace_client.zig").call(alloc, options.path.?, if (options.request_path) |path| try readDefinition(alloc, path) else null);
-        return .{ .repository = options.path.?, .workspace_id = @import("definition.zig").text(data, "workspace"), .trunk_revision = @import("definition.zig").text(data, "revision"), .tasks = &.{}, .pending_journals = 0, .publication = "remote", .model_data = data };
+        const model = @import("definition.zig");
+        const context = if (model.field(data, "payload")) |payload| if (payload == .string) try std.json.parseFromSliceLeaky(std.json.Value, alloc, payload.string, .{}) else data else data;
+        return .{ .repository = options.path.?, .workspace_id = model.text(context, "workspace"), .trunk_revision = model.text(data, "revision"), .tasks = &.{}, .pending_journals = 0, .publication = "remote", .model_data = data };
     }
     const manager = switch (options.action) {
         .init => try workspace.Manager.init(alloc, options.path orelse "omos.fossil"),

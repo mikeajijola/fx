@@ -214,7 +214,7 @@ pub fn execute(original: workspace.Manager, raw: []const u8, writable: bool) ![]
     const request = try authority.authenticate(manager.alloc, current, raw, io.milliTimestamp());
     try model.validateOperation(manager.alloc, declaration, "omos_company_operation", try parse(manager.alloc, (try records.decode(authority.Envelope, manager.alloc, raw, .{})).payload), .input);
     const grant = try authority.liveGrant(current, request.grant, io.milliTimestamp());
-    const mutation = request.action == .create_view or request.action == .checkpoint or request.action == .record or request.action == .submit or request.action == .delegate or request.action == .reconcile;
+    const mutation = authority.isMutation(request.action);
     if (mutation and !writable) return error.ServiceReadOnly;
     if (mutation and request.action != .reconcile) if (request.view) |id| {
         const selected = try loadView(manager, grant, id);
