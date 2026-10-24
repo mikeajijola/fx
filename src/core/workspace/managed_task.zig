@@ -134,6 +134,9 @@ pub const Turn = struct {
             const prefix = try alloc.print("company/checkpoints/{s}/", .{self.task.id});
             for (try self.manager.inventory(self.reviewed_revision.?)) |path| {
                 if (!std.mem.startsWith(u8, path, prefix)) continue;
+                const name = std.Io.Dir.path.basename(path);
+                if (name.len <= 5 or !std.mem.endsWith(u8, name, ".json")) return error.WorkspaceVerificationFailed;
+                _ = (try self.manager.companyCheckpointRevision(self.task, name[0 .. name.len - 5])) orelse return error.WorkspaceVerificationFailed;
                 const bytes = try self.manager.contentAt(path, self.reviewed_revision.?);
                 try evidence.append(alloc, .{ .id = try alloc.print("workspace-checkpoint:{s}", .{try workspace.hash(alloc, bytes)}), .kind = .verification, .status = .success, .content = bytes });
             }

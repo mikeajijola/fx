@@ -117,6 +117,15 @@ const SessionBinding = struct {
         session: []const u8,
     },
 };
+const CompanyCheckpoint = struct {
+    kind: []const u8,
+    task: []const u8,
+    operation: []const u8,
+    base: []const u8,
+    files: []const struct { path: []const u8, sha256: ?[]const u8, bytes: usize, deleted: bool },
+    outcome: []const u8,
+    note: ?[]const u8 = null,
+};
 
 pub const Snapshot = struct {
     repository: []const u8,
@@ -134,6 +143,29 @@ pub fn hash(alloc: Allocator, data: []const u8) ![]const u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
     return alloc.dupe(u8, &std.fmt.bytesToHex(&digest, .lower));
+}
+
+fn immutableRevision(value: []const u8) bool {
+    if (value.len != 40 and value.len != 64) return false;
+    for (value) |ch| if (!std.ascii.isHex(ch)) return false;
+    return true;
+}
+
+// Earlier hosts retained Fossil's 40-character display abbreviation. Resolve
+// it only against a known authorized ancestor and return that full identity.
+fn revisionMatches(previous: []const u8, full: []const u8) bool {
+    return std.mem.eql(u8, previous, full) or (previous.len == 40 and full.len == 64 and std.mem.startsWith(u8, full, previous));
+}
+
+fn caseCollides(left: []const u8, right: []const u8) bool {
+    var a = std.mem.splitScalar(u8, left, '/');
+    var b = std.mem.splitScalar(u8, right, '/');
+    while (a.next()) |part| {
+        const other = b.next() orelse return false;
+        if (std.mem.eql(u8, part, other)) continue;
+        return std.ascii.eqlIgnoreCase(part, other);
+    }
+    return false;
 }
 
 fn join(alloc: Allocator, left: []const u8, right: []const u8) ![]const u8 {
@@ -362,7 +394,7 @@ pub const Manager = struct {
     manifest: Manifest,
 
     fn checkExpectedRevision(self: Manager, branch: []const u8) !void {
-        if (self.expected_revision) |expected| if (!std.mem.eql(u8, expected, try self.revision(branch))) return error.WorkspaceRevisionChanged;
+        if (self.expected_revision) |expected| if (!try self.sameRevision(expected, try self.revision(branch))) return error.WorkspaceRevisionChanged;
     }
 
     pub fn tryExecutionLease(self: Manager) !?ExecutionLease {
@@ -411,19 +443,30 @@ pub const Manager = struct {
         return null;
     }
 
-    pub fn companyReadableRevision(self: Manager, task: ?Task, candidate: []const u8) !bool {
+    pub fn companyReadRevision(self: Manager, task: ?Task, candidate: []const u8) !?[]const u8 {
         // Resolve only full immutable identities supplied by the caller.
-        if ((candidate.len != 40 and candidate.len != 64) or !std.ascii.isHex(candidate[0])) return false;
-        for (candidate) |ch| if (!std.ascii.isHex(ch)) return false;
+        if (candidate.len != 40 and candidate.len != 64) return null;
+        for (candidate) |ch| if (!std.ascii.isHex(ch)) return null;
         const heads = [_][]const u8{ try self.revision("trunk"), if (task) |selected| try self.currentRevision(selected) else try self.revision("trunk") };
         for (heads, 0..) |head, index| {
             if (index == 1 and std.mem.eql(u8, heads[0], head)) continue;
-            if (std.mem.eql(u8, head, candidate)) return true;
-            const ancestors = try self.run(null, &.{ "timeline", "ancestors", head, "--type", "ci", "--limit", "0", "--format", "%H", "-R", self.repository });
-            var lines = std.mem.splitScalar(u8, ancestors, '\n');
-            while (lines.next()) |line| if (std.mem.eql(u8, std.mem.trim(u8, line, " \r\t"), candidate)) return true;
+            if (revisionMatches(candidate, head)) return head;
+            var offset: usize = 0;
+            while (true) {
+                const ancestors = try self.run(null, &.{ "timeline", "ancestors", head, "--type", "ci", "--limit", "128", "--offset", try self.alloc.print("{d}", .{offset}), "--format", "%H", "-R", self.repository });
+                var lines = std.mem.splitScalar(u8, ancestors, '\n');
+                var count: usize = 0;
+                while (lines.next()) |raw| {
+                    const line = std.mem.trim(u8, raw, " \r\t");
+                    if (!immutableRevision(line)) continue;
+                    count += 1;
+                    if (revisionMatches(candidate, line)) return line;
+                }
+                if (count < 128) break;
+                offset += count;
+            }
         }
-        return false;
+        return null;
     }
 
     pub fn companyContent(self: Manager, path: []const u8) ![]const u8 {
@@ -920,6 +963,8 @@ pub const Manager = struct {
         defer command_lease.release();
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.appendSlice(self.alloc, &.{ try @import("fossil_executable.zig").resolve(self.alloc), "--user", "omos" });
+        // Grants identify exact canonical files, independent of host defaults.
+        if (arguments.len > 0 and std.mem.eql(u8, arguments[0], "cat")) try argv.appendSlice(self.alloc, &.{ "--case-sensitive", "on" });
         try argv.appendSlice(self.alloc, arguments);
         var environment = std.process.Environ.Map.init(self.alloc);
         defer environment.deinit();
@@ -1084,7 +1129,7 @@ pub const Manager = struct {
             }
         }
         const target = try self.revision(revision_id);
-        if (repository_matches and checkout_revision != null and std.mem.eql(u8, checkout_revision.?, target)) return tree;
+        if (repository_matches and checkout_revision != null and std.mem.eql(u8, try self.fullRevision(tree, "current"), target)) return tree;
         const clean = if (repository_matches)
             (try self.run(tree, &.{ "changes", "--hash", "--differ" })).len == 0 and (try self.run(tree, &.{ "extras", "--dotfiles" })).len == 0
         else
@@ -1105,19 +1150,41 @@ pub const Manager = struct {
     }
 
     pub fn revision(self: Manager, branch: []const u8) ![]const u8 {
-        // `info` reports full check-in identities without private SQLite access.
-        const output = try self.run(null, &.{ "info", branch, "-R", self.repository });
+        return self.fullRevision(null, branch);
+    }
+
+    fn fullRevision(self: Manager, cwd: ?[]const u8, selected: []const u8) ![]const u8 {
+        // `info` abbreviates SHA3 identities, and a timeline is ordered by
+        // dates. `whatis` resolves the exact check-in to its canonical hash.
+        const output = if (cwd != null and std.mem.eql(u8, selected, "current"))
+            try self.run(cwd, &.{ "whatis", "--type", "ci", "current" })
+        else
+            try self.run(cwd, &.{ "whatis", "--type", "ci", selected, "-R", self.repository });
         var lines = std.mem.splitScalar(u8, output, '\n');
+        var result: ?[]const u8 = null;
         while (lines.next()) |line| {
-            for ([_][]const u8{ "hash:", "uuid:", "checkout:" }) |prefix| {
-                if (!std.mem.startsWith(u8, line, prefix)) continue;
-                const value = std.mem.trim(u8, line[prefix.len..], " \t");
-                const end = std.mem.findScalar(u8, value, ' ') orelse value.len;
-                if (end != 40 and end != 64) return error.InvalidFossilRevision;
-                return self.alloc.dupe(u8, value[0..end]);
-            }
+            if (!std.mem.startsWith(u8, line, "artifact:")) continue;
+            const value = std.mem.trim(u8, line[9..], " \r\t");
+            if (result != null or !immutableRevision(value)) return error.InvalidFossilRevision;
+            result = value;
         }
-        return error.InvalidFossilRevision;
+        // Unlike info, whatis can exit successfully when a symbol is absent.
+        // Preserve the manager's existing not-found contract for branch creation.
+        return result orelse error.FossilCommandFailed;
+    }
+
+    fn sameRevision(self: Manager, left: []const u8, right: []const u8) !bool {
+        if (!immutableRevision(left) or !immutableRevision(right)) return false;
+        if (std.mem.eql(u8, left, right)) return true;
+        const a = self.revision(left) catch |err| switch (err) {
+            error.FossilCommandFailed, error.InvalidFossilRevision => return false,
+            else => return err,
+        };
+        const b = self.revision(right) catch |err| switch (err) {
+            error.FossilCommandFailed, error.InvalidFossilRevision => return false,
+            else => return err,
+        };
+        return std.mem.eql(u8, a, b);
     }
 
     fn commit(self: Manager, tree: []const u8, message: []const u8) ![]const u8 {
@@ -1141,15 +1208,7 @@ pub const Manager = struct {
         }
         _ = try self.run(tree, &.{ "addremove", "--dotfiles" });
         _ = try self.run(tree, &.{ "commit", "--hash", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", message });
-        const output = try self.run(tree, &.{"info"});
-        var lines = std.mem.splitScalar(u8, output, '\n');
-        while (lines.next()) |line| {
-            if (std.mem.startsWith(u8, line, "checkout:")) {
-                const value = std.mem.trim(u8, line[9..], " \t");
-                return self.alloc.dupe(u8, value[0 .. std.mem.findScalar(u8, value, ' ') orelse value.len]);
-            }
-        }
-        return error.InvalidFossilRevision;
+        return self.fullRevision(tree, "current");
     }
 
     fn taskPath(self: Manager, id: []const u8) ![]const u8 {
@@ -1666,7 +1725,7 @@ pub const Manager = struct {
         var task = try self.loadTask(previous.id);
         if (task.state == .publication_pending or task.state == .accepted) return error.TaskIsReadOnly;
         const parent_revision = try self.revision(task.parent);
-        if (std.mem.eql(u8, parent_revision, task.base_revision)) return task;
+        if (try self.sameRevision(parent_revision, task.base_revision)) return task;
         try self.ensureMergeable(task, try self.revision(task.branch), parent_revision);
         const tree = try self.checkout(task.branch);
         try self.merge(tree, parent_revision, task);
@@ -2014,25 +2073,80 @@ pub const Manager = struct {
     /// One writer transaction fences an entire filesystem projection checkpoint.
     /// A retry recognizes the desired bytes; divergent canonical changes fail.
     pub fn checkpointContent(self: Manager, task: Task, changes: []const ContentChange) ![]const u8 {
-        return self.checkpointContentInternal(task, changes, null);
+        return self.checkpointContentInternal(task, changes, null, .checkpoint);
     }
 
-    pub fn companyCheckpointed(self: Manager, task: Task, operation: []const u8) !bool {
+    pub fn companyCheckpointRevision(self: Manager, task: Task, operation: []const u8) !?[]const u8 {
         if (!safeId(operation)) return error.InvalidCompanyIdentity;
         const path = try self.alloc.print("company/checkpoints/{s}/{s}.json", .{ task.id, operation });
-        for (try self.inventory(task.branch)) |entry| if (std.mem.eql(u8, entry, path)) return true;
-        return false;
+        for (try self.inventory(task.branch)) |entry| if (std.mem.eql(u8, entry, path)) {
+            const revision_id = try self.pathRevision(task.branch, path);
+            const bytes = try self.contentAt(path, revision_id);
+            if (!std.mem.eql(u8, bytes, try self.contentAt(path, task.branch))) return error.WorkspaceVerificationFailed;
+            const saved_checkpoint = try parse(self.alloc, CompanyCheckpoint, bytes);
+            if (!std.mem.eql(u8, saved_checkpoint.kind, "company_checkpoint") or !std.mem.eql(u8, saved_checkpoint.task, task.id) or !std.mem.eql(u8, saved_checkpoint.operation, operation) or !std.mem.eql(u8, saved_checkpoint.outcome, "checkpointed") or !immutableRevision(saved_checkpoint.base) or saved_checkpoint.files.len == 0 or saved_checkpoint.files.len > 10000) return error.WorkspaceVerificationFailed;
+            const paths = try self.inventory(revision_id);
+            for (saved_checkpoint.files, 0..) |file, index| {
+                if (!@import("company_authority.zig").validPath(file.path, false)) return error.WorkspaceVerificationFailed;
+                for (saved_checkpoint.files[0..index]) |previous| if (std.mem.eql(u8, previous.path, file.path)) return error.WorkspaceVerificationFailed;
+                const present = for (paths) |item| {
+                    if (std.mem.eql(u8, item, file.path)) break true;
+                } else false;
+                if (file.deleted) {
+                    if (present or file.sha256 != null or file.bytes != 0) return error.WorkspaceVerificationFailed;
+                } else {
+                    if (!present or file.sha256 == null) return error.WorkspaceVerificationFailed;
+                    const actual = try self.contentAt(file.path, revision_id);
+                    if (actual.len != file.bytes or !std.mem.eql(u8, try hash(self.alloc, actual), file.sha256.?)) return error.WorkspaceVerificationFailed;
+                }
+            }
+            for (try self.changedPaths(saved_checkpoint.base, revision_id)) |changed| {
+                if (std.mem.eql(u8, changed, path)) continue;
+                const expected = for (saved_checkpoint.files) |file| {
+                    if (std.mem.eql(u8, changed, file.path)) break true;
+                } else false;
+                if (!expected) return error.WorkspaceVerificationFailed;
+            }
+            return revision_id;
+        };
+        return null;
     }
 
     pub fn checkpointCompanyContent(self: Manager, task: Task, changes: []const ContentChange, operation: []const u8) ![]const u8 {
         if (!safeId(operation)) return error.InvalidCompanyIdentity;
-        return self.checkpointContentInternal(task, changes, operation);
+        return self.checkpointContentInternal(task, changes, operation, .checkpoint);
     }
 
-    fn checkpointContentInternal(self: Manager, task: Task, changes: []const ContentChange, operation: ?[]const u8) ![]const u8 {
+    pub fn writeCompanyRecord(self: Manager, task: Task, entity: []const u8, id: []const u8, record_content: ?[]const u8, previous_hash: ?[]const u8, operation: []const u8) ![]const u8 {
+        const path = try @import("company_records.zig").path(self.alloc, entity, id);
+        const basis = task.model_basis orelse return error.WorkspaceMigrationRequired;
+        const declaration = try self.loadDeclaration(basis.revision);
+        const declared = for (declaration.semantic.entityTypes) |kind| {
+            if (std.mem.eql(u8, kind.id, entity)) break true;
+        } else false;
+        if (!declared) return error.UnknownEntityType;
+        const bytes = if (record_content) |raw| bytes: {
+            const value = parse(self.alloc, std.json.Value, raw) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidCompanyRecordJson,
+            };
+            try model.validateRecord(declaration.semantic, entity, value, true);
+            const encoded = try json(self.alloc, .{ .entity = entity, .id = id, .task = task.id, .data = value });
+            const portable = try parse(self.alloc, std.json.Value, encoded);
+            // Privacy filtering must not silently change a requested record,
+            // including optional values that still pass schema validation.
+            const saved = model.field(portable, "data").?;
+            try model.validateRecord(declaration.semantic, entity, saved, true);
+            if (!std.mem.eql(u8, try std.json.Stringify.valueAlloc(self.alloc, value, .{}), try std.json.Stringify.valueAlloc(self.alloc, saved, .{}))) return error.CompanyRecordNotPortable;
+            break :bytes encoded;
+        } else null;
+        return self.checkpointContentInternal(task, &.{.{ .path = path, .content = bytes, .previous_hash = previous_hash }}, operation, .record);
+    }
+
+    fn checkpointContentInternal(self: Manager, task: Task, changes: []const ContentChange, operation: ?[]const u8, action: @import("company_authority.zig").Action) ![]const u8 {
         const lease = try Lease.acquire(self.alloc, self.root);
         defer lease.release();
-        if (operation) |id| if (try self.companyCheckpointed(task, id)) return self.currentRevision(task);
+        if (operation) |id| if (try self.companyCheckpointRevision(task, id)) |revision_id| return revision_id;
         try self.checkExpectedRevision(task.branch);
         const current = try self.loadTask(task.id);
         if (current.authority != null) if (current.review_job) |id| {
@@ -2046,13 +2160,19 @@ pub const Manager = struct {
         const company_grant = if (current.authority) |binding| grant: {
             const authority_state = try record_json.decode(@import("company_authority.zig").State, self.alloc, try self.companyContent("authority/state.json"), .{});
             const live = try @import("company_authority.zig").liveGrant(authority_state, binding.grant, io_mod.milliTimestamp());
-            if (!std.mem.eql(u8, live.actor, binding.actor) or !@import("company_authority.zig").permitsAction(live, .checkpoint)) return error.CompanyAccessDenied;
+            if (!std.mem.eql(u8, live.actor, binding.actor) or !@import("company_authority.zig").permitsAction(live, action)) return error.CompanyAccessDenied;
             break :grant @as(?@import("company_authority.zig").Grant, live);
         } else null;
         for (changes, 0..) |change, index| {
             if (company_grant) |grant| if (!@import("company_authority.zig").permitsPath(grant, change.path)) return error.CompanyAccessDenied;
-            if (!allowedMutablePath(change.path)) return error.WorkspacePathDenied;
-            for (changes[0..index]) |previous| if (std.mem.eql(u8, change.path, previous.path)) return error.DuplicateWorkspacePath;
+            if (action == .record) {
+                if (operation == null or current.authority == null or !std.mem.startsWith(u8, change.path, "records/")) return error.CompanyAccessDenied;
+            } else if (!allowedMutablePath(change.path)) return error.WorkspacePathDenied;
+            for (inventory_paths) |existing| if (caseCollides(existing, change.path)) return error.WorkspaceProjectionConflict;
+            for (changes[0..index]) |previous| {
+                if (std.mem.eql(u8, change.path, previous.path)) return error.DuplicateWorkspacePath;
+                if (caseCollides(previous.path, change.path)) return error.WorkspaceProjectionConflict;
+            }
             if (change.content) |bytes| {
                 if (bytes.len > max_bytes) return error.WorkspaceRecordTooLarge;
                 if (std.mem.startsWith(u8, change.path, "artifacts/") and !std.mem.eql(u8, change.path[10..], try hash(self.alloc, bytes))) return error.InvalidArtifactIdentity;
@@ -2088,6 +2208,23 @@ pub const Manager = struct {
         }
         if ((try self.run(tree, &.{ "changes", "--hash", "--differ" })).len == 0 and (try self.run(tree, &.{ "extras", "--dotfiles" })).len == 0) return revision_id;
         const committed = try self.commit(tree, "Checkpoint workspace filesystem changes");
+        const committed_paths = try self.inventory(committed);
+        for (changes) |change| {
+            const present = for (committed_paths) |path| {
+                if (std.mem.eql(u8, path, change.path)) break true;
+            } else false;
+            if (change.content) |expected| {
+                if (!present) return error.WorkspaceVerificationFailed;
+                const actual = try self.contentAt(change.path, committed);
+                if (!std.mem.eql(u8, actual, expected)) return error.WorkspaceVerificationFailed;
+            } else if (present) return error.WorkspaceVerificationFailed;
+        }
+        for (try self.changedPaths(revision_id, committed)) |path| {
+            const expected = for (changes) |change| {
+                if (std.mem.eql(u8, change.path, path)) break true;
+            } else if (operation) |id| std.mem.eql(u8, path, try self.alloc.print("company/checkpoints/{s}/{s}.json", .{ task.id, id })) else false;
+            if (!expected) return error.WorkspaceVerificationFailed;
+        }
         if (operation != null) try fault("company-checkpoint-committed");
         return committed;
     }
@@ -2394,7 +2531,7 @@ pub const Manager = struct {
         defer lease.release();
         const latest = try self.loadTask(task.id);
         try @import("company_authority.zig").authorizeTask(self, latest);
-        if (latest.authority != null and !std.mem.eql(u8, latest.base_revision, try self.revision(latest.parent))) return error.CompanyReconciliationRequired;
+        if (latest.authority != null and !try self.sameRevision(latest.base_revision, try self.revision(latest.parent))) return error.CompanyReconciliationRequired;
         if (latest.revision_pending) return error.TaskContractRevisionPending;
         try self.checkReviewFence(latest);
         if (self.review_fence == null) if (latest.review_job) |id| {
@@ -2422,7 +2559,7 @@ pub const Manager = struct {
         }
         if (decision.disposition != .fulfilled) return error.WorkspaceReviewRequired;
         if (latest.state == .accepted) return self.acceptedRevision(latest);
-        if (!std.mem.eql(u8, review.revision, try self.revision(task.branch))) return error.WorkspaceRevisionChanged;
+        if (!try self.sameRevision(review.revision, try self.revision(task.branch))) return error.WorkspaceRevisionChanged;
         if ((try self.entries(try self.journalDir(task))).len != 0) return error.WorkspacePendingEvidence;
         if (try self.uiChanged(latest.base_revision, review.revision) and !try self.hasUiReceipt(latest, review.revision)) return error.UiValidationRequired;
         try self.ensureMergeable(latest, review.revision, try self.revision(task.parent));
@@ -2452,36 +2589,57 @@ pub const Manager = struct {
         } else if (publication.version >= 2 and publication.task.authority != null) return error.CompanyPublicationProofRequired;
     }
 
-    fn receiptRevision(self: Manager, publication: Publication) ![]const u8 {
-        const path = try self.alloc.print("acceptances/{s}.json", .{publication.operation});
-        const output = try self.run(null, &.{ "timeline", "ancestors", publication.target, "--path", path, "--type", "ci", "--limit", "1", "--format", "%H", "--quiet", "-R", self.repository });
+    fn pathRevision(self: Manager, branch: []const u8, path: []const u8) ![]const u8 {
+        const output = try self.run(null, &.{ "timeline", "ancestors", branch, "--path", path, "--type", "ci", "--limit", "1", "--format", "%H", "--quiet", "-R", self.repository });
         // Older supported Fossil releases append a completion notice even with
         // --quiet. The format guarantees the first row is the check-in hash.
         var lines = std.mem.splitScalar(u8, output, '\n');
         const revision_id = std.mem.trim(u8, lines.next() orelse return error.WorkspaceVerificationFailed, " \r\t");
-        if (revision_id.len != 40 and revision_id.len != 64) return error.WorkspaceVerificationFailed;
-        for (revision_id) |ch| if (!std.ascii.isHex(ch)) return error.WorkspaceVerificationFailed;
+        if (!immutableRevision(revision_id)) return error.WorkspaceVerificationFailed;
+        return revision_id;
+    }
+
+    fn receiptRevision(self: Manager, publication: Publication) ![]const u8 {
+        const path = try self.alloc.print("acceptances/{s}.json", .{publication.operation});
+        const revision_id = try self.pathRevision(publication.target, path);
         const bytes = try self.contentAt(path, revision_id);
         if (!try publicationEqual(self.alloc, bytes, publication)) return error.WorkspaceVerificationFailed;
         try self.verifyPublication(try parse(self.alloc, Publication, bytes));
         return revision_id;
     }
 
-    pub fn acceptedRevision(self: Manager, task: Task) ![]const u8 {
+    fn acceptedPublication(self: Manager, task: Task) !Publication {
         const source = try self.currentRevision(task);
         const operation = try hash(self.alloc, try json(self.alloc, .{ task.id, source, task.definition.version, task.parent }));
-        const publication = try parse(self.alloc, Publication, try self.contentAt(try self.alloc.print("acceptances/{s}.json", .{operation}), task.parent));
-        if (!std.mem.eql(u8, publication.task.id, task.id) or !std.mem.eql(u8, publication.source, source) or !std.mem.eql(u8, publication.target, task.parent)) return error.WorkspaceVerificationFailed;
-        return self.receiptRevision(publication);
+        const bytes = self.contentAt(try self.alloc.print("acceptances/{s}.json", .{operation}), task.parent) catch |err| switch (err) {
+            error.FossilCommandFailed => null,
+            else => return err,
+        };
+        if (bytes) |raw| {
+            const publication = try parse(self.alloc, Publication, raw);
+            if (!std.mem.eql(u8, publication.task.id, task.id) or !try self.sameRevision(publication.source, source) or !std.mem.eql(u8, publication.target, task.parent)) return error.WorkspaceVerificationFailed;
+            return publication;
+        }
+        // Legacy operation IDs included the display abbreviation. Preserve
+        // their original bytes and signatures instead of generating a new ID.
+        for (try self.inventory(task.parent)) |path| {
+            if (!std.mem.startsWith(u8, path, "acceptances/")) continue;
+            const publication = try parse(self.alloc, Publication, try self.contentAt(path, task.parent));
+            if (std.mem.eql(u8, publication.task.id, task.id) and std.mem.eql(u8, publication.target, task.parent) and try self.sameRevision(publication.source, source)) return publication;
+        }
+        return error.WorkspacePublicationRequired;
+    }
+
+    pub fn acceptedRevision(self: Manager, task: Task) ![]const u8 {
+        return self.receiptRevision(try self.acceptedPublication(task));
     }
 
     pub fn publicationSummary(self: Manager, task: Task) !std.json.Value {
-        const revision_id = try self.acceptedRevision(task);
-        const operation = try hash(self.alloc, try json(self.alloc, .{ task.id, try self.currentRevision(task), task.definition.version, task.parent }));
-        const path = try self.alloc.print("acceptances/{s}.json", .{operation});
+        const publication = try self.acceptedPublication(task);
+        const revision_id = try self.receiptRevision(publication);
+        const path = try self.alloc.print("acceptances/{s}.json", .{publication.operation});
         const bytes = try self.contentAt(path, revision_id);
-        const publication = try parse(self.alloc, Publication, bytes);
-        return parse(self.alloc, std.json.Value, try json(self.alloc, .{ .revision = revision_id, .operation = operation, .receipt_path = path, .receipt_sha256 = try hash(self.alloc, bytes), .issuer_proof = publication.issuer_proof }));
+        return parse(self.alloc, std.json.Value, try json(self.alloc, .{ .revision = revision_id, .operation = publication.operation, .receipt_path = path, .receipt_sha256 = try hash(self.alloc, bytes), .issuer_proof = publication.issuer_proof }));
     }
 
     fn finishPublication(self: Manager, pending_publication: Publication) ![]const u8 {
@@ -2494,12 +2652,12 @@ pub const Manager = struct {
             accepted_revision = try self.receiptRevision(try parse(self.alloc, Publication, bytes));
         } else {
             try @import("company_authority.zig").authorizeTask(self, publication.task);
-            if (publication.task.authority != null and !std.mem.eql(u8, publication.task.base_revision, try self.revision(publication.target))) return error.CompanyReconciliationRequired;
+            if (publication.task.authority != null and !try self.sameRevision(publication.task.base_revision, try self.revision(publication.target))) return error.CompanyReconciliationRequired;
             if (publication.review_fence) |fence| {
                 const job = try self.loadReviewJob(publication.task, fence.job);
                 if (!@import("review_job.zig").owns(job, fence, io_mod.milliTimestamp())) return error.StaleReviewLease;
             }
-            if (!std.mem.eql(u8, try self.revision(publication.task.branch), publication.source)) return error.WorkspaceRevisionChanged;
+            if (!try self.sameRevision(try self.revision(publication.task.branch), publication.source)) return error.WorkspaceRevisionChanged;
             var nonce: [16]u8 = undefined;
             io_mod.getIo().random(&nonce);
             const key = if (publication.task.authority != null) "company-integration" else try self.alloc.print("publication/{s}/{s}", .{ publication.operation, std.fmt.bytesToHex(&nonce, .lower) });
@@ -3130,7 +3288,8 @@ pub const Manager = struct {
     }
 
     fn resultProjection(self: Manager, publication: Publication, path: []const u8, revision_id: []const u8, projection: *@import("record_projection.zig").Projection) !std.json.Value {
-        var row = (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = "omos_result", .id = publication.operation, .data = .{ .task = publication.task.id, .status = "published", .summary = publication.review.candidate, .receipt = path }, .source_path = path, .revision = revision_id }), .{})).value;
+        _ = revision_id;
+        var row = (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = "omos_result", .id = publication.operation, .data = .{ .task = publication.task.id, .status = "published", .summary = publication.review.candidate, .receipt = path }, .source_path = path, .revision = try self.receiptRevision(publication) }), .{})).value;
         if (publication.review.assessment_record) |id| {
             try row.object.getPtr("data").?.object.put(self.alloc, "assessment", .{ .string = id });
             try projection.relationships.append(self.alloc, .{ .relationship = "omos_assessment_result", .from = id, .to = publication.operation, .task = publication.task.id, .authority = .host_observed });

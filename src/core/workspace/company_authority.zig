@@ -4,7 +4,7 @@ const std = @import("std");
 const records = @import("../shared/record_json.zig");
 const workspace = @import("fossil_workspace.zig");
 
-pub const Action = enum { discover, read, create_view, checkpoint, submit, status, export_scope, delegate, reconcile };
+pub const Action = enum { discover, read, create_view, checkpoint, submit, status, export_scope, delegate, reconcile, query, record };
 pub const Grant = struct {
     id: []const u8,
     actor: []const u8,
@@ -46,6 +46,8 @@ pub const Request = struct {
     candidate: ?[]const u8 = null,
     outcome: ?[]const u8 = null,
     delegated_grant: ?Grant = null,
+    entity: ?[]const u8 = null,
+    record_id: ?[]const u8 = null,
 };
 
 pub fn hexBytes(comptime size: usize, value: []const u8) ![size]u8 {
@@ -134,7 +136,7 @@ pub fn authenticateRetained(alloc: std.mem.Allocator, state: State, raw: []const
     if (fresh.action != .reconcile) return error.CompanyAccessDenied;
     const original = try authenticateRequest(alloc, state, raw, now, true);
     if (!std.mem.eql(u8, fresh.actor, original.actor) or !std.mem.eql(u8, fresh.grant, original.grant) or fresh.outcome == null or !std.mem.eql(u8, fresh.outcome.?, original.operation)) return error.CompanyAccessDenied;
-    if (original.action != .create_view and original.action != .checkpoint and original.action != .submit and original.action != .delegate) return error.CompanyRecoveryActionDenied;
+    if (original.action != .create_view and original.action != .checkpoint and original.action != .record and original.action != .submit and original.action != .delegate) return error.CompanyRecoveryActionDenied;
     return original;
 }
 

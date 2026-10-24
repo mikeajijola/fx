@@ -888,7 +888,9 @@
                 "status",
                 "export_scope",
                 "delegate",
-                "reconcile"
+                "reconcile",
+                "query",
+                "record"
               ]
             },
             "view": {
@@ -959,6 +961,18 @@
               ]
             },
             "outcome": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "entity": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "record_id": {
               "type": [
                 "string",
                 "null"

@@ -304,11 +304,48 @@ rejected; the existing shared bearer token remains a local-owner interface.
 The company transport and operation shapes are declared in OmniForm.
 
 Supported actions are `discover`, `read`, `create_view`, `checkpoint`, `submit`,
-`status`, `export_scope`, `delegate`, and `reconcile`. Reads and inventories
-enforce the live grant and restrict historical revisions to accepted ancestry or the caller's
-own view. Content reads use bounded base64 byte ranges and SHA-256 hashes.
+`status`, `export_scope`, `delegate`, `reconcile`, `query`, and `record`. Reads
+and inventories enforce the live grant and restrict historical revisions to
+accepted ancestry or the caller's own view. Content reads use bounded base64
+byte ranges and SHA-256 hashes. Canonical filenames are case-sensitive even
+when the host or repository defaults to case-insensitive lookup. Checkpoints
+reject new ASCII case collisions before changing working files.
 Scoped export currently returns a paginated content manifest for those reads;
 it does not clone the company repository or export issuer authority.
+
+`query` enumerates custom entity records at an authorized pinned revision. Path
+permissions and the optional `entity` filter apply before totals and pagination,
+so inaccessible rows do not affect the returned count. Pages contain at most
+32 records and 64 KiB of record data. Rows larger than 8 KiB become references
+with their original path, revision, byte size, and SHA-256 identity; retrieve
+those bytes through bounded `read` calls. A historical revision preserves its
+original query results.
+
+New references contain the complete Fossil check-in hash: 64 hexadecimal
+characters for SHA-3 or 40 for legacy SHA-1. Earlier hosts retained Fossil's
+40-character display abbreviation for SHA-3 objects. Historical retrieval
+resolves those references only against authorized ancestry and returns the
+complete identity. Ancestry requests use bounded pages. Recovery preserves
+historical receipt bytes, operation identities, and signatures; it does not
+rewrite them to change the reference format.
+
+`record` requires explicit operation authority and a writable view. Supply
+`entity`, a stable `record_id`, JSON text in `content`, and the expected view
+revision. The path is `records/<entity>/<record_id>.json` and must fall within
+the grant. The task's pinned OmniForm declaration validates the data. Updates
+and deletions also supply the previous record hash; `remove: true` deletes a
+record. Different records can reconcile independently. Concurrent changes to
+the same record remain subject to the file conflict boundary and independent
+assessment. Existing content-addressed records retain their identities.
+
+Company actors cannot write `omos_` entities or bypass validation by sending a
+raw checkpoint into `records/`. Structural validation failures retain a failed
+operation receipt and release its view. `CompanyRecordNotPortable` rejects
+values that privacy filtering would silently change, including optional fields.
+A corrected request uses a new
+operation ID. Uncertain persistence failures keep the view fenced for recovery.
+Typed writes and their checkpoint receipts commit together. These are draft
+changes until independent review and authorized publication succeed.
 
 Each company view retains its own task branch, base revision, contract, and
 private changes. Unchanged files reuse Fossil content objects. Scoped actors
@@ -322,7 +359,11 @@ bounded shared cache require further implementation.
 Mutations retain a request hash and pending outcome before effects. Completed
 retries return the saved result after a fresh authority check. Reusing an
 operation ID for different bytes is rejected. Checkpoint receipts commit with
-the changed files, allowing a retry to reconcile a lost response. An uncertain
+the changed files. Acknowledgement verifies exact paths, saved bytes, deletions,
+and the change set against the committed revision. Recovery and assessment
+repeat these checks against the original receipt commit; a receipt alone cannot
+establish that the intended content was saved. A corrupted checkpoint remains
+uncertain and is never replayed or accepted through its receipt. An uncertain
 operation retains ownership of its view until reconciled. `status` can inspect
 an outcome using its original operation ID. The outcome retains the exact signed
 request and final signed receipt. Original request bytes are available through

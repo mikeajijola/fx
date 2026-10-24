@@ -139,7 +139,7 @@ describe("portable Fossil workspace recovery", () => {
     const task = before.tasks.find((task: any) => task.session === createHash("sha256").update(JSON.parse(first.stdout).session_id).digest("hex"));
     const native = new NativeClient({ binary: join(import.meta.dir, "../../zig-out/bin/fx"), project: f.cwd, env: { ...process.env, ...f.env } });
     try {
-      const revision = f.fossil("info", task.branch).match(/(?:hash|uuid):\s+([a-f0-9]+)/)![1];
+      const revision = f.fossil("timeline", "ancestors", task.branch, "--limit", "1", "--format", "%H", "--quiet").split("\n")[0].trim();
       expect((await native.request("task.resume", { session: secondSession, task: task.id, revision })).id).toBe(task.id);
       expect((await native.request("snapshot", { action: "fossil.status" })).trunk_revision).toBe(before.trunk_revision);
     } finally { await native.close(); }
@@ -246,6 +246,188 @@ describe("portable Fossil workspace recovery", () => {
       service.child.kill();
       await service.child.exited;
     }
+  }, 120000);
+
+  test("queries and updates declared company records with scoped counts, stable identities and protected host state", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const declaration = JSON.parse(f.fossil("cat", "omniform/company.json", "-r", "trunk"));
+    declaration.spec.semantic.entityTypes.push({ id: "company_note", fields: { text: "string", authorization: "string" }, required: ["text"] });
+    const definitionFile = join(f.home, "company-definition.json");
+    writeFileSync(definitionFile, JSON.stringify(declaration));
+    const proposed = await f.run(["fossil", "definition", "propose", definitionFile, "--json"]);
+    expect(proposed.code, proposed.stderr + proposed.stdout).toBe(0);
+    const inference = model(f, (_body, count) => count === 1 ? { tool_calls: [{ index: 0, id: "private-record", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "record", entity: "company_note", content: JSON.stringify({ text: "Outside the scoped actor's records" }) }) } }] } : { content: "The private company record is retained." });
+    const seeded = await f.run(["ask", "Retain the private company note", "--json"]);
+    expect(seeded.code, seeded.stderr).toBe(0);
+    const privatePath = f.fossil("ls", "-r", "trunk").trim().split("\n").find((path: string) => path.startsWith("records/company_note/"))!;
+    const privateAlias = privatePath.replace(/[^/]+$/, (name: string) => name.toUpperCase());
+    f.fossil("settings", "case-sensitive", "off");
+    expect(f.fossil("cat", privateAlias, "-r", "trunk")).toContain("Outside the scoped actor's records");
+    const actorCalls = inference.counts().actors;
+    const admin = async (body: object) => {
+      const file = join(f.home, "operator.json");
+      writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+      const result = await f.run(["fossil", "company", file, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    const company = await admin({ action: "initialize" });
+    const key = generateKeyPairSync("ed25519");
+    await admin({ action: "grant", revision: company.revision, grant: { id: "record-editor", actor: "editor", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: [...["alpha", "beta", "large", "ALPHA"].map(id => `records/company_note/${id}.json`), privateAlias], actions: ["create_view", "record", "checkpoint", "query", "read", "submit", "status", "reconcile"], expires_ms: Date.now() + 3600000 } });
+    const service = await startWorkspaceService(f, true);
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const envelope = (action: string, params: object = {}) => {
+      const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "editor", grant: "record-editor", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action, ...params });
+      return { payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") };
+    };
+    const post = (body: object) => fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", connection: "close" }, body: JSON.stringify(body) });
+    const unpack = async (response: Response, action = "retry") => {
+      const result = await response.json() as any;
+      expect(response.status, JSON.stringify({ action, result })).toBe(200);
+      return JSON.parse(result.payload).result;
+    };
+    const send = async (action: string, params: object = {}) => unpack(await post(envelope(action, params)), JSON.stringify({ action, revision: (params as any).revision, entity: (params as any).entity, record_id: (params as any).record_id, offset: (params as any).offset }));
+    try {
+      expect(boot.features.typed_records).toBe("custom_entities");
+      expect(boot.revision).toHaveLength(64);
+      const aliasRead = await post(envelope("read", { revision: boot.revision, path: privateAlias }));
+      expect(aliasRead.status).toBe(400);
+      expect((await aliasRead.json() as any).content).toBeUndefined();
+      expect((await post(envelope("read", { revision: boot.revision, path: privatePath }))).status).toBe(403);
+      const view = await send("create_view", { revision: boot.revision, objective: "Save the updated alpha note and the complete large note" });
+      const first = await send("record", { view: view.view, revision: view.revision, entity: "company_note", record_id: "alpha", content: JSON.stringify({ text: "First alpha" }) });
+      expect(first.revision).toHaveLength(64);
+      const bad = envelope("record", { view: view.view, revision: first.revision, entity: "company_note", record_id: "beta", content: JSON.stringify({ text: 42 }) });
+      expect((await post(bad)).status).toBe(400);
+      expect((await send("status", { outcome: JSON.parse(bad.payload).operation })).state).toBe("failed");
+      const unportable = envelope("record", { view: view.view, revision: first.revision, entity: "company_note", record_id: "beta", content: JSON.stringify({ text: "Preserve every requested field", authorization: "fixture-value" }) });
+      const refused = await post(unportable);
+      expect(refused.status).toBe(400);
+      expect((await refused.json() as any).error).toBe("CompanyRecordNotPortable");
+      expect((await send("status", { outcome: JSON.parse(unportable.payload).operation })).state).toBe("failed");
+      expect((await post(envelope("record", { view: view.view, revision: first.revision, entity: "omos_assessment", record_id: "forged", content: "{}" }))).status).toBe(403);
+      expect((await post(envelope("checkpoint", { view: view.view, revision: first.revision, path: first.path, content: "{}" }))).status).toBe(403);
+      expect((await post(envelope("record", { view: view.view, revision: first.revision, entity: "company_note", record_id: "ALPHA", content: JSON.stringify({ text: "Conflicting filename case" }) }))).status).toBe(409);
+      expect((await send("status", { view: view.view })).revision).toBe(first.revision);
+      const beta = await send("record", { view: view.view, revision: first.revision, entity: "company_note", record_id: "beta", content: JSON.stringify({ text: "Second note" }) });
+      const page = await send("query", { view: view.view, revision: beta.revision, entity: "company_note", limit: 1 });
+      expect(page.total).toBe(2);
+      expect(page.records).toHaveLength(1);
+      expect(page.next_offset).toBe(1);
+      const next = await send("query", { view: view.view, revision: beta.revision, entity: "company_note", offset: page.next_offset, limit: 1 });
+      expect(next.records[0].id).not.toBe(page.records[0].id);
+      expect(next.next_offset).toBeNull();
+      const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks.find((task: any) => task.authority?.grant === "record-editor");
+      expect(f.fossil("ls", "-r", task.branch).trim().split("\n").filter((path: string) => path.startsWith("records/company_note/"))).toHaveLength(3);
+      const alpha = page.records[0].id === "alpha" ? page.records[0] : next.records[0];
+      expect((await post(envelope("record", { view: view.view, revision: beta.revision, entity: "company_note", record_id: "alpha", previous_hash: "00".repeat(32), content: JSON.stringify({ text: "Stale write" }) }))).status).toBe(409);
+      const updateEnvelope = envelope("record", { view: view.view, revision: beta.revision, entity: "company_note", record_id: "alpha", previous_hash: alpha.sha256, content: JSON.stringify({ text: "Updated alpha" }) });
+      const updated = await unpack(await post(updateEnvelope));
+      expect(await unpack(await post(updateEnvelope))).toEqual(updated);
+      const largeText = "café ".repeat(2500);
+      const large = await send("record", { view: view.view, revision: updated.revision, entity: "company_note", record_id: "large", content: JSON.stringify({ text: largeText }) });
+      const rows = await send("query", { view: view.view, revision: large.revision, entity: "company_note" });
+      expect(rows.total).toBe(3);
+      const largeRow = rows.records.find((row: any) => row.id === "large");
+      expect(largeRow.complete).toBe(false);
+      expect(largeRow.data).toBeUndefined();
+      const segments: Buffer[] = [];
+      let offset = 0;
+      do {
+        const range = await send("read", { view: view.view, revision: large.revision, path: largeRow.source_path, offset, limit: 4096 });
+        segments.push(Buffer.from(range.content, "base64"));
+        if (range.next_offset === null) break;
+        offset = range.next_offset;
+      } while (true);
+      const original = Buffer.concat(segments);
+      expect(createHash("sha256").update(original).digest("hex")).toBe(largeRow.sha256);
+      expect(JSON.parse(original.toString("utf8")).data.text).toBe(largeText);
+      const betaRow = rows.records.find((row: any) => row.id === "beta");
+      const removed = await send("record", { view: view.view, revision: large.revision, entity: "company_note", record_id: "beta", previous_hash: betaRow.sha256, remove: true });
+      expect((await send("query", { view: view.view, revision: removed.revision })).total).toBe(2);
+      const historical = await send("query", { view: view.view, revision: first.revision, entity: "company_note" });
+      expect(historical.total).toBe(1);
+      expect(historical.records[0].data.text).toBe("First alpha");
+      const legacyReference = await send("query", { view: view.view, revision: first.revision.slice(0, 40), entity: "company_note" });
+      expect(legacyReference.revision).toBe(first.revision);
+      expect(legacyReference.records).toEqual(historical.records);
+      expect(f.fossil("ls", "-r", "trunk")).not.toContain(first.path);
+      const submitted = await send("submit", { view: view.view, revision: removed.revision, candidate: "Saved the updated alpha note and complete large note; removed beta." });
+      let status: any;
+      const deadline = Date.now() + 60000;
+      while (Date.now() < deadline) {
+        status = await send("status", { view: view.view });
+        if (!["queued", "running"].includes(status.job?.state)) break;
+        await Bun.sleep(30);
+      }
+      expect(status.job.id).toBe(submitted.job);
+      expect(status.job.state, JSON.stringify(status)).toBe("published");
+      expect(JSON.parse(f.fossil("cat", first.path, "-r", "trunk")).data.text).toBe("Updated alpha");
+      expect(f.fossil("ls", "-r", "trunk")).not.toContain("records/company_note/beta.json");
+      expect(inference.counts().actors).toBe(actorCalls);
+    } finally { service.child.kill(); await service.child.exited; }
+  }, 180000);
+
+  test("keeps a corrupted checkpoint uncertain instead of trusting its receipt or replaying its commit", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const admin = async (body: object) => {
+      const file = join(f.home, "operator.json");
+      writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+      const result = await f.run(["fossil", "company", file, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    const company = await admin({ action: "initialize" });
+    const key = generateKeyPairSync("ed25519");
+    await admin({ action: "grant", revision: company.revision, grant: { id: "checkpoint-worker", actor: "worker", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["documents/team/"], actions: ["create_view", "checkpoint", "read", "status", "reconcile", "submit"], expires_ms: Date.now() + 3600000 } });
+    const realFossil = spawnSync("which", ["fossil"], { encoding: "utf8" }).stdout.trim();
+    const counter = join(f.home, "checkpoint-commits.txt");
+    const helper = join(f.home, "corrupt-checkpoint-fossil.py");
+    writeFileSync(helper, `#!/usr/bin/env python3
+import pathlib, subprocess, sys
+if "commit" in sys.argv[1:] and "Checkpoint workspace filesystem changes" in sys.argv[1:]:
+    counter = pathlib.Path(${JSON.stringify(counter)})
+    count = int(counter.read_text()) if counter.exists() else 0
+    counter.write_text(str(count + 1))
+    if count == 0:
+        pathlib.Path("documents/team/report.md").write_text("Mutated after preparation")
+result = subprocess.run([${JSON.stringify(realFossil)}, *sys.argv[1:]])
+sys.exit(result.returncode)
+`, { mode: 0o700 });
+    const service = await startWorkspaceService(f, true, { OMOS_FOSSIL_BIN: helper });
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const envelope = (action: string, params: object = {}) => {
+      const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "worker", grant: "checkpoint-worker", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action, ...params });
+      return { payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") };
+    };
+    const post = (body: object) => fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", connection: "close" }, body: JSON.stringify(body) });
+    const send = async (action: string, params: object = {}) => {
+      const response = await post(envelope(action, params));
+      const result = await response.json() as any;
+      expect(response.status, JSON.stringify({ action, result })).toBe(200);
+      return JSON.parse(result.payload).result;
+    };
+    try {
+      const view = await send("create_view", { revision: boot.revision, objective: "Save the prepared team report" });
+      const checkpoint = envelope("checkpoint", { view: view.view, revision: view.revision, path: "documents/team/report.md", content: "Prepared report" });
+      const operation = JSON.parse(checkpoint.payload).operation;
+      const failed = await post(checkpoint);
+      expect(failed.status).toBe(400);
+      expect((await failed.json() as any).error).toBe("WorkspaceVerificationFailed");
+      expect((await send("status", { outcome: operation })).state).toBe("uncertain");
+      const selected = await send("status", { view: view.view });
+      const observed = await send("read", { view: view.view, revision: selected.revision, path: "documents/team/report.md" });
+      expect(Buffer.from(observed.content, "base64").toString()).toBe("Mutated after preparation");
+      const reconciled = await post(envelope("reconcile", { outcome: operation }));
+      expect(reconciled.status).toBe(400);
+      expect((await reconciled.json() as any).error).toBe("WorkspaceVerificationFailed");
+      expect((await send("status", { outcome: operation })).state).toBe("uncertain");
+      expect(readFileSync(counter, "utf8")).toBe("1");
+      expect((await post(envelope("submit", { view: view.view, revision: selected.revision, candidate: "The report was saved." }))).status).toBe(400);
+      expect(f.fossil("ls", "-r", "trunk")).not.toContain("documents/team/report.md");
+    } finally { service.child.kill(); await service.child.exited; }
   }, 120000);
 
   test("keeps company drafts isolated without copying the company files for every view", async () => {
@@ -1712,6 +1894,43 @@ process.exit(result.exitCode);
     expect(result.code, result.stderr + result.stdout).toBe(0);
     expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("other");
   }, 60000);
+
+  test("recovers legacy display-hash publications without rewriting receipts or repeating work", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const realFossil = spawnSync("which", ["fossil"], { encoding: "utf8" }).stdout.trim();
+    expect(realFossil).toStartWith("/");
+    const helper = join(f.home, "legacy-display-fossil.py");
+    writeFileSync(helper, `#!/usr/bin/env python3
+import re, subprocess, sys
+result = subprocess.run([${JSON.stringify(realFossil)}, *sys.argv[1:]], capture_output=True)
+output = result.stdout
+if "whatis" in sys.argv[1:]:
+    output = re.sub(rb"(?m)^(artifact:[ \\t]+)([a-f0-9]{64})$", lambda match: match[1] + match[2][:40], output)
+sys.stdout.buffer.write(output)
+sys.stderr.buffer.write(result.stderr)
+sys.exit(result.returncode)
+`, { mode: 0o700 });
+    const inference = model(f, (_body, count) => count === 1 ? writeMemory("Preserve the original publication.") : { content: "The preference remains saved." });
+    const stopped = await f.run(["ask", "Remember the preference", "--json"], { OMOS_FOSSIL_BIN: helper, FX_E2E_FOSSIL_FAULT: "publication-committed" });
+    expect(stopped.code).toBe(1);
+    const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    expect(task.base_revision).toHaveLength(40);
+    const receiptPath = f.fossil("ls", "-r", "trunk").trim().split("\n").find((path: string) => path.startsWith("acceptances/"))!;
+    const original = f.fossil("cat", receiptPath, "-r", "trunk");
+    expect(JSON.parse(original).source).toHaveLength(40);
+    const calls = inference.counts();
+    const resumed = await f.run(["ask", "--resume-id", JSON.parse(stopped.stdout).session_id, "continue", "--json"]);
+    expect(resumed.code, resumed.stderr + resumed.stdout).toBe(0);
+    expect(inference.counts()).toEqual(calls);
+    expect(f.fossil("cat", receiptPath, "-r", "trunk")).toBe(original);
+    const result = await f.run(["fossil", "query", "omos_result", "--json"]);
+    expect(result.code, result.stderr).toBe(0);
+    const rows = JSON.parse(result.stdout).model_data.records;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].revision).toHaveLength(64);
+    expect(rows[0].source_path).toBe(receiptPath);
+  }, 90000);
 
   test("a commit before acknowledgement recovers without repeating model actions", async () => {
     const f = fixture();

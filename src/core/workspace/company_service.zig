@@ -142,7 +142,7 @@ pub fn bootstrap(manager: workspace.Manager) ![]const u8 {
     defer lease.release();
     const current = try state(manager);
     _ = try keys.current(manager, current.epoch, current.issuer);
-    return encode(manager.alloc, .{ .version = "omos.company/v1", .workspace = current.workspace, .issuer = current.issuer, .epoch = current.epoch, .revision = try manager.revision("trunk"), .features = .{ .scope = "path", .merge = "record_or_file", .max_read_bytes = 16384, .max_object_bytes = 8 * 1024 * 1024 } });
+    return encode(manager.alloc, .{ .version = "omos.company/v1", .workspace = current.workspace, .issuer = current.issuer, .epoch = current.epoch, .revision = try manager.revision("trunk"), .features = .{ .scope = "path", .merge = "record_or_file", .typed_records = "custom_entities", .scoped_export = "manifest", .hosted_execution = false, .max_request_bytes = 1024 * 1024, .max_read_bytes = 16384, .max_object_bytes = 8 * 1024 * 1024 } });
 }
 
 pub fn execute(original: workspace.Manager, raw: []const u8, writable: bool) ![]const u8 {
@@ -156,7 +156,7 @@ pub fn execute(original: workspace.Manager, raw: []const u8, writable: bool) ![]
     const request = try authority.authenticate(manager.alloc, current, raw, io.milliTimestamp());
     try model.validateOperation(manager.alloc, declaration, "omos_company_operation", try parse(manager.alloc, (try records.decode(authority.Envelope, manager.alloc, raw, .{})).payload), .input);
     const grant = try authority.liveGrant(current, request.grant, io.milliTimestamp());
-    const mutation = request.action == .create_view or request.action == .checkpoint or request.action == .submit or request.action == .delegate or request.action == .reconcile;
+    const mutation = request.action == .create_view or request.action == .checkpoint or request.action == .record or request.action == .submit or request.action == .delegate or request.action == .reconcile;
     if (mutation and !writable) return error.ServiceReadOnly;
     if (mutation and request.action != .reconcile) if (request.view) |id| {
         const selected = try loadView(manager, grant, id);
@@ -178,7 +178,7 @@ pub fn execute(original: workspace.Manager, raw: []const u8, writable: bool) ![]
     if (mutation and retained == null) try saveJournal(manager, path, journal);
     const result = perform(manager, current, grant, request, request_hash) catch |err| {
         if (mutation) {
-            journal.state = if (err == error.WorkspaceRevisionChanged or err == error.CompanyAccessDenied or err == error.WorkspaceProjectionConflict) .failed else .uncertain;
+            journal.state = if (err == error.WorkspaceRevisionChanged or err == error.CompanyAccessDenied or err == error.WorkspaceProjectionConflict or ((request.action == .record or request.action == .checkpoint) and @import("company_records.zig").validationFailure(err))) .failed else .uncertain;
             journal.failure = @errorName(err);
             journal.receipt = try signed(manager, current, request, request_hash, try encode(manager.alloc, .{ .operation = request.operation, .state = @tagName(journal.state), .failure = journal.failure }));
             try saveJournal(manager, path, journal);
@@ -289,9 +289,22 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
         const job = if (view.task.review_job) |id| try manager.loadReviewJob(view.task, id) else null;
         return encode(alloc, .{ .view = view.view.id, .revision = revision_id, .state = @tagName(view.task.state), .job = job, .publication = if (view.task.state == .accepted) try manager.publicationSummary(view.task) else null });
     }
+    if (request.action == .record) {
+        const view = selected orelse return error.CompanyViewRequired;
+        if (try manager.companyCheckpointRevision(view.task, operation_hash)) |committed| return encode(alloc, .{ .view = view.view.id, .revision = committed, .state = "checkpointed" });
+        if (request.revision == null or !std.mem.eql(u8, request.revision.?, revision_id)) return error.WorkspaceRevisionChanged;
+        const entity = request.entity orelse return error.UnknownEntityType;
+        const id = request.record_id orelse return error.InvalidCompanyIdentity;
+        const path = try @import("company_records.zig").path(alloc, entity, id);
+        if (!authority.permitsPath(grant, path)) return error.CompanyAccessDenied;
+        if (request.encoding != .utf8) return error.UnsupportedCompanyRecordEncoding;
+        manager.expected_revision = request.revision;
+        const revision = try manager.writeCompanyRecord(view.task, entity, id, if (request.remove) null else request.content orelse return error.MissingContent, request.previous_hash, operation_hash);
+        return encode(alloc, .{ .view = view.view.id, .revision = revision, .state = "checkpointed", .entity = entity, .record_id = id, .path = path });
+    }
     if (request.action == .checkpoint) {
         const view = selected orelse return error.CompanyViewRequired;
-        if (try manager.companyCheckpointed(view.task, operation_hash)) return encode(alloc, .{ .view = view.view.id, .revision = revision_id, .state = "checkpointed" });
+        if (try manager.companyCheckpointRevision(view.task, operation_hash)) |committed| return encode(alloc, .{ .view = view.view.id, .revision = committed, .state = "checkpointed" });
         if (request.revision == null or !std.mem.eql(u8, request.revision.?, revision_id)) return error.WorkspaceRevisionChanged;
         const path = request.path orelse return error.MissingPath;
         if (!authority.permitsPath(grant, path)) return error.CompanyAccessDenied;
@@ -330,13 +343,14 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
         const job = try manager.queueReview(integrated);
         return encode(alloc, .{ .view = view.view.id, .candidate_revision = revision_id, .job = job.id, .state = if (grant.human_approval) "approval_required" else "verification_pending", .revision = try manager.currentRevision(view.task) });
     }
-    if (request.action == .discover or request.action == .read or request.action == .export_scope) {
-        const pinned = request.revision orelse revision_id;
+    if (request.action == .discover or request.action == .read or request.action == .export_scope or request.action == .query) {
+        const requested_revision = request.revision orelse revision_id;
         // Check ancestry before looking up caller-supplied identities so the
         // response cannot reveal whether another private draft exists.
-        if (!try manager.companyReadableRevision(if (selected) |view| view.task else null, pinned)) return error.CompanyAccessDenied;
+        const pinned = (try manager.companyReadRevision(if (selected) |view| view.task else null, requested_revision)) orelse return error.CompanyAccessDenied;
         const manifest = try records.decode(workspace.Manifest, alloc, try manager.contentAt("workspace.json", pinned), .{});
         if (!std.mem.eql(u8, manifest.id, current.workspace)) return error.WorkspaceIdentityMismatch;
+        if (request.action == .query) return @import("company_records.zig").query(manager, grant, request, pinned);
         if (request.action == .read) {
             const path = request.path orelse return error.MissingPath;
             if (!authority.permitsPath(grant, path)) return error.CompanyAccessDenied;

@@ -4893,6 +4893,7 @@ test {
     _ = @import("core/app/provider_picker_runtime.zig");
     _ = @import("core/workspace/context_contract.zig");
     _ = @import("core/workspace/company_authority.zig");
+    _ = @import("core/workspace/company_records.zig");
     _ = @import("core/workspace/profile_photo.zig");
     _ = @import("core/workspace/declaration_schema.zig");
     _ = @import("core/workspace/workspace_access.zig");
