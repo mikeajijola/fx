@@ -590,6 +590,13 @@ sys.exit(result.returncode)
       expect(inventory.files).toHaveLength(1);
       expect(inventory.files[0].path.startsWith("documents/team/")).toBe(true);
       expect(inventory.authority).toBe("content_only");
+      expect(inventory.files[0].executable).toBeUndefined();
+      const attributes = await unpack(await post(envelope("export_scope", { version: "omos.company/v2", view: view.view, revision: successful.revision })));
+      expect(attributes.version).toBe("omos.scoped-export/v2");
+      expect(attributes.files[0].executable).toBe(false);
+      const modeRead = await unpack(await post(envelope("read", { version: "omos.company/v2", view: view.view, revision: successful.revision, path: inventory.files[0].path, limit: 4 })));
+      expect(modeRead.executable).toBe(false);
+      expect((await post(envelope("checkpoint", { version: "omos.company/v2", view: view.view, revision: successful.revision, path: "documents/team/forbidden-v2.md", content: "Unsupported mutation representation" }))).status).toBe(403);
       const read = await unpack(await post(envelope("read", { view: view.view, revision: successful.revision, path: inventory.files[0].path, limit: 4 })));
       expect(read.next_offset).toBe(4);
       expect(Buffer.from(read.content, "base64").length).toBe(4);
@@ -1253,6 +1260,24 @@ sys.exit(result.returncode)
       await send("reader", "submit", { view: emptyView.view, revision: emptyView.revision, candidate: "The company todo query now contains the new record." });
       await accepted("reader", emptyView.view);
       expect(inference.counts().actors).toBe(0);
+      const modeView = await create("reader", "Report the observed executable flag");
+      const modeInput = await send("reader", "read", { version: "omos.company/v2", view: modeView.view, path: "documents/team/input.md" });
+      expect(modeInput.executable).toBe(false);
+      const owner = model(f, (body, count) => {
+        if (count > 1) return { content: "The owner changed only the saved executable flag." };
+        const context = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
+        const root = JSON.parse(context.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/)![1]);
+        return { tool_calls: [{ index: 0, id: "owner-mode-change", type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", command: `chmod 700 '${root}/documents/team/input.md'`, timeout_ms: 10000 } }) } }] };
+      });
+      const changedMode = await f.run(["ask", "Change only the saved document executable flag", "--json"]);
+      expect(changedMode.code, changedMode.stderr).toBe(0);
+      expect(owner.counts().actors).toBe(2);
+      // A subsequent byte-only inspection must not erase the earlier observed
+      // flag. No body bytes changed, so hash-only dependencies would pass.
+      await send("reader", "read", { view: modeView.view, revision: await currentBase(), path: "documents/team/input.md" });
+      const modeProposal = await post(request("reader", "submit", { view: modeView.view, revision: modeView.revision, candidate: "The old executable flag remains current." }));
+      expect(modeProposal.status).toBe(400);
+      expect((await modeProposal.json() as any).error).toBe("WorkspaceReadDependencyChanged");
       service.child.kill(); await service.child.exited;
       const exported = join(f.home, "observed-inputs.fossil");
       const result = await f.run(["fossil", "export", exported, "--json"]);
@@ -1905,11 +1930,20 @@ sys.exit(result.returncode)
 
   test("packages only authorised pinned company files with signed inventory and bounded content pages", async () => {
     const f = fixture();
-    const content = "A portable, permission-scoped company document.\n".repeat(900);
-    const gateway = model(f, (_body, count) => count === 1 ? writeMemory(content) : { content: "Saved the company document." });
+    const content = "#!/bin/sh\n" + "# A portable, permission-scoped company script.\n".repeat(900) + "printf 'scoped-script\\n'\n";
+    const path = "skills/portable/run.sh";
+    const gateway = model(f, (body, count) => {
+      if (count === 1) return { tool_calls: [{ index: 0, id: "save-script", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", path, content }) } }] };
+      if (count === 2) {
+        const context = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
+        const root = JSON.parse(context.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/)![1]);
+        return { tool_calls: [{ index: 0, id: "mark-executable", type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", command: `chmod 700 '${root}/${path}'`, timeout_ms: 10000 } }) } }] };
+      }
+      return { content: "Saved the portable executable script." };
+    });
     const prepared = await f.run(["ask", "--json", "Save the company document"]);
     expect(prepared.code, prepared.stderr).toBe(0);
-    expect(gateway.counts().actors).toBe(2);
+    expect(gateway.counts().actors).toBe(3);
     const admin = async (body: object) => {
       const file = join(f.home, "operator.json");
       writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
@@ -1921,7 +1955,7 @@ sys.exit(result.returncode)
     expect(created.code, created.stderr).toBe(0);
     const identity = JSON.parse(created.stdout);
     const initialized = await admin({ action: "initialize" });
-    await admin({ action: "grant", revision: initialized.revision, grant: { id: "file-export", actor: "reader", public_key: identity.public_key, paths: ["memory/"], actions: ["export_scope"], expires_ms: Date.now() + 3600000 } });
+    await admin({ action: "grant", revision: initialized.revision, grant: { id: "file-export", actor: "reader", public_key: identity.public_key, paths: ["skills/"], actions: ["export_scope"], expires_ms: Date.now() + 3600000 } });
     const service = await startWorkspaceService(f, false);
     try {
       const boot = await (await fetch(service.url + "/v1/company")).json() as any;
@@ -1931,7 +1965,7 @@ sys.exit(result.returncode)
       const exported = await f.run(["fossil", "export-scope", input, output, "--json"]);
       expect(exported.code, exported.stderr + exported.stdout).toBe(0);
       const result = JSON.parse(exported.stdout);
-      expect(result).toMatchObject({ version: "omos.scope-package/v1", path: output, workspace: boot.workspace, revision: boot.revision, files: 1, bytes: Buffer.byteLength(content), dependency_closure: "not_evaluated" });
+      expect(result).toMatchObject({ version: "omos.scope-package/v2", file_attributes: "verified", path: output, workspace: boot.workspace, revision: boot.revision, files: 1, bytes: Buffer.byteLength(content), dependency_closure: "not_evaluated" });
       expect(statSync(output).mode & 0o777).toBe(0o600);
       const archive = readFileSync(output), objects = new Map<string, Buffer>();
       for (let at = 0; at + 512 <= archive.length && archive[at] !== 0;) {
@@ -1943,7 +1977,7 @@ sys.exit(result.returncode)
       }
       const manifest = JSON.parse(objects.get("manifest.json")!.toString());
       expect(manifest).toMatchObject({ scope: "grant_file_snapshot", dependency_closure: "not_evaluated", revision: boot.revision, actor: "reader", grant: "file-export", issuer: boot.issuer });
-      expect(manifest.files).toEqual([{ path: "memory/preference.md", sha256: createHash("sha256").update(content).digest("hex"), bytes: Buffer.byteLength(content) }]);
+      expect(manifest.files).toEqual([{ path, executable: true, sha256: createHash("sha256").update(content).digest("hex"), bytes: Buffer.byteLength(content) }]);
       const document = objects.get(`objects/${manifest.files[0].sha256}`)!;
       expect(document.toString()).toBe(content);
       expect(objects.size).toBe(2);
@@ -1955,6 +1989,7 @@ sys.exit(result.returncode)
         expect(claims.request_hash).toBe(createHash("sha256").update(request.payload).digest("hex"));
         expect(claims.result.files).toEqual(manifest.files);
         expect(JSON.parse(request.payload).action).toBe("export_scope");
+        expect(JSON.parse(request.payload).version).toBe("omos.company/v2");
       }
       const seed = readFileSync(join(f.home, ".fx", "company-keys", "reader.seed"));
       expect(archive.includes(seed)).toBe(false);
@@ -1964,7 +1999,7 @@ sys.exit(result.returncode)
       writeFileSync(offlineArchive, archive);
       const verified = await offline.run(["fossil", "verify-scope", offlineConfig, offlineArchive, "--json"]);
       expect(verified.code, verified.stderr).toBe(0);
-      expect(JSON.parse(verified.stdout)).toMatchObject({ files: 1, bytes: Buffer.byteLength(content), revision: boot.revision });
+      expect(JSON.parse(verified.stdout)).toMatchObject({ file_attributes: "verified", files: 1, bytes: Buffer.byteLength(content), revision: boot.revision });
       expect(existsSync(join(offline.home, ".fx", "omos-workspace.json"))).toBe(false);
       expect(existsSync(join(offline.home, ".fx", "company-keys"))).toBe(false);
       const corrupt = Buffer.from(archive); corrupt[512] ^= 1;
@@ -1973,13 +2008,43 @@ sys.exit(result.returncode)
       expect(damaged.code).toBe(1);
       expect(damaged.stdout + damaged.stderr).toContain("ScopeExportHashMismatch");
       const invented = Buffer.from(archive);
-      const pathIndex = invented.indexOf(Buffer.from('"path":"memory/preference.md"'));
+      const pathIndex = invented.indexOf(Buffer.from('"path":' + JSON.stringify(path)));
       expect(pathIndex).toBeGreaterThan(0);
-      invented[pathIndex + Buffer.byteLength('"path":"memory/')] = "P".charCodeAt(0);
+      invented[pathIndex + Buffer.byteLength('"path":"skills/')] = "P".charCodeAt(0);
       writeFileSync(offlineArchive, invented);
       const forged = await offline.run(["fossil", "verify-scope", offlineConfig, offlineArchive, "--json"]);
       expect(forged.code).toBe(1);
       expect(forged.stdout + forged.stderr).toContain("InvalidScopePackage");
+      const missingFlag = Buffer.from(archive);
+      const flagIndex = missingFlag.indexOf(Buffer.from('"executable":true'));
+      expect(flagIndex).toBeGreaterThan(0);
+      missingFlag.write("null", flagIndex + Buffer.byteLength('"executable":'));
+      writeFileSync(offlineArchive, missingFlag);
+      expect((await offline.run(["fossil", "verify-scope", offlineConfig, offlineArchive, "--json"])).code).toBe(1);
+      const downgrade = Buffer.from(archive);
+      const versionIndex = downgrade.indexOf(Buffer.from('"version":"omos.scope-package/v2"'));
+      expect(versionIndex).toBeGreaterThan(0);
+      downgrade[versionIndex + Buffer.byteLength('"version":"omos.scope-package/v')] = "1".charCodeAt(0);
+      writeFileSync(offlineArchive, downgrade);
+      const downgraded = await offline.run(["fossil", "verify-scope", offlineConfig, offlineArchive, "--json"]);
+      expect(downgraded.code).toBe(1);
+      expect(downgraded.stdout + downgraded.stderr).toContain("InvalidScopePackage");
+
+      // An actual legacy v1 receipt still verifies as bytes-only. Its missing
+      // mode information must not be reported as verified file attributes.
+      const actorKey = createPrivateKey({ key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seed]), format: "der", type: "pkcs8" });
+      const legacyPayload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "reader", grant: "file-export", operation: "legacy-inventory", expires_ms: Date.now() + 120000, action: "export_scope", revision: boot.revision, offset: 0 });
+      const legacyRequest = { payload: legacyPayload, signature: sign(null, Buffer.from(legacyPayload), actorKey).toString("hex") };
+      const legacyResponse = await fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(legacyRequest) });
+      expect(legacyResponse.status).toBe(200);
+      const legacyReceipt = await legacyResponse.json() as any;
+      const legacyManifest = { ...manifest, version: "omos.scope-package/v1", files: JSON.parse(legacyReceipt.payload).result.files, inventory_receipts: [{ request: JSON.stringify(legacyRequest), receipt: legacyReceipt }] };
+      const repacked = spawnSync("python3", ["-c", "import base64,io,json,sys,tarfile\nv=json.load(sys.stdin); out=io.BytesIO(); expected=1024\nwith tarfile.open(fileobj=out,mode='w',format=tarfile.USTAR_FORMAT) as archive:\n for name,encoded in v:\n  data=base64.b64decode(encoded); info=tarfile.TarInfo(name); info.size=len(data); info.mode=0o600; archive.addfile(info,io.BytesIO(data)); expected+=512+((len(data)+511)//512)*512\nsys.stdout.buffer.write(out.getvalue()[:expected])\n"], { input: JSON.stringify([[`objects/${manifest.files[0].sha256}`, document.toString("base64")], ["manifest.json", Buffer.from(JSON.stringify(legacyManifest)).toString("base64")]]), maxBuffer: archive.length * 2 });
+      expect(repacked.status, repacked.stderr.toString()).toBe(0);
+      writeFileSync(offlineArchive, repacked.stdout);
+      const legacyVerified = await offline.run(["fossil", "verify-scope", offlineConfig, offlineArchive, "--json"]);
+      expect(legacyVerified.code, legacyVerified.stderr).toBe(0);
+      expect(JSON.parse(legacyVerified.stdout)).toMatchObject({ version: "omos.scope-package/v1", file_attributes: "unavailable", files: 1 });
       writeFileSync(offlineArchive, archive);
       writeFileSync(offlineConfig, JSON.stringify({ ...config, issuer: "00".repeat(32) }));
       const untrusted = await offline.run(["fossil", "verify-scope", offlineConfig, offlineArchive, "--json"]);
@@ -2018,14 +2083,14 @@ sys.exit(result.returncode)
       if (!query.path) {
         inventoryCalls++;
         if (mode === "deny-final" && inventoryCalls > 1) return Response.json({ error: "CompanyAccessDenied" }, { status: 403 });
-        result = { version: "omos.scoped-export/v1", workspace: "company", revision, actor: "reader", grant: "exporter", files: [{ path: "documents/report.md", sha256: hash, bytes: content.length }], total: 1, next_offset: null };
+        result = { version: "omos.scoped-export/v2", workspace: "company", revision, actor: "reader", grant: "exporter", files: [{ path: "documents/report.md", sha256: hash, bytes: content.length, executable: false }], total: 1, next_offset: null };
       }
       else {
         contentCalls++;
         const end = Math.min(query.offset + 16384, content.length);
         const bytes = Buffer.from(content.subarray(query.offset, end));
         if (mode === "hash") bytes[0] ^= 1;
-        result = { revision, path: query.path, exists: true, offset: mode === "offset" ? query.offset + 1 : query.offset, bytes: content.length, sha256: hash, encoding: "base64", content: bytes.toString("base64"), next_offset: end < content.length ? end : null };
+        result = { executable: false, revision, path: query.path, exists: true, offset: mode === "offset" ? query.offset + 1 : query.offset, bytes: content.length, sha256: hash, encoding: "base64", content: bytes.toString("base64"), next_offset: end < content.length ? end : null };
       }
       const payload = JSON.stringify({ version: "omos.company-receipt/v1", workspace: "company", actor: "reader", grant: "exporter", operation: query.operation, request_hash: createHash("sha256").update(envelope.payload).digest("hex"), action: "export_scope", epoch: 1, result });
       return Response.json({ payload, signature: sign(null, Buffer.from(payload), issuer.privateKey).toString("hex"), issuer: public_key });

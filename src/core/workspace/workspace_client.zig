@@ -60,7 +60,7 @@ pub fn companyCall(alloc: std.mem.Allocator, base_url: []const u8, company: Comp
 pub fn companyCallControlled(alloc: std.mem.Allocator, base_url: []const u8, company: Company, raw: []const u8, control: ?Control) !std.json.Value {
     const envelope = try records.decode(authority.Envelope, alloc, raw, .{});
     const request = try records.decode(authority.Request, alloc, envelope.payload, .{});
-    if (!std.mem.eql(u8, request.version, "omos.company/v1") or !std.mem.eql(u8, request.workspace, company.workspace)) return error.WorkspaceIdentityMismatch;
+    if (!authority.supportedRequestVersion(request) or !std.mem.eql(u8, request.workspace, company.workspace)) return error.WorkspaceIdentityMismatch;
     const response = httpControlled(alloc, base_url, "/v1/company", raw, null, control) catch |err| {
         if (authority.isMutation(request.action)) {
             @import("../shared/debug_trace.zig").logf("workspace", "company response outcome unknown operation={s} cause={s}; reconcile the original operation before retrying", .{ request.operation, @errorName(err) });

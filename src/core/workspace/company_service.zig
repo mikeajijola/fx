@@ -7,6 +7,7 @@ const authority = @import("company_authority.zig");
 const records = @import("../shared/record_json.zig");
 const keys = @import("company_keys.zig");
 const model = @import("definition.zig");
+const fossil_manifest = @import("fossil_manifest.zig");
 const read_dependencies = @import("company_reads.zig");
 
 const Journal = struct {
@@ -200,7 +201,7 @@ pub fn bootstrap(manager: workspace.Manager) ![]const u8 {
     const current = try state(manager);
     _ = try keys.current(manager, current.epoch, current.issuer);
     const declaration = try manager.loadDeclaration(((try manager.modelBasis("trunk")) orelse return error.WorkspaceMigrationRequired).revision);
-    return encode(manager.alloc, .{ .version = "omos.company/v1", .workspace = current.workspace, .issuer = current.issuer, .epoch = current.epoch, .revision = try manager.revision("trunk"), .features = .{ .scope = "path", .merge = "record_or_file", .typed_records = "custom_entities", .scoped_export = "manifest", .read_dependencies = read_dependencies.supported(declaration), .operator_approvals = model.hasOperation(declaration, "omos_company_admin"), .hosted_execution = false, .max_request_bytes = 1024 * 1024, .max_read_bytes = 16384, .max_object_bytes = 8 * 1024 * 1024 } });
+    return encode(manager.alloc, .{ .version = "omos.company/v1", .workspace = current.workspace, .issuer = current.issuer, .epoch = current.epoch, .revision = try manager.revision("trunk"), .features = .{ .scope = "path", .merge = "record_or_file", .typed_records = "custom_entities", .scoped_export = "manifest", .file_attributes = "omos.company/v2", .read_dependencies = read_dependencies.supported(declaration), .operator_approvals = model.hasOperation(declaration, "omos_company_admin"), .hosted_execution = false, .max_request_bytes = 1024 * 1024, .max_read_bytes = 16384, .max_object_bytes = 8 * 1024 * 1024 } });
 }
 
 pub fn execute(original: workspace.Manager, raw: []const u8, writable: bool) ![]const u8 {
@@ -473,12 +474,20 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
         return encode(alloc, .{ .view = view.view.id, .candidate_revision = revision_id, .job = job.id, .state = if (grant.human_approval) "approval_required" else "verification_pending", .revision = try manager.currentRevision(view.task) });
     }
     if (request.action == .discover or request.action == .read or request.action == .export_scope or request.action == .query) {
+        const attributes = std.mem.eql(u8, request.version, "omos.company/v2");
         const requested_revision = request.revision orelse revision_id;
         // Check ancestry before looking up caller-supplied identities so the
         // response cannot reveal whether another private draft exists.
         const pinned = (try manager.companyReadRevision(if (selected) |view| view.task else null, requested_revision)) orelse return error.CompanyAccessDenied;
         const manifest = try records.decode(workspace.Manifest, alloc, try manager.contentAt("workspace.json", pinned), .{});
         if (!std.mem.eql(u8, manifest.id, current.workspace)) return error.WorkspaceIdentityMismatch;
+        var flags = std.StringHashMap(fossil_manifest.File).init(alloc);
+        defer flags.deinit();
+        if (attributes) for (try manager.fileManifest(pinned)) |file| {
+            if (!authority.permitsPath(grant, file.path)) continue;
+            if (file.mode == .symlink) return error.WorkspaceSymlinkDenied;
+            try flags.put(file.path, file);
+        };
         if (request.action == .query) return retainRead(manager, grant, request, if (selected) |view| view.view else null, pinned, try @import("company_records.zig").query(manager, grant, request, pinned), writable);
         if (request.action == .read or (request.action == .export_scope and request.path != null)) {
             const path = request.path orelse return error.MissingPath;
@@ -488,14 +497,19 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
             } else false;
             if (!present) {
                 if (request.offset != 0) return error.InvalidEvidenceOffset;
-                return retainRead(manager, grant, request, if (selected) |view| view.view else null, pinned, try encode(alloc, .{ .revision = pinned, .path = path, .exists = false, .content = "", .encoding = "base64", .bytes = 0, .sha256 = @as(?[]const u8, null), .next_offset = @as(?usize, null) }), writable);
+                var result = try parse(alloc, try encode(alloc, .{ .revision = pinned, .path = path, .exists = false, .content = "", .encoding = "base64", .bytes = 0, .sha256 = @as(?[]const u8, null), .next_offset = @as(?usize, null) }));
+                if (attributes) try result.object.put(alloc, "executable", .null);
+                return retainRead(manager, grant, request, if (selected) |view| view.view else null, pinned, try encode(alloc, result), writable);
             }
             const bytes = try manager.contentAt(path, pinned);
+            if (attributes) try fossil_manifest.verifyObject((flags.get(path) orelse return error.WorkspaceVerificationFailed).artifact.?, bytes);
             if (request.limit == 0 or request.limit > 16384 or request.offset > bytes.len) return error.InvalidEvidenceOffset;
             const end = request.offset + @min(request.limit, bytes.len - request.offset);
             const segment = bytes[request.offset..end];
             const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(segment.len));
-            return retainRead(manager, grant, request, if (selected) |view| view.view else null, pinned, try encode(alloc, .{ .revision = pinned, .path = path, .exists = true, .offset = request.offset, .content = std.base64.standard.Encoder.encode(encoded, segment), .encoding = "base64", .bytes = bytes.len, .sha256 = try workspace.hash(alloc, bytes), .next_offset = if (end < bytes.len) @as(?usize, end) else null }), writable);
+            var result = try parse(alloc, try encode(alloc, .{ .revision = pinned, .path = path, .exists = true, .offset = request.offset, .content = std.base64.standard.Encoder.encode(encoded, segment), .encoding = "base64", .bytes = bytes.len, .sha256 = try workspace.hash(alloc, bytes), .next_offset = if (end < bytes.len) @as(?usize, end) else null }));
+            if (attributes) try result.object.put(alloc, "executable", .{ .bool = (flags.get(path) orelse return error.WorkspaceVerificationFailed).mode == .executable });
+            return retainRead(manager, grant, request, if (selected) |view| view.view else null, pinned, try encode(alloc, result), writable);
         }
         var files: std.ArrayList(std.json.Value) = .empty;
         var count: usize = 0;
@@ -503,11 +517,14 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
             if (!authority.permitsPath(grant, path)) continue;
             if (count >= request.offset and files.items.len < 32) {
                 const bytes = try manager.contentAt(path, pinned);
-                try files.append(alloc, try parse(alloc, try encode(alloc, .{ .path = path, .sha256 = try workspace.hash(alloc, bytes), .bytes = bytes.len })));
+                if (attributes) try fossil_manifest.verifyObject((flags.get(path) orelse return error.WorkspaceVerificationFailed).artifact.?, bytes);
+                var result = try parse(alloc, try encode(alloc, .{ .path = path, .sha256 = try workspace.hash(alloc, bytes), .bytes = bytes.len }));
+                if (attributes) try result.object.put(alloc, "executable", .{ .bool = (flags.get(path) orelse return error.WorkspaceVerificationFailed).mode == .executable });
+                try files.append(alloc, result);
             }
             count += 1;
         }
-        return retainRead(manager, grant, request, if (selected) |view| view.view else null, pinned, try encode(alloc, .{ .version = if (request.action == .export_scope) "omos.scoped-export/v1" else "omos.scoped-inventory/v1", .workspace = current.workspace, .revision = pinned, .actor = grant.actor, .grant = grant.id, .files = files.items, .next_offset = if (request.offset + files.items.len < count) @as(?usize, request.offset + files.items.len) else null, .total = count, .content_endpoint = "/v1/company", .dependency_closure = "not_evaluated", .authority = "content_only" }), writable);
+        return retainRead(manager, grant, request, if (selected) |view| view.view else null, pinned, try encode(alloc, .{ .version = if (request.action == .export_scope) (if (attributes) "omos.scoped-export/v2" else "omos.scoped-export/v1") else (if (attributes) "omos.scoped-inventory/v2" else "omos.scoped-inventory/v1"), .workspace = current.workspace, .revision = pinned, .actor = grant.actor, .grant = grant.id, .files = files.items, .next_offset = if (request.offset + files.items.len < count) @as(?usize, request.offset + files.items.len) else null, .total = count, .content_endpoint = "/v1/company", .dependency_closure = "not_evaluated", .authority = "content_only" }), writable);
     }
     return error.UnsupportedCompanyApi;
 }

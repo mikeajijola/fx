@@ -438,9 +438,13 @@ expiry, and approval conditions. Ancestor revocation invalidates descendants.
 
 `GET /v1/company` returns public instance discovery. `POST /v1/company` accepts
 an envelope with `payload` and `signature`. The signature is hex-encoded Ed25519
-over the exact UTF-8 payload bytes. The payload uses `omos.company/v1` and binds
-the workspace, actor, grant, unique operation ID, expiry, action, and action
-parameters. Requests expire within five minutes. Browser-origin requests are
+over the exact UTF-8 payload bytes. The payload binds the workspace, actor,
+grant, unique operation ID, expiry, action, and action parameters.
+`omos.company/v1` retains the existing operations and byte-only file responses.
+`omos.company/v2` supports `discover`, `read`, and `export_scope` with signed
+executable flags. Mutations still require version 1. Both versions enforce the
+same authority rules. File attributes require an updated company declaration;
+unsupported representations fail before execution. Requests expire within five minutes. Browser-origin requests are
 rejected; the existing shared bearer token remains a local-owner interface.
 The company transport and operation shapes are declared in OmniForm.
 
@@ -497,8 +501,11 @@ remain subject to the grant's current scope. Actor signing seeds stay in the
 private profile and never enter the archive.
 
 The archive contains `manifest.json` and deduplicated `objects/<sha256>` files.
-The manifest maps original paths to hashes and sizes and retains signed
-inventory receipts with their exact requests. The client verifies every
+New `omos.scope-package/v2` manifests map original paths to hashes, sizes, and
+executable flags and retain signed version 2 inventory receipts with their exact
+requests. The export client requires a server that supports this representation.
+Content objects remain private regular files; executable flags belong to each
+original path. The client verifies every
 response against the pinned issuer and epoch, then verifies the complete
 archive before publishing it. Publication uses an exclusive file link and
 refuses to replace an existing output.
@@ -508,7 +515,12 @@ offline against the separate configuration pins. It requires no local Fossil
 repository, actor key, or server connection. It checks object hashes and sizes,
 manifest coverage, signed inventory pages, exact request bindings, and company,
 actor, grant, view and revision identities. This establishes historical package
-integrity; it does not establish that the grant remains live.
+integrity; it does not establish that the grant remains live. Version 2 reports
+`file_attributes: "verified"` after matching every flag to its signed inventory.
+Changing or dropping a flag, or relabeling that inventory as version 1, fails
+verification. Historical version 1 packages remain readable and report
+`file_attributes: "unavailable"`. Neither format proves that a script can run
+without its declared host dependencies.
 
 Exports use at most 32 inventory entries per page and 16 KiB per content
 request. Files are limited to 8 MiB, inventories to 10,000 paths and 8 MiB of
@@ -558,8 +570,12 @@ Reads attached to an active view record their inputs on the protected company
 branch. The response includes `read_tracking: "recorded"` and an `observation`
 reference. Tracking does not change the view's content revision. Authorized
 missing-file reads return `exists: false` with a null hash, so absence becomes
-an explicit dependency. Query and inventory observations retain scoped result
-membership as well as hashes for returned files or records. Inaccessible rows
+an explicit dependency. Version 2 file observations bind content and executable
+flags as one state. A later byte-only read cannot replace that attribute
+dependency. Historical
+read identities remain hashes of their original stored bytes, independent of
+new host fields and defaults. Query and inventory observations retain scoped
+result membership as well as hashes for returned files or records. Inaccessible rows
 never affect that membership.
 
 Submission pins these observations to an immutable control revision before

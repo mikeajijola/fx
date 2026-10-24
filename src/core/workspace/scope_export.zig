@@ -23,7 +23,7 @@ const Config = struct {
     max_bytes: u64 = 1024 * 1024 * 1024,
     deadline_ms: u32 = 300_000,
 };
-const Entry = struct { path: []const u8, sha256: []const u8, bytes: usize };
+const Entry = struct { path: []const u8, sha256: []const u8, bytes: usize, executable: ?bool = null };
 const Proof = struct { request: []const u8, receipt: std.json.Value };
 const Manifest = struct {
     version: []const u8,
@@ -49,6 +49,7 @@ const Page = struct {
     next_offset: ?usize,
 };
 const Segment = struct {
+    executable: bool,
     revision: []const u8,
     path: []const u8,
     exists: bool,
@@ -60,7 +61,8 @@ const Segment = struct {
     next_offset: ?usize,
 };
 pub const Snapshot = struct {
-    version: []const u8 = "omos.scope-package/v1",
+    version: []const u8 = "omos.scope-package/v2",
+    file_attributes: enum { verified, unavailable } = .verified,
     path: []const u8,
     workspace: []const u8,
     revision: []const u8,
@@ -87,7 +89,7 @@ const Session = struct {
         var nonce: [16]u8 = undefined;
         io.getIo().random(&nonce);
         const payload = try std.json.Stringify.valueAlloc(alloc, authority.Request{
-            .version = "omos.company/v1",
+            .version = "omos.company/v2",
             .workspace = self.config.workspace,
             .actor = self.config.actor,
             .grant = self.config.grant,
@@ -177,7 +179,8 @@ pub fn verify(alloc: std.mem.Allocator, raw: []const u8, archive: []const u8) !S
     const trailing = try reader.interface.allocRemaining(alloc, .limited(1024));
     if (trailing.len != 512 or !std.mem.allEqual(u8, trailing, 0)) return error.InvalidScopePackage;
     const manifest = try records.decode(Manifest, alloc, manifest_bytes orelse return error.InvalidScopePackage, .{});
-    if (!std.mem.eql(u8, manifest.version, "omos.scope-package/v1") or !std.mem.eql(u8, manifest.scope, "grant_file_snapshot") or !std.mem.eql(u8, manifest.dependency_closure, "not_evaluated") or !std.mem.eql(u8, manifest.workspace, config.workspace) or !std.mem.eql(u8, manifest.revision, config.revision) or !std.mem.eql(u8, manifest.actor, config.actor) or !std.mem.eql(u8, manifest.grant, config.grant) or !std.mem.eql(u8, manifest.issuer, config.issuer) or manifest.epoch == 0 or manifest.files.len > 10000 or manifest.inventory_receipts.len > 313) return error.InvalidScopePackage;
+    const attributes = std.mem.eql(u8, manifest.version, "omos.scope-package/v2");
+    if ((!attributes and !std.mem.eql(u8, manifest.version, "omos.scope-package/v1")) or !std.mem.eql(u8, manifest.scope, "grant_file_snapshot") or !std.mem.eql(u8, manifest.dependency_closure, "not_evaluated") or !std.mem.eql(u8, manifest.workspace, config.workspace) or !std.mem.eql(u8, manifest.revision, config.revision) or !std.mem.eql(u8, manifest.actor, config.actor) or !std.mem.eql(u8, manifest.grant, config.grant) or !std.mem.eql(u8, manifest.issuer, config.issuer) or manifest.epoch == 0 or manifest.files.len > 10000 or manifest.inventory_receipts.len > 313) return error.InvalidScopePackage;
     const company: client.Company = .{ .version = "omos.company/v1", .workspace = config.workspace, .issuer = config.issuer, .epoch = manifest.epoch };
     var covered: usize = 0;
     var complete = false;
@@ -189,14 +192,14 @@ pub fn verify(alloc: std.mem.Allocator, raw: []const u8, archive: []const u8) !S
         try client.verifyCompanyReceipt(alloc, company, proof.request, proof.receipt);
         const envelope = try records.decode(authority.Envelope, alloc, proof.request, .{});
         const request = try records.decode(authority.Request, alloc, envelope.payload, .{});
-        if (request.action != .export_scope or request.path != null or request.revision == null or !std.mem.eql(u8, request.revision.?, config.revision) or request.offset != covered or !std.mem.eql(u8, request.actor, config.actor) or !std.mem.eql(u8, request.grant, config.grant) or !equalView(request.view, config.view)) return error.InvalidScopePackage;
+        if (!std.mem.eql(u8, request.version, if (attributes) "omos.company/v2" else "omos.company/v1") or request.action != .export_scope or request.path != null or request.revision == null or !std.mem.eql(u8, request.revision.?, config.revision) or request.offset != covered or !std.mem.eql(u8, request.actor, config.actor) or !std.mem.eql(u8, request.grant, config.grant) or !equalView(request.view, config.view)) return error.InvalidScopePackage;
         const receipt = try std.json.parseFromValueLeaky(struct { payload: []const u8 }, alloc, proof.receipt, .{ .ignore_unknown_fields = true });
         const claims = try records.decode(struct { result: Page }, alloc, receipt.payload, .{ .ignore_unknown_fields = true });
         const page = claims.result;
-        if (!std.mem.eql(u8, page.version, "omos.scoped-export/v1") or !std.mem.eql(u8, page.workspace, config.workspace) or !std.mem.eql(u8, page.revision, config.revision) or !std.mem.eql(u8, page.actor, config.actor) or !std.mem.eql(u8, page.grant, config.grant) or page.total != manifest.files.len or page.files.len > 32 or page.files.len > manifest.files.len -| covered) return error.InvalidScopePackage;
+        if (!std.mem.eql(u8, page.version, if (attributes) "omos.scoped-export/v2" else "omos.scoped-export/v1") or !std.mem.eql(u8, page.workspace, config.workspace) or !std.mem.eql(u8, page.revision, config.revision) or !std.mem.eql(u8, page.actor, config.actor) or !std.mem.eql(u8, page.grant, config.grant) or page.total != manifest.files.len or page.files.len > 32 or page.files.len > manifest.files.len -| covered) return error.InvalidScopePackage;
         for (page.files) |entry| {
             const expected = manifest.files[covered];
-            if (!std.mem.eql(u8, entry.path, expected.path) or !std.mem.eql(u8, entry.sha256, expected.sha256) or entry.bytes != expected.bytes or !authority.validPath(entry.path, false) or !validHash(entry.sha256)) return error.InvalidScopePackage;
+            if (!std.mem.eql(u8, entry.path, expected.path) or !std.mem.eql(u8, entry.sha256, expected.sha256) or entry.bytes != expected.bytes or (if (attributes) entry.executable == null or entry.executable != expected.executable else entry.executable != null or expected.executable != null) or !authority.validPath(entry.path, false) or !validHash(entry.sha256)) return error.InvalidScopePackage;
             const slot = try paths.getOrPut(alloc, try std.ascii.allocLowerString(alloc, entry.path));
             if (slot.found_existing or (objects.get(entry.sha256) orelse return error.InvalidScopePackage) != entry.bytes) return error.InvalidScopePackage;
             try used.put(alloc, entry.sha256, {});
@@ -212,7 +215,7 @@ pub fn verify(alloc: std.mem.Allocator, raw: []const u8, archive: []const u8) !S
         }
     }
     if (!complete or covered != manifest.files.len or used.count() != objects.count()) return error.InvalidScopePackage;
-    return .{ .path = archive, .workspace = config.workspace, .revision = config.revision, .files = covered, .bytes = total_bytes };
+    return .{ .version = manifest.version, .file_attributes = if (attributes) .verified else .unavailable, .path = archive, .workspace = config.workspace, .revision = config.revision, .files = covered, .bytes = total_bytes };
 }
 
 fn equalView(a: ?[]const u8, b: ?[]const u8) bool {
@@ -255,7 +258,7 @@ fn download(session: Session, alloc: std.mem.Allocator, dir: std.Io.Dir, shared_
         const a = page_arena.allocator();
         const response = try session.request(a, entry.path, offset);
         const segment = try std.json.parseFromValueLeaky(Segment, a, response.result, .{ .ignore_unknown_fields = true });
-        if (!segment.exists or !std.mem.eql(u8, segment.revision, session.config.revision) or !std.mem.eql(u8, segment.path, entry.path) or !std.mem.eql(u8, segment.sha256, entry.sha256) or segment.bytes != entry.bytes or segment.offset != offset or !std.mem.eql(u8, segment.encoding, "base64")) return error.InvalidScopeExportSegment;
+        if (segment.executable != entry.executable or !segment.exists or !std.mem.eql(u8, segment.revision, session.config.revision) or !std.mem.eql(u8, segment.path, entry.path) or !std.mem.eql(u8, segment.sha256, entry.sha256) or segment.bytes != entry.bytes or segment.offset != offset or !std.mem.eql(u8, segment.encoding, "base64")) return error.InvalidScopeExportSegment;
         const size = try std.base64.standard.Decoder.calcSizeForSlice(segment.content);
         if (size > 16384 or size > bytes.len - offset or (size == 0 and offset != bytes.len)) return error.InvalidScopeExportSegment;
         try std.base64.standard.Decoder.decode(bytes[offset..][0..size], segment.content);
@@ -311,20 +314,20 @@ pub fn write(alloc: std.mem.Allocator, raw: []const u8, destination: []const u8)
         const a = arena.allocator();
         const response = try session.request(a, null, offset);
         const page = try std.json.parseFromValueLeaky(Page, a, response.result, .{ .ignore_unknown_fields = true });
-        if (!std.mem.eql(u8, page.version, "omos.scoped-export/v1") or !std.mem.eql(u8, page.workspace, config.workspace) or !std.mem.eql(u8, page.revision, config.revision) or !std.mem.eql(u8, page.actor, config.actor) or !std.mem.eql(u8, page.grant, config.grant) or page.files.len > 32 or page.total > 10000 or page.files.len > page.total -| offset or (total != null and total.? != page.total)) return error.InvalidScopeExportInventory;
+        if (!std.mem.eql(u8, page.version, "omos.scoped-export/v2") or !std.mem.eql(u8, page.workspace, config.workspace) or !std.mem.eql(u8, page.revision, config.revision) or !std.mem.eql(u8, page.actor, config.actor) or !std.mem.eql(u8, page.grant, config.grant) or page.files.len > 32 or page.total > 10000 or page.files.len > page.total -| offset or (total != null and total.? != page.total)) return error.InvalidScopeExportInventory;
         total = page.total;
         const proof = try std.json.Stringify.valueAlloc(a, .{ .request = response.request, .receipt = response.response }, .{});
         metadata_bytes += proof.len;
         if (metadata_bytes > 8 * 1024 * 1024) return error.ScopeExportMetadataLimit;
         try receipts.append(alloc, try std.json.parseFromSliceLeaky(std.json.Value, alloc, proof, .{ .allocate = .alloc_always }));
         for (page.files) |entry| {
-            if (!authority.validPath(entry.path, false) or !validHash(entry.sha256) or entry.bytes > 8 * 1024 * 1024) return error.InvalidScopeExportInventory;
+            if (entry.executable == null or !authority.validPath(entry.path, false) or !validHash(entry.sha256) or entry.bytes > 8 * 1024 * 1024) return error.InvalidScopeExportInventory;
             const lower = try std.ascii.allocLowerString(alloc, entry.path);
             const slot = try paths.getOrPut(alloc, lower);
             if (slot.found_existing) return error.InvalidScopeExportInventory;
             total_bytes += entry.bytes;
             if (total_bytes > config.max_bytes) return error.ScopeExportByteLimit;
-            try entries.append(alloc, .{ .path = try alloc.dupe(u8, entry.path), .sha256 = try alloc.dupe(u8, entry.sha256), .bytes = entry.bytes });
+            try entries.append(alloc, .{ .path = try alloc.dupe(u8, entry.path), .sha256 = try alloc.dupe(u8, entry.sha256), .bytes = entry.bytes, .executable = entry.executable });
         }
         offset += page.files.len;
         if (offset == page.total) {
@@ -373,7 +376,7 @@ pub fn write(alloc: std.mem.Allocator, raw: []const u8, destination: []const u8)
     var final_arena = std.heap.ArenaAllocator.init(alloc);
     defer final_arena.deinit();
     _ = try session.request(final_arena.allocator(), null, 0);
-    const manifest = try std.json.Stringify.valueAlloc(alloc, .{ .version = "omos.scope-package/v1", .scope = "grant_file_snapshot", .dependency_closure = "not_evaluated", .workspace = config.workspace, .revision = config.revision, .actor = config.actor, .grant = config.grant, .issuer = company.issuer, .epoch = company.epoch, .files = entries.items, .inventory_receipts = receipts.items }, .{});
+    const manifest = try std.json.Stringify.valueAlloc(alloc, .{ .version = "omos.scope-package/v2", .scope = "grant_file_snapshot", .dependency_closure = "not_evaluated", .workspace = config.workspace, .revision = config.revision, .actor = config.actor, .grant = config.grant, .issuer = company.issuer, .epoch = company.epoch, .files = entries.items, .inventory_receipts = receipts.items }, .{});
     if (manifest.len > 16 * 1024 * 1024) return error.ScopeExportMetadataLimit;
     try tar.writeFileBytes("manifest.json", manifest, .{ .mode = 0o600 });
     try tar.finishPedantically();

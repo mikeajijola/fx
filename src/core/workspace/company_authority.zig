@@ -57,6 +57,14 @@ pub const Request = struct {
     record_id: ?[]const u8 = null,
 };
 
+/// Version 2 adds authenticated file attributes to read-only file operations.
+/// Existing mutation and record protocols retain their version 1 semantics.
+pub fn supportedRequestVersion(request: Request) bool {
+    if (std.mem.eql(u8, request.version, "omos.company/v1")) return true;
+    if (!std.mem.eql(u8, request.version, "omos.company/v2")) return false;
+    return request.action == .discover or request.action == .read or request.action == .export_scope;
+}
+
 pub fn hexBytes(comptime size: usize, value: []const u8) ![size]u8 {
     if (value.len != size * 2) return error.InvalidCompanyIdentity;
     var bytes: [size]u8 = undefined;
@@ -151,7 +159,7 @@ fn authenticateRequest(alloc: std.mem.Allocator, state: State, raw: []const u8, 
     if (raw.len > 1024 * 1024) return error.ServiceRequestTooLarge;
     const envelope = try records.decode(Envelope, alloc, raw, .{});
     const request = try records.decode(Request, alloc, envelope.payload, .{});
-    if (!std.mem.eql(u8, request.version, "omos.company/v1") or !std.mem.eql(u8, request.workspace, state.workspace)) return error.WorkspaceIdentityMismatch;
+    if (!supportedRequestVersion(request) or !std.mem.eql(u8, request.workspace, state.workspace)) return error.WorkspaceIdentityMismatch;
     if (!safeIdentity(request.operation) or !safeIdentity(request.actor)) return error.InvalidCompanyIdentity;
     if (!retained and (request.expires_ms <= now or request.expires_ms > now + 300000)) return error.CompanyRequestExpired;
     const grant = try liveGrant(state, request.grant, now);
@@ -212,4 +220,15 @@ test "company authority enforces boundaries, delegation, ancestor revocation and
     try std.testing.expectError(error.CompanyRequestExpired, authenticate(alloc, state, envelope, 5000));
     const bad = try std.json.Stringify.valueAlloc(alloc, Envelope{ .payload = try alloc.print("{s} ", .{payload}), .signature = &signature }, .{});
     try std.testing.expectError(error.CompanySignatureRejected, authenticate(alloc, state, bad, 1));
+}
+
+test "company authority limits version 2 to file metadata reads" {
+    var request: Request = .{ .version = "omos.company/v2", .workspace = "company", .actor = "alice", .grant = "grant", .operation = "read", .expires_ms = 10000, .action = .read };
+    try std.testing.expect(supportedRequestVersion(request));
+    request.action = .checkpoint;
+    try std.testing.expect(!supportedRequestVersion(request));
+    request.version = "omos.company/v1";
+    try std.testing.expect(supportedRequestVersion(request));
+    request.version = "omos.company/v3";
+    try std.testing.expect(!supportedRequestVersion(request));
 }

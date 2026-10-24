@@ -860,7 +860,10 @@
           "type": "object",
           "properties": {
             "version": {
-              "const": "omos.company/v1"
+              "enum": [
+                "omos.company/v1",
+                "omos.company/v2"
+              ]
             },
             "workspace": {
               "type": "string"
@@ -1205,7 +1208,10 @@
           "type": "object",
           "properties": {
             "version": {
-              "const": "omos.scope-package/v1"
+              "enum": [
+                "omos.scope-package/v1",
+                "omos.scope-package/v2"
+              ]
             },
             "path": {
               "type": "string"
@@ -1265,6 +1271,12 @@
                 "evictions"
               ],
               "additionalProperties": false
+            },
+            "file_attributes": {
+              "enum": [
+                "verified",
+                "unavailable"
+              ]
             }
           },
           "required": [
@@ -1359,7 +1371,10 @@
           "type": "object",
           "properties": {
             "version": {
-              "const": "omos.scope-package/v1"
+              "enum": [
+                "omos.scope-package/v1",
+                "omos.scope-package/v2"
+              ]
             },
             "path": {
               "type": "string"
@@ -1419,6 +1434,12 @@
                 "evictions"
               ],
               "additionalProperties": false
+            },
+            "file_attributes": {
+              "enum": [
+                "verified",
+                "unavailable"
+              ]
             }
           },
           "required": [
