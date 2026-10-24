@@ -47,6 +47,85 @@ async function startWorkspaceService(f: ReturnType<typeof fixture>, writable = f
 
 // These fault, boundary, migration, and authority cases qualify the candidate without training it.
 describe("portable Fossil workspace recovery", () => {
+  for (const interrupted of [false, true]) test(`explicitly relocates copied personal work and requires validation in the new project${interrupted ? " after interruption" : ""}`, async () => {
+    const original = fixture();
+    const producer = model(original, (_body, count) => count <= 2 ? { tool_calls: [{ index: 0, id: `original-check-${count}`, type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", command: "printf 'Original source checked'", timeout_ms: 1000 } }) } }] } : { content: "The original source check passed; the task remains paused." }, () => "blocked", {
+      plan: { capability: "coding_task", summary: "Verify the source before accepting the requested change", obligations: [], checks: ["Check the current source"] },
+    });
+    expect((await original.run(["fossil", "init"])).code).toBe(0);
+    expect((await original.run(["ask", "Verify this source change and retain its coding checks", "--json"])).code).toBe(1);
+    const before = JSON.parse((await original.run(["fossil", "status", "--json"])).stdout);
+    const task = before.tasks[0];
+    const history = original.fossil("ls", "-r", task.branch).split("\n").filter(path => path.startsWith(`history/${task.id}/`));
+    expect(history.some(path => JSON.parse(original.fossil("cat", path, "-r", task.branch)).kind === "source_validation")).toBe(true);
+
+    const restored = fixture();
+    let phase = "setup";
+    let freshChecks = 0;
+    const consumer = model(restored, () => {
+      if (phase === "validate" && freshChecks < 2) {
+        freshChecks++;
+        return { tool_calls: [{ index: 0, id: `relocated-check-${freshChecks}`, type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", command: "printf 'Relocated source checked'", timeout_ms: 1000 } }) } }] };
+      }
+      return { content: "The retained source task and its requirements are preserved." };
+    }, () => phase === "setup" ? "blocked" : "met");
+    const repository = join(restored.cwd, "omos.fossil");
+    expect((await original.run(["fossil", "export", repository, "--json"])).code).toBe(0);
+    expect((await restored.run(["fossil", "use", repository, "--json"])).code).toBe(0);
+    const sessionResult = await restored.run(["ask", "Open a fresh local session", "--json"]);
+    expect(sessionResult.code).toBe(1);
+    const session = JSON.parse(sessionResult.stdout).session_id;
+    let native = new NativeClient({ binary: join(import.meta.dir, "../../zig-out/bin/fx"), project: restored.cwd, env: { ...process.env, ...restored.env, ...(interrupted ? { FX_E2E_FOSSIL_FAULT: "project-rebind-committed" } : {}) } });
+    let selected: any;
+    try {
+      let revision = restored.fossil("timeline", "ancestors", task.branch, "--limit", "1", "--format", "%H", "--quiet").split("\n")[0].trim();
+      await expect(native.request("task.resume", { session, task: task.id, revision })).rejects.toThrow("TaskProjectMismatch");
+      if (interrupted) {
+        await expect(native.request("task.resume", { session, task: task.id, revision, rebind_project: true })).rejects.toThrow("WorkspaceInjectedFailure");
+        await native.close();
+        native = new NativeClient({ binary: join(import.meta.dir, "../../zig-out/bin/fx"), project: restored.cwd, env: { ...process.env, ...restored.env } });
+        revision = restored.fossil("timeline", "ancestors", task.branch, "--limit", "1", "--format", "%H", "--quiet").split("\n")[0].trim();
+      }
+      selected = await native.request("task.resume", { session, task: task.id, revision, rebind_project: true });
+      expect(selected.id).toBe(task.id);
+      expect(selected.branch).toBe(task.branch);
+      expect(selected.project_root).toBe(restored.cwd);
+      expect(selected.definition).toEqual({ ...task.definition, version: task.definition.version + 1 });
+      expect(selected.model_basis).toEqual(task.model_basis);
+      expect(selected.amendments).toEqual(task.amendments);
+      expect(selected.source_validation_version).toBe(selected.definition.version);
+      if (!interrupted) await expect(native.request("task.resume", { session, task: task.id, revision, rebind_project: true })).rejects.toThrow("WorkspaceRevisionChanged");
+    } finally { await native.close(); }
+    const relocatedHistory = restored.fossil("ls", "-r", task.branch).split("\n").filter(path => path.startsWith(`history/${task.id}/`));
+    for (const path of history) expect(relocatedHistory).toContain(path);
+    const relocations = relocatedHistory.map(path => JSON.parse(restored.fossil("cat", path, "-r", task.branch))).filter(row => row.kind === "project_rebind");
+    expect(relocations.length).toBe(1);
+    const relocation = relocations[0];
+    expect(relocation.value.previous_project).toBe(original.cwd);
+    expect(relocation.value.project).toBe(restored.cwd);
+    expect(relocation.value.previous_contract).toEqual(task.definition);
+    const localCache = join(restored.home, ".fx/fossil", createHash("sha256").update(repository).digest("hex"));
+    rmSync(join(localCache, "tasks"), { recursive: true });
+    rmSync(join(localCache, "sessions"), { recursive: true });
+    const rebuilt = JSON.parse((await restored.run(["fossil", "status", "--json"])).stdout).tasks.find((item: any) => item.id === task.id);
+    expect(rebuilt.project_root).toBe(restored.cwd);
+    expect(rebuilt.source_validation_version).toBe(selected.definition.version);
+
+    phase = "stale-check";
+    const priorAssessments = consumer.counts().assessments;
+    const stale = await restored.run(["ask", "--resume-id", session, "continue", "--json"], { FX_MAX_AGENT_STEPS: "1" });
+    expect(stale.code, stale.stdout + stale.stderr).toBe(1);
+    expect(consumer.counts().assessments).toBeGreaterThan(priorAssessments);
+    expect(JSON.parse((await restored.run(["fossil", "tasks", "--json"])).stdout).tasks.find((item: any) => item.id === task.id).state).not.toBe("accepted");
+    phase = "validate";
+    const accepted = await restored.run(["ask", "--resume-id", session, "Run fresh validation in this project and finish the retained task", "--json"]);
+    expect(accepted.code, accepted.stdout + accepted.stderr).toBe(0);
+    expect(freshChecks).toBe(2);
+    expect(consumer.counts().actors).toBeGreaterThan(1);
+    expect(producer.counts().actors).toBe(3);
+    expect(JSON.parse((await original.run(["fossil", "tasks", "--json"])).stdout).tasks[0]).toEqual(task);
+  }, 240000);
+
   test("requires successful integrity reports and preserves private branches in a portable export", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);

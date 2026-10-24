@@ -370,6 +370,10 @@ pub const Turn = struct {
             for (batch) |raw| {
                 const row = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
                 const model = @import("definition.zig");
+                if (self.task.source_validation_version) |minimum| {
+                    const version = model.field(row, "contract_version") orelse continue;
+                    if (version != .integer or version.integer < minimum) continue;
+                }
                 const value = model.field(row, "value") orelse continue;
                 if (std.mem.eql(u8, model.text(row, "kind"), "source_validation") and std.mem.eql(u8, model.text(value, "source"), current)) {
                     try validations.put(alloc, try alloc.dupe(u8, model.text(value, "evidence")), {});

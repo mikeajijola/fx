@@ -38,6 +38,7 @@ pub const Task = struct {
     parent_contract_version: ?u32 = null,
     base_revision: []const u8,
     project_root: []const u8,
+    source_validation_version: ?u32 = null,
     definition: contract.Definition,
     request_artifact: ?[]const u8 = null,
     amendments: []const []const u8 = &.{},
@@ -1336,12 +1337,17 @@ pub const Manager = struct {
     }
 
     pub fn loadTask(self: Manager, id: []const u8) !Task {
-        const task = try parse(self.alloc, Task, try read(self.alloc, try self.localTaskPath(id)));
+        return self.decodeTask(id, try read(self.alloc, try self.localTaskPath(id)));
+    }
+
+    fn decodeTask(self: Manager, id: []const u8, bytes: []const u8) !Task {
+        const task = try parse(self.alloc, Task, bytes);
         if (!std.mem.eql(u8, task.workspace_id, self.manifest.id) or !std.mem.eql(u8, task.id, id)) return error.WorkspaceBindingMismatch;
         if (!safeId(task.session) or !std.mem.eql(u8, task.definition.id, task.id) or task.definition.version == 0) return error.InvalidWorkspaceFormat;
         if (!std.mem.eql(u8, task.branch, try self.alloc.print("task/{s}", .{task.id}))) return error.InvalidWorkspaceFormat;
         if (!std.mem.eql(u8, task.parent, "trunk") and !(std.mem.startsWith(u8, task.parent, "task/") and safeId(task.parent[5..]))) return error.InvalidWorkspaceFormat;
         if (!std.Io.Dir.path.isAbsolute(task.project_root)) return error.InvalidWorkspaceFormat;
+        if (task.source_validation_version) |minimum| if (minimum == 0 or minimum > task.definition.version) return error.InvalidWorkspaceFormat;
         const checked_contract = try contract.parse(self.alloc, try json(self.alloc, task.definition));
         checked_contract.deinit();
         if (task.model_basis) |basis| {
@@ -1494,18 +1500,61 @@ pub const Manager = struct {
     }
 
     pub fn resumeTask(self: Manager, session: []const u8, id: []const u8, project: []const u8) !Task {
+        return self.resumeTaskInProject(session, id, project, false);
+    }
+
+    pub fn resumeTaskInProject(self: Manager, session: []const u8, id: []const u8, project: []const u8, rebind_project: bool) !Task {
         const lease = try self.writerLease();
         defer lease.release();
         const task_lease = (try self.tryTaskExecutionLease(id)) orelse return error.WorkspaceExecutionBusy;
         defer task_lease.release();
         var task = try self.loadTask(id);
         try self.checkExpectedRevision(task.branch);
-        if (!std.mem.eql(u8, project, task.project_root)) return error.TaskProjectMismatch;
+        if (rebind_project) {
+            // Recover a committed relocation after interruption before the
+            // replaceable task cache was updated. Never repeat its transition.
+            const canonical = try self.decodeTask(id, try self.content(task, try self.taskPath(id)));
+            if ((canonical.source_validation_version orelse 0) > (task.source_validation_version orelse 0)) {
+                if (canonical.definition.version < task.definition.version) return error.WorkspaceRecoveryRequired;
+                task = canonical;
+                try self.saveTask(task);
+            }
+        }
+        if (!std.mem.eql(u8, project, task.project_root)) {
+            if (!rebind_project) return error.TaskProjectMismatch;
+            task = try self.rebindProject(task, project);
+        }
         if (task.state == .accepted and !try self.publicationPending(task)) return error.TaskAlreadyAccepted;
         try self.pauseSelectedTask(session, id);
         if (task.state != .publication_pending and task.state != .accepted) task.state = .active;
         try self.saveTask(task);
         try self.selectSession(session, task);
+        return task;
+    }
+
+    // Explicit local selection can relocate personal work, never company
+    // authority or an immutable publication. The caller owns both leases.
+    fn rebindProject(self: Manager, previous: Task, project: []const u8) !Task {
+        if (previous.authority != null) return error.CompanyExecutionIsolationRequired;
+        if (!std.Io.Dir.path.isAbsolute(project)) return error.InvalidProjectRoot;
+        if (previous.state == .accepted or previous.state == .publication_pending or previous.state == .conflict) return error.TaskIsReadOnly;
+        if (previous.review_job) |id| {
+            const job = try self.loadReviewJob(previous, id);
+            if (job.state == .queued or job.state == .running) return error.TaskReviewInProgress;
+        }
+        try self.drain(previous);
+        var task = previous;
+        task.project_root = project;
+        task.definition.version = std.math.add(u32, previous.definition.version, 1) catch return error.StaleWorkContract;
+        task.source_validation_version = task.definition.version;
+        task.review_job = null;
+        const entry = try json(self.alloc, .{ .kind = "project_rebind", .task = task.id, .contract_version = task.definition.version, .value = .{ .origin = "user", .previous_project = previous.project_root, .project = project, .previous_contract = previous.definition, .note = "Explicit project relocation preserves all requirements. Source and environment validation must be repeated in this location." } });
+        const tree = try self.checkout(task.branch);
+        try atomicWrite(self.alloc, try join(self.alloc, tree, try self.taskPath(task.id)), try json(self.alloc, task));
+        try atomicWrite(self.alloc, try join(self.alloc, tree, try self.alloc.print("history/{s}/{s}.json", .{ task.id, try hash(self.alloc, entry) })), entry);
+        _ = try self.commit(tree, "Record explicit project relocation and validation boundary");
+        try fault("project-rebind-committed");
+        try self.saveTask(task);
         return task;
     }
 

@@ -284,6 +284,18 @@ work. Selecting other work does not pause a task another runtime is executing.
 An idle selected task's paused state is committed with the selection change.
 These leases coordinate runtimes on one host; they are not distributed leases.
 
+Copied personal tasks retain their original project directory. Ordinary resume
+refuses a different directory with `TaskProjectMismatch`. Select the new project
+explicitly with `/task resume <id> --rebind-project`, or supply
+`rebind_project: true` to the revision-fenced native `task.resume` operation.
+Relocation retains the task identity, pinned definition and policy, obligations,
+original request, and evidence. A `project_rebind` history record preserves the
+previous directory and contract. The contract version advances and earlier
+source checks cannot validate execution in the new environment. Accepted tasks,
+pending publications, conflicts, active review jobs, execution owned by another
+runtime, and company-authorized tasks cannot be relocated this way. Company
+execution requires its separate authority and ownership flow.
+
 When task or session index directories are missing, opening the bound instance
 reconstructs them from canonical task branches, acceptance receipts, and these
 selection events. A durable restore marker makes an interrupted rebuild resume

@@ -171,11 +171,30 @@ pub fn taskCommand(alloc: std.mem.Allocator, session: []const u8, project: []con
     const argument = std.mem.trim(u8, text[split..], " \t");
     const task = if (std.mem.eql(u8, action, "new"))
         try manager.start(session, project, argument, null)
-    else if (std.mem.eql(u8, action, "resume"))
-        try manager.resumeTask(session, argument, project)
-    else
-        return error.InvalidTaskCommand;
+    else if (std.mem.eql(u8, action, "resume")) blk: {
+        const selection = try parseTaskSelection(argument);
+        break :blk try manager.resumeTaskInProject(session, selection.id, project, selection.rebind_project);
+    } else return error.InvalidTaskCommand;
     return alloc.print("Task {s}\nBranch: {s}\nState: {s}\nGoal: {s}", .{ task.id, task.branch, @tagName(task.state), task.definition.objective });
+}
+
+fn parseTaskSelection(argument: []const u8) !struct { id: []const u8, rebind_project: bool } {
+    var words = std.mem.tokenizeAny(u8, argument, " \t");
+    const id = words.next() orelse return error.TaskIdRequired;
+    const flag = words.next();
+    if (words.next() != null) return error.InvalidTaskCommand;
+    if (flag) |value| if (!std.mem.eql(u8, value, "--rebind-project")) return error.InvalidTaskCommand;
+    return .{ .id = id, .rebind_project = flag != null };
+}
+
+test "project relocation requires an explicit task selection flag" {
+    try std.testing.expect(!(try parseTaskSelection("task")).rebind_project);
+    const selected = try parseTaskSelection("task --rebind-project");
+    try std.testing.expectEqualStrings("task", selected.id);
+    try std.testing.expect(selected.rebind_project);
+    try std.testing.expectError(error.InvalidTaskCommand, parseTaskSelection("task --guess-project"));
+    try std.testing.expectError(error.InvalidTaskCommand, parseTaskSelection("task --rebind-project extra"));
+    try std.testing.expectError(error.TaskIdRequired, parseTaskSelection(""));
 }
 
 fn readDefinition(alloc: std.mem.Allocator, path: []const u8) ![]const u8 {
